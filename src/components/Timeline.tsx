@@ -1,8 +1,22 @@
 import React, {useRef} from 'react';
-import {Film, Layers, Music, Type, ZoomIn, ZoomOut} from 'lucide-react';
-import type {Clip, Collaborator, TrackType} from '../shared/types.ts';
+import {
+  Eye,
+  EyeOff,
+  Film,
+  Layers,
+  Music,
+  Plus,
+  Trash2,
+  Type,
+  Volume2,
+  VolumeX,
+  ZoomIn,
+  ZoomOut,
+} from 'lucide-react';
+import type {Clip, Collaborator, Track, TrackType} from '../shared/types.ts';
 
 interface TimelineProps {
+  tracks: Track[];
   clips: Clip[];
   duration: number;
   currentTime: number;
@@ -12,6 +26,9 @@ interface TimelineProps {
   onSeek: (time: number) => void;
   onSelectClip: (clipId: string | null) => void;
   onZoomChange: (pxPerSec: number) => void;
+  onAddTrack: (type: TrackType) => void;
+  onUpdateTrack: (trackId: string, patch: Partial<Track>) => void;
+  onDeleteTrack: (trackId: string) => void;
   onClipTransform: (
     clipId: string,
     patch: Partial<Clip>,
@@ -19,19 +36,33 @@ interface TimelineProps {
   ) => void;
 }
 
-const TRACK_CONFIG: Array<{
-  id: TrackType;
-  label: string;
-  icon: React.FC<{className?: string}>;
-  heightClass: string;
-}> = [
-  {id: 'video', label: 'Видео', icon: Film, heightClass: 'h-12 sm:h-14'},
-  {id: 'overlay', label: 'Слой', icon: Layers, heightClass: 'h-10 sm:h-11'},
-  {id: 'text', label: 'Текст', icon: Type, heightClass: 'h-9 sm:h-10'},
-  {id: 'audio', label: 'Аудио', icon: Music, heightClass: 'h-9 sm:h-10'},
-];
+function getTrackIcon(type: TrackType) {
+  switch (type) {
+    case 'video':
+      return Film;
+    case 'overlay':
+      return Layers;
+    case 'text':
+      return Type;
+    case 'audio':
+      return Music;
+  }
+}
+
+function getTrackHeightClass(type: TrackType): string {
+  switch (type) {
+    case 'video':
+      return 'h-12 sm:h-14';
+    case 'overlay':
+      return 'h-10 sm:h-11';
+    case 'text':
+    case 'audio':
+      return 'h-9 sm:h-10';
+  }
+}
 
 export const Timeline: React.FC<TimelineProps> = ({
+  tracks,
   clips,
   duration,
   currentTime,
@@ -41,26 +72,30 @@ export const Timeline: React.FC<TimelineProps> = ({
   onSeek,
   onSelectClip,
   onZoomChange,
+  onAddTrack,
+  onUpdateTrack,
+  onDeleteTrack,
   onClipTransform,
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const trackAreaRef = useRef<HTMLDivElement | null>(null);
+  const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrubActiveRef = useRef(false);
+
   const dragClipRef = useRef<{
     clipId: string;
+    trackType: TrackType;
     mode: 'move' | 'trim-left' | 'trim-right';
     startX: number;
     origStart: number;
     origDuration: number;
     origTrimStart: number;
+    origTrackId: string;
     sourceDuration: number;
     speed: number;
   } | null>(null);
 
-  const totalWidth = Math.max(
-    600,
-    Math.ceil((duration + 4) * pxPerSec)
-  );
+  const totalWidth = Math.max(600, Math.ceil((duration + 4) * pxPerSec));
 
   const clientXToTime = (clientX: number): number => {
     const el = trackAreaRef.current;
@@ -91,6 +126,38 @@ export const Timeline: React.FC<TimelineProps> = ({
     }
   };
 
+  const findCompatibleTrackAtY = (
+    clientY: number,
+    type: TrackType,
+    fallbackTrackId: string
+  ): string => {
+    for (const track of tracks) {
+      if (track.type !== type) continue;
+      const el = rowRefs.current.get(track.id);
+      if (!el) continue;
+      const rect = el.getBoundingClientRect();
+      if (clientY >= rect.top && clientY <= rect.bottom) {
+        return track.id;
+      }
+    }
+    return fallbackTrackId;
+  };
+
+  const snapTime = (rawTime: number, excludeClipId: string): number => {
+    const thresholdSec = 8 / pxPerSec;
+    const candidates = [0, currentTime];
+    for (const c of clips) {
+      if (c.id === excludeClipId) continue;
+      candidates.push(c.start, c.start + c.duration);
+    }
+    for (const target of candidates) {
+      if (Math.abs(rawTime - target) <= thresholdSec) {
+        return Math.round(target * 100) / 100;
+      }
+    }
+    return Math.round(rawTime * 20) / 20;
+  };
+
   const startClipDrag = (
     e: React.PointerEvent<HTMLElement>,
     clip: Clip,
@@ -101,11 +168,13 @@ export const Timeline: React.FC<TimelineProps> = ({
     e.currentTarget.setPointerCapture(e.pointerId);
     dragClipRef.current = {
       clipId: clip.id,
+      trackType: clip.track,
       mode,
       startX: e.clientX,
       origStart: clip.start,
       origDuration: clip.duration,
       origTrimStart: clip.trimStart,
+      origTrackId: clip.trackId,
       sourceDuration: clip.sourceDuration || 60,
       speed: clip.speed || 1,
     };
@@ -113,12 +182,19 @@ export const Timeline: React.FC<TimelineProps> = ({
 
   const computePatchFromDrag = (
     drag: NonNullable<typeof dragClipRef.current>,
-    clientX: number
+    clientX: number,
+    clientY: number
   ): Partial<Clip> => {
-    const dt = Math.round(((clientX - drag.startX) / pxPerSec) * 20) / 20;
+    const dt = (clientX - drag.startX) / pxPerSec;
     if (drag.mode === 'move') {
-      const nextStart = Math.max(0, Math.round((drag.origStart + dt) * 100) / 100);
-      return {start: nextStart};
+      const rawStart = Math.max(0, drag.origStart + dt);
+      const nextStart = snapTime(rawStart, drag.clipId);
+      const targetTrackId = findCompatibleTrackAtY(
+        clientY,
+        drag.trackType,
+        drag.origTrackId
+      );
+      return {start: nextStart, trackId: targetTrackId};
     }
     if (drag.mode === 'trim-left') {
       const maxDelta = drag.origDuration - 0.3;
@@ -132,7 +208,6 @@ export const Timeline: React.FC<TimelineProps> = ({
       );
       return {start: nextStart, duration: nextDur, trimStart: nextTrim};
     }
-    // trim-right
     const maxAllowedDur = Math.max(
       0.3,
       (drag.sourceDuration - drag.origTrimStart) / drag.speed
@@ -148,7 +223,7 @@ export const Timeline: React.FC<TimelineProps> = ({
     const drag = dragClipRef.current;
     if (!drag) return;
     e.stopPropagation();
-    const patch = computePatchFromDrag(drag, e.clientX);
+    const patch = computePatchFromDrag(drag, e.clientX, e.clientY);
     onClipTransform(drag.clipId, patch, false);
   };
 
@@ -156,7 +231,7 @@ export const Timeline: React.FC<TimelineProps> = ({
     const drag = dragClipRef.current;
     if (!drag) return;
     e.stopPropagation();
-    const patch = computePatchFromDrag(drag, e.clientX);
+    const patch = computePatchFromDrag(drag, e.clientX, e.clientY);
     dragClipRef.current = null;
     try {
       e.currentTarget.releasePointerCapture(e.pointerId);
@@ -174,11 +249,37 @@ export const Timeline: React.FC<TimelineProps> = ({
   }
 
   return (
-    <div className="flex flex-col border-t border-white/10 bg-[#111114] select-none">
-      {/* Compact zoom & track header strip */}
-      <div className="flex h-8 items-center justify-between border-b border-white/5 px-3 text-[11px] text-zinc-400">
-        <span className="font-medium text-zinc-300">Дорожки монтажа</span>
-        <div className="flex items-center gap-1">
+    <div className="flex h-full flex-col border-t border-white/10 bg-[#111114] select-none">
+      {/* Compact Track Creation + Zoom Header Strip */}
+      <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-white/5 px-2.5 text-[11px] text-zinc-400">
+        <div className="no-scrollbar flex items-center gap-1 overflow-x-auto">
+          <button
+            type="button"
+            onClick={() => onAddTrack('overlay')}
+            className="flex h-6 items-center gap-1 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 text-[10px] font-medium text-indigo-300 hover:bg-indigo-500/20 whitespace-nowrap"
+          >
+            <Plus className="h-3 w-3" />
+            Наложение
+          </button>
+          <button
+            type="button"
+            onClick={() => onAddTrack('text')}
+            className="flex h-6 items-center gap-1 rounded-md border border-amber-500/30 bg-amber-500/10 px-2 text-[10px] font-medium text-amber-300 hover:bg-amber-500/20 whitespace-nowrap"
+          >
+            <Plus className="h-3 w-3" />
+            Текст
+          </button>
+          <button
+            type="button"
+            onClick={() => onAddTrack('audio')}
+            className="flex h-6 items-center gap-1 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2 text-[10px] font-medium text-emerald-300 hover:bg-emerald-500/20 whitespace-nowrap"
+          >
+            <Plus className="h-3 w-3" />
+            Аудио
+          </button>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
             onClick={() => onZoomChange(Math.max(36, pxPerSec - 16))}
@@ -187,7 +288,7 @@ export const Timeline: React.FC<TimelineProps> = ({
           >
             <ZoomOut className="h-3.5 w-3.5" />
           </button>
-          <span className="w-10 text-center font-mono text-[10px] tabular-nums text-zinc-400">
+          <span className="w-9 text-center font-mono text-[10px] tabular-nums text-zinc-400">
             {Math.round((pxPerSec / 64) * 100)}%
           </span>
           <button
@@ -201,29 +302,86 @@ export const Timeline: React.FC<TimelineProps> = ({
         </div>
       </div>
 
-      {/* Main scrollable track grid */}
-      <div className="flex flex-1 min-h-0 overflow-hidden">
+      {/* Main vertically & horizontally scrollable track grid */}
+      <div className="studio-scrollbar flex flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
         {/* Left Track Labels */}
-        <div className="z-20 flex w-14 shrink-0 flex-col border-r border-white/10 bg-[#141418] sm:w-20">
-          <div className="h-6 border-b border-white/5" />
-          {TRACK_CONFIG.map((t) => {
-            const Icon = t.icon;
+        <div className="z-20 flex w-20 shrink-0 flex-col border-r border-white/10 bg-[#141418] sm:w-32">
+          <div className="sticky top-0 z-10 h-6 shrink-0 border-b border-white/5 bg-[#16161b]" />
+          {tracks.map((track) => {
+            const Icon = getTrackIcon(track.type);
+            const hClass = getTrackHeightClass(track.type);
+            const trackClipsCount = clips.filter(
+              (c) => c.trackId === track.id
+            ).length;
+            const sameTypeCount = tracks.filter(
+              (t) => t.type === track.type
+            ).length;
+
             return (
               <div
-                key={t.id}
-                className={`flex ${t.heightClass} items-center justify-center gap-1.5 border-b border-white/5 px-1.5 text-[10px] font-medium text-zinc-400 sm:justify-start sm:px-2.5 sm:text-[11px]`}
+                key={track.id}
+                className={`flex ${hClass} shrink-0 items-center justify-between gap-1 border-b border-white/5 px-1.5 text-[10px] font-medium text-zinc-300 sm:px-2`}
               >
-                <Icon className="h-3.5 w-3.5 shrink-0 text-zinc-500" />
-                <span className="hidden truncate sm:inline">{t.label}</span>
+                <div className="flex min-w-0 items-center gap-1">
+                  <Icon className="h-3 w-3 shrink-0 text-zinc-500" />
+                  <span className="truncate">{track.name}</span>
+                </div>
+                <div className="flex shrink-0 items-center gap-0.5">
+                  {track.type === 'audio' ? (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onUpdateTrack(track.id, {muted: !track.muted})
+                      }
+                      aria-label="Отключить звук дорожки"
+                      className={`flex h-6 w-6 items-center justify-center rounded hover:bg-white/10 ${
+                        track.muted ? 'text-rose-400' : 'text-zinc-500'
+                      }`}
+                    >
+                      {track.muted ? (
+                        <VolumeX className="h-3 w-3" />
+                      ) : (
+                        <Volume2 className="h-3 w-3" />
+                      )}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onUpdateTrack(track.id, {hidden: !track.hidden})
+                      }
+                      aria-label="Скрыть слой дорожки"
+                      className={`flex h-6 w-6 items-center justify-center rounded hover:bg-white/10 ${
+                        track.hidden ? 'text-amber-400' : 'text-zinc-500'
+                      }`}
+                    >
+                      {track.hidden ? (
+                        <EyeOff className="h-3 w-3" />
+                      ) : (
+                        <Eye className="h-3 w-3" />
+                      )}
+                    </button>
+                  )}
+                  {trackClipsCount === 0 && sameTypeCount > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => onDeleteTrack(track.id)}
+                      aria-label="Удалить пустую дорожку"
+                      className="flex h-6 w-6 items-center justify-center rounded text-zinc-500 hover:bg-rose-500/15 hover:text-rose-400"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  )}
+                </div>
               </div>
             );
           })}
         </div>
 
-        {/* Scrollable Ruler + Tracks */}
+        {/* Scrollable Ruler + Dynamic Track Rows */}
         <div
           ref={scrollContainerRef}
-          className="studio-scrollbar relative flex-1 overflow-x-auto overflow-y-hidden"
+          className="studio-scrollbar relative flex-1 overflow-x-auto overflow-y-visible"
         >
           <div
             ref={trackAreaRef}
@@ -236,7 +394,7 @@ export const Timeline: React.FC<TimelineProps> = ({
               onPointerMove={handleRulerPointerMove}
               onPointerUp={handleRulerPointerUp}
               onPointerCancel={handleRulerPointerUp}
-              className="relative h-6 cursor-ew-resize touch-none border-b border-white/10 bg-[#16161b]"
+              className="sticky top-0 z-20 h-6 cursor-ew-resize touch-none border-b border-white/10 bg-[#16161b]"
             >
               {ticks.map((sec) => (
                 <div
@@ -244,7 +402,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                   style={{left: `${sec * pxPerSec}px`}}
                   className="pointer-events-none absolute top-0 flex h-full flex-col justify-between"
                 >
-                  <span className="pl-1 font-mono text-[10px] leading-none text-zinc-500 tabular-nums pt-1">
+                  <span className="pl-1 pt-1 font-mono text-[10px] leading-none text-zinc-500 tabular-nums">
                     {sec}s
                   </span>
                   <span className="h-1.5 w-px bg-white/20" />
@@ -253,16 +411,23 @@ export const Timeline: React.FC<TimelineProps> = ({
             </div>
 
             {/* Track Rows */}
-            {TRACK_CONFIG.map((track) => {
+            {tracks.map((track) => {
+              const hClass = getTrackHeightClass(track.type);
               const trackClips = clips
-                .filter((c) => c.track === track.id)
+                .filter((c) => c.trackId === track.id)
                 .sort((a, b) => a.start - b.start);
 
               return (
                 <div
                   key={track.id}
+                  ref={(el) => {
+                    if (el) rowRefs.current.set(track.id, el);
+                    else rowRefs.current.delete(track.id);
+                  }}
                   onClick={() => onSelectClip(null)}
-                  className={`relative ${track.heightClass} border-b border-white/5 bg-[#0e0e11]`}
+                  className={`relative ${hClass} border-b border-white/5 bg-[#0e0e11] ${
+                    track.hidden || track.muted ? 'opacity-45' : ''
+                  }`}
                 >
                   {trackClips.map((clip) => {
                     const isSelected = clip.id === selectedClipId;
@@ -273,11 +438,11 @@ export const Timeline: React.FC<TimelineProps> = ({
                     const widthPx = Math.max(26, clip.duration * pxPerSec);
 
                     const baseSurface =
-                      track.id === 'video'
+                      track.type === 'video'
                         ? 'bg-zinc-800/95'
-                        : track.id === 'overlay'
+                        : track.type === 'overlay'
                           ? 'bg-indigo-950/90'
-                          : track.id === 'text'
+                          : track.type === 'text'
                             ? 'bg-amber-950/85'
                             : 'bg-emerald-950/85';
 
@@ -303,7 +468,6 @@ export const Timeline: React.FC<TimelineProps> = ({
                         onPointerCancel={handleClipPointerUp}
                         className={`group absolute top-1 bottom-1 flex touch-none cursor-grab items-center overflow-hidden rounded-lg ${baseSurface} active:cursor-grabbing`}
                       >
-                        {/* Thumbnail strip for image clips */}
                         {clip.kind === 'image' && clip.src && (
                           <div
                             className="pointer-events-none absolute inset-0 opacity-45"
@@ -315,8 +479,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                           />
                         )}
 
-                        {/* Waveform visualization for audio clips */}
-                        {track.id === 'audio' && (
+                        {track.type === 'audio' && (
                           <div className="pointer-events-none absolute inset-0 flex items-center gap-[2px] px-2 opacity-35">
                             {Array.from({
                               length: Math.max(6, Math.floor(widthPx / 6)),
@@ -332,7 +495,6 @@ export const Timeline: React.FC<TimelineProps> = ({
                           </div>
                         )}
 
-                        {/* Clip Label */}
                         <div className="relative z-10 flex w-full items-center justify-between gap-1 px-2.5 text-[11px] font-medium text-white drop-shadow">
                           <span className="truncate">
                             {clip.kind === 'text'
@@ -344,7 +506,6 @@ export const Timeline: React.FC<TimelineProps> = ({
                           </span>
                         </div>
 
-                        {/* Remote Collaborator Indicator */}
                         {remoteOwner && (
                           <span
                             style={{backgroundColor: remoteOwner.color}}
@@ -354,7 +515,6 @@ export const Timeline: React.FC<TimelineProps> = ({
                           </span>
                         )}
 
-                        {/* Left & Right Touch Trim Handles when selected */}
                         {isSelected && (
                           <>
                             <div

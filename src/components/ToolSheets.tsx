@@ -11,6 +11,7 @@ import {
   Type,
   Upload,
   Users,
+  Wifi,
   X,
 } from 'lucide-react';
 import {
@@ -23,58 +24,101 @@ import {
   SYNTH_AUDIO_PRESETS,
 } from '../shared/types.ts';
 import type {
+  BlendMode,
   ChatMessage,
   Clip,
   Collaborator,
   FilterPreset,
   MotionEffect,
-  TrackType,
+  RoomSummary,
   TransitionType,
 } from '../shared/types.ts';
 
 export type ActiveToolTab =
   | 'edit'
   | 'media'
+  | 'overlay'
   | 'text'
   | 'effects'
   | 'audio'
   | 'team';
 
+async function uploadOrLocalMedia(
+  file: File,
+  fallbackKind: 'video' | 'image' | 'audio'
+): Promise<{name: string; kind: 'video' | 'image' | 'audio'; src: string}> {
+  const uploadEndpoint = getApiUrl('/api/upload');
+  if (uploadEndpoint) {
+    try {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
+      const data = (await res.json()) as {
+        name?: string;
+        kind?: 'video' | 'image' | 'audio';
+        src?: string;
+      };
+      if (res.ok && data.src) {
+        return {
+          name: data.name || file.name,
+          kind: data.kind || fallbackKind,
+          src: data.src,
+        };
+      }
+    } catch {
+      // Fall back to local object URL
+    }
+  }
+  return {
+    name: file.name,
+    kind: fallbackKind,
+    src: URL.createObjectURL(file),
+  };
+}
+
+function probeMediaDuration(
+  url: string,
+  kind: 'video' | 'image' | 'audio'
+): Promise<number> {
+  if (kind === 'image') return Promise.resolve(4.5);
+  return new Promise((resolve) => {
+    const el = document.createElement(kind === 'audio' ? 'audio' : 'video');
+    el.preload = 'metadata';
+    el.onloadedmetadata = () => {
+      const d = Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 5;
+      resolve(Math.round(d * 10) / 10);
+    };
+    el.onerror = () => resolve(5);
+    el.src = url;
+  });
+}
+
 interface MediaPanelProps {
+  defaultTrack?: 'video' | 'overlay';
   onAddMediaClip: (opts: {
     name: string;
     kind: 'video' | 'image';
     src: string;
     duration: number;
     track: 'video' | 'overlay';
+    forceNewTrack?: boolean;
   }) => void;
   onClose?: () => void;
 }
 
 export const MediaPanel: React.FC<MediaPanelProps> = ({
+  defaultTrack = 'video',
   onAddMediaClip,
   onClose,
 }) => {
-  const [targetTrack, setTargetTrack] = useState<'video' | 'overlay'>('video');
+  const [targetTrack, setTargetTrack] = useState<'video' | 'overlay'>(
+    defaultTrack
+  );
+  const [forceNewTrack, setForceNewTrack] = useState(
+    defaultTrack === 'overlay'
+  );
   const [uploading, setUploading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-
-  const probeMediaDuration = (
-    url: string,
-    kind: 'video' | 'image'
-  ): Promise<number> => {
-    if (kind === 'image') return Promise.resolve(4.5);
-    return new Promise((resolve) => {
-      const v = document.createElement('video');
-      v.preload = 'metadata';
-      v.onloadedmetadata = () => {
-        const d = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 5;
-        resolve(Math.round(d * 10) / 10);
-      };
-      v.onerror = () => resolve(5);
-      v.src = url;
-    });
-  };
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -83,47 +127,21 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
     setErrorMsg(null);
 
     try {
-      const uploadEndpoint = getApiUrl('/api/upload');
       for (const file of Array.from(files)) {
         const isVideo = file.type.startsWith('video/');
-        const mediaKind: 'video' | 'image' = isVideo ? 'video' : 'image';
-
-        if (uploadEndpoint) {
-          try {
-            const form = new FormData();
-            form.append('file', file);
-            const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
-            const data = (await res.json()) as {
-              name?: string;
-              kind?: 'video' | 'image' | 'audio';
-              src?: string;
-              error?: string;
-            };
-            if (res.ok && data.src) {
-              const serverKind = data.kind === 'video' ? 'video' : 'image';
-              const dur = await probeMediaDuration(data.src, serverKind);
-              onAddMediaClip({
-                name: data.name || file.name,
-                kind: serverKind,
-                src: data.src,
-                duration: Math.min(30, dur),
-                track: targetTrack,
-              });
-              continue;
-            }
-          } catch {
-            // Fall back to local device file URL if offline/APK without server
-          }
-        }
-
-        const localUrl = URL.createObjectURL(file);
-        const dur = await probeMediaDuration(localUrl, mediaKind);
+        const uploaded = await uploadOrLocalMedia(
+          file,
+          isVideo ? 'video' : 'image'
+        );
+        const mediaKind = uploaded.kind === 'video' ? 'video' : 'image';
+        const dur = await probeMediaDuration(uploaded.src, mediaKind);
         onAddMediaClip({
-          name: file.name,
+          name: uploaded.name,
           kind: mediaKind,
-          src: localUrl,
+          src: uploaded.src,
           duration: Math.min(30, dur),
           track: targetTrack,
+          forceNewTrack,
         });
       }
       onClose?.();
@@ -140,13 +158,14 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-zinc-400">
-          Куда добавить:
-        </span>
-        <div className="flex rounded-lg bg-zinc-900 p-1 border border-white/10">
+        <span className="text-xs font-medium text-zinc-400">Куда добавить:</span>
+        <div className="flex rounded-lg border border-white/10 bg-zinc-900 p-1">
           <button
             type="button"
-            onClick={() => setTargetTrack('video')}
+            onClick={() => {
+              setTargetTrack('video');
+              setForceNewTrack(false);
+            }}
             className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
               targetTrack === 'video'
                 ? 'bg-cyan-500 text-zinc-950'
@@ -158,26 +177,38 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
           </button>
           <button
             type="button"
-            onClick={() => setTargetTrack('overlay')}
+            onClick={() => {
+              setTargetTrack('overlay');
+              setForceNewTrack(true);
+            }}
             className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
               targetTrack === 'overlay'
-                ? 'bg-cyan-500 text-zinc-950'
+                ? 'bg-indigo-500 text-white'
                 : 'text-zinc-300 hover:text-white'
             }`}
           >
             <Layers className="h-3.5 w-3.5" />
-            Слой (PIP)
+            Наложение
           </button>
         </div>
       </div>
 
-      {/* Upload from Phone / PC */}
+      <label className="flex items-center justify-between rounded-xl border border-white/10 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300 cursor-pointer">
+        <span>Создавать новую дорожку (без наслаивания)</span>
+        <input
+          type="checkbox"
+          checked={forceNewTrack}
+          onChange={(e) => setForceNewTrack(e.target.checked)}
+          className="h-4 w-4 accent-cyan-400"
+        />
+      </label>
+
       <label className="flex min-h-[56px] cursor-pointer items-center justify-center gap-2.5 rounded-xl border border-dashed border-cyan-500/40 bg-cyan-500/10 px-4 py-3 text-sm font-medium text-cyan-200 transition hover:bg-cyan-500/15 active:scale-[0.99]">
         <Upload className="h-4 w-4 shrink-0 text-cyan-400" />
         <span>
           {uploading
-            ? 'Загрузка на сервер...'
-            : 'Загрузить видео или фото с устройства'}
+            ? 'Загрузка файла...'
+            : 'Выбрать видео или фото с устройства'}
         </span>
         <input
           type="file"
@@ -189,13 +220,11 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
         />
       </label>
 
-      {errorMsg && (
-        <p className="text-xs text-rose-400">{errorMsg}</p>
-      )}
+      {errorMsg && <p className="text-xs text-rose-400">{errorMsg}</p>}
 
       <div>
         <p className="mb-2 text-xs font-medium text-zinc-400">
-          Готовые сцены для быстрого монтажа
+          Готовые сцены для монтажа
         </p>
         <div className="grid grid-cols-3 gap-2.5">
           {SAMPLE_MEDIA_ASSETS.map((asset) => (
@@ -209,6 +238,7 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
                   src: asset.src,
                   duration: asset.duration,
                   track: targetTrack,
+                  forceNewTrack,
                 });
                 onClose?.();
               }}
@@ -236,9 +266,145 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
   );
 };
 
+interface OverlayPanelProps {
+  selectedClip: Clip | null;
+  onAddMediaClip: MediaPanelProps['onAddMediaClip'];
+  onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+  onClose?: () => void;
+}
+
+const BLEND_MODES: Array<{id: BlendMode; label: string}> = [
+  {id: 'source-over', label: 'Обычный'},
+  {id: 'screen', label: 'Экран'},
+  {id: 'multiply', label: 'Умножение'},
+  {id: 'overlay', label: 'Перекрытие'},
+  {id: 'lighten', label: 'Светлее'},
+];
+
+export const OverlayPanel: React.FC<OverlayPanelProps> = ({
+  selectedClip,
+  onAddMediaClip,
+  onUpdateClip,
+  onClose,
+}) => {
+  const isOverlay = selectedClip?.track === 'overlay';
+
+  return (
+    <div className="space-y-4">
+      {isOverlay && (
+        <div className="space-y-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3">
+          <p className="text-xs font-semibold text-indigo-200">
+            Настройка наложения: {selectedClip.name}
+          </p>
+
+          <label className="block space-y-1 text-xs text-zinc-300">
+            <div className="flex justify-between">
+              <span>Размер (PIP)</span>
+              <span className="font-mono tabular-nums">
+                {Math.round((selectedClip.mediaScale ?? 0.42) * 100)}%
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0.15}
+              max={0.95}
+              step={0.05}
+              value={selectedClip.mediaScale ?? 0.42}
+              onChange={(e) =>
+                onUpdateClip(selectedClip.id, {
+                  mediaScale: Number(e.target.value),
+                })
+              }
+              className="w-full accent-indigo-400"
+            />
+          </label>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="block space-y-1 text-xs text-zinc-300">
+              <div className="flex justify-between">
+                <span>Поворот</span>
+                <span className="font-mono tabular-nums">
+                  {selectedClip.rotation ?? 0}°
+                </span>
+              </div>
+              <input
+                type="range"
+                min={-180}
+                max={180}
+                step={2}
+                value={selectedClip.rotation ?? 0}
+                onChange={(e) =>
+                  onUpdateClip(selectedClip.id, {
+                    rotation: Number(e.target.value),
+                  })
+                }
+                className="w-full accent-indigo-400"
+              />
+            </label>
+
+            <label className="block space-y-1 text-xs text-zinc-300">
+              <div className="flex justify-between">
+                <span>Скругление</span>
+                <span className="font-mono tabular-nums">
+                  {selectedClip.borderRadius ?? 20}px
+                </span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={80}
+                step={4}
+                value={selectedClip.borderRadius ?? 20}
+                onChange={(e) =>
+                  onUpdateClip(selectedClip.id, {
+                    borderRadius: Number(e.target.value),
+                  })
+                }
+                className="w-full accent-indigo-400"
+              />
+            </label>
+          </div>
+
+          <div>
+            <p className="mb-1.5 text-xs text-zinc-300">Режим смешивания</p>
+            <div className="flex flex-wrap gap-1.5">
+              {BLEND_MODES.map((bm) => (
+                <button
+                  key={bm.id}
+                  type="button"
+                  onClick={() =>
+                    onUpdateClip(selectedClip.id, {blendMode: bm.id})
+                  }
+                  className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium ${
+                    (selectedClip.blendMode ?? 'source-over') === bm.id
+                      ? 'bg-indigo-500 text-white'
+                      : 'bg-zinc-900 text-zinc-300 border border-white/10'
+                  }`}
+                >
+                  {bm.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <p className="text-[11px] text-zinc-400">
+            Перетаскивайте наложение пальцем прямо по экрану предпросмотра.
+          </p>
+        </div>
+      )}
+
+      <MediaPanel
+        defaultTrack="overlay"
+        onAddMediaClip={onAddMediaClip}
+        onClose={onClose}
+      />
+    </div>
+  );
+};
+
 interface TextPanelProps {
   selectedClip: Clip | null;
-  onAddText: (text: string) => void;
+  onAddText: (text: string, forceNewTrack: boolean) => void;
   onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
 }
 
@@ -265,6 +431,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
   onUpdateClip,
 }) => {
   const [draftText, setDraftText] = useState('НОВЫЙ ТИТР');
+  const [forceNewTrack, setForceNewTrack] = useState(true);
   const isTextSelected = selectedClip?.track === 'text';
 
   const style = selectedClip?.textStyle ?? {
@@ -295,13 +462,23 @@ export const TextPanel: React.FC<TextPanelProps> = ({
         />
         <button
           type="button"
-          onClick={() => onAddText(draftText || 'ТИТР')}
+          onClick={() => onAddText(draftText || 'ТИТР', forceNewTrack)}
           className="flex h-11 shrink-0 items-center gap-1.5 rounded-xl bg-cyan-500 px-4 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 active:scale-95 whitespace-nowrap"
         >
           <Plus className="h-4 w-4" />
           Добавить
         </button>
       </div>
+
+      <label className="flex items-center justify-between rounded-xl border border-white/10 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300 cursor-pointer">
+        <span>Новый титр на отдельную дорожку</span>
+        <input
+          type="checkbox"
+          checked={forceNewTrack}
+          onChange={(e) => setForceNewTrack(e.target.checked)}
+          className="h-4 w-4 accent-cyan-400"
+        />
+      </label>
 
       {isTextSelected ? (
         <div className="space-y-3 border-t border-white/10 pt-3">
@@ -426,7 +603,7 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
   if (!selectedClip || selectedClip.track === 'audio') {
     return (
       <div className="rounded-xl border border-white/10 bg-zinc-900/60 p-4 text-center text-xs text-zinc-400">
-        Выберите видео, фото, слой или титр на таймлайне, чтобы настроить фильтры и анимацию.
+        Выберите видео, фото, наложение или титр на таймлайне, чтобы настроить фильтры и анимацию.
       </div>
     );
   }
@@ -463,6 +640,28 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
               onClick={() => onUpdateClip(selectedClip.id, {transitionIn: t.id})}
               className={`min-h-[38px] rounded-lg px-2 text-xs font-medium transition whitespace-nowrap ${
                 selectedClip.transitionIn === t.id
+                  ? 'bg-cyan-500 text-zinc-950'
+                  : 'bg-zinc-900 text-zinc-300 border border-white/10'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <p className="mb-2 text-xs font-medium text-zinc-400">Переход в конце</p>
+        <div className="grid grid-cols-4 gap-1.5">
+          {TRANSITIONS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() =>
+                onUpdateClip(selectedClip.id, {transitionOut: t.id})
+              }
+              className={`min-h-[38px] rounded-lg px-2 text-xs font-medium transition whitespace-nowrap ${
+                (selectedClip.transitionOut ?? 'none') === t.id
                   ? 'bg-cyan-500 text-zinc-950'
                   : 'bg-zinc-900 text-zinc-300 border border-white/10'
               }`}
@@ -591,6 +790,7 @@ interface AudioPanelProps {
     kind: 'audio' | 'synth';
     src: string;
     duration: number;
+    forceNewTrack?: boolean;
   }) => void;
   onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
   onClose?: () => void;
@@ -609,48 +809,18 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
     if (!file) return;
     setUploading(true);
     try {
-      const uploadEndpoint = getApiUrl('/api/upload');
-      let finalSrc = '';
-      let finalName = file.name;
-
-      if (uploadEndpoint) {
-        try {
-          const form = new FormData();
-          form.append('file', file);
-          const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
-          const data = (await res.json()) as {
-            name?: string;
-            src?: string;
-          };
-          if (res.ok && data.src) {
-            finalSrc = data.src;
-            finalName = data.name || file.name;
-          }
-        } catch {
-          // fallback to local URL
-        }
-      }
-
-      if (!finalSrc) {
-        finalSrc = URL.createObjectURL(file);
-      }
-
-      const audio = new Audio(finalSrc);
-      const dur = await new Promise<number>((resolve) => {
-        audio.onloadedmetadata = () =>
-          resolve(Number.isFinite(audio.duration) ? audio.duration : 10);
-        audio.onerror = () => resolve(10);
-      });
-
+      const uploaded = await uploadOrLocalMedia(file, 'audio');
+      const dur = await probeMediaDuration(uploaded.src, 'audio');
       onAddAudioClip({
-        name: finalName,
+        name: uploaded.name,
         kind: 'audio',
-        src: finalSrc,
-        duration: Math.min(60, Math.round(dur * 10) / 10),
+        src: uploaded.src,
+        duration: Math.min(60, dur),
+        forceNewTrack: false,
       });
       onClose?.();
     } catch {
-      // keep panel open on failure
+      // keep open
     } finally {
       setUploading(false);
       e.target.value = '';
@@ -711,6 +881,7 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
                   kind: 'synth',
                   src: preset.src,
                   duration: preset.duration,
+                  forceNewTrack: false,
                 });
                 onClose?.();
               }}
@@ -743,11 +914,12 @@ interface TeamPanelProps {
   serverUrl: string;
   user: {id: string; name: string; color: string};
   allCollaborators: Collaborator[];
+  availableRooms: RoomSummary[];
   chat: ChatMessage[];
   status: 'connecting' | 'connected' | 'reconnecting' | 'offline';
   onUpdateProfile: (name: string, color: string) => void;
+  onOpenLobby: () => void;
   onSwitchRoom: (nextRoomId: string) => void;
-  onCreateNewRoom: (blank: boolean) => void;
   onSendChat: (text: string) => void;
   onUpdateServerUrl: (url: string) => void;
 }
@@ -766,17 +938,17 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
   serverUrl,
   user,
   allCollaborators,
+  availableRooms,
   chat,
   status,
   onUpdateProfile,
+  onOpenLobby,
   onSwitchRoom,
-  onCreateNewRoom,
   onSendChat,
   onUpdateServerUrl,
 }) => {
   const [copied, setCopied] = useState(false);
   const [nameInput, setNameInput] = useState(user.name);
-  const [roomInput, setRoomInput] = useState('');
   const [chatInput, setChatInput] = useState('');
   const [serverInput, setServerInput] = useState(serverUrl);
   const [lanUrls, setLanUrls] = useState<string[]>([]);
@@ -818,24 +990,46 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
 
   return (
     <div className="space-y-4">
+      {/* Minecraft-style LAN Room Browser Button */}
+      <button
+        type="button"
+        onClick={onOpenLobby}
+        className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-cyan-500/40 bg-cyan-500/15 px-3.5 py-2.5 text-left hover:bg-cyan-500/20 active:scale-[0.99]"
+      >
+        <div className="flex items-center gap-2.5">
+          <Wifi className="h-4 w-4 text-cyan-400" />
+          <div>
+            <p className="text-xs font-semibold text-white">
+              Список комнат в сети ({availableRooms.length})
+            </p>
+            <p className="text-[11px] text-cyan-200/80">
+              Войти, создать или найти сервер в Wi-Fi
+            </p>
+          </div>
+        </div>
+        <span className="rounded-lg bg-cyan-500 px-2.5 py-1 text-[11px] font-semibold text-zinc-950">
+          Открыть
+        </span>
+      </button>
+
       {isNative && (
         <form
           onSubmit={(e) => {
             e.preventDefault();
             onUpdateServerUrl(serverInput);
           }}
-          className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-3 space-y-2"
+          className="rounded-xl border border-white/10 bg-zinc-900/70 p-3 space-y-2"
         >
-          <p className="text-xs font-medium text-cyan-200">
-            Сервер для совместного монтажа
+          <p className="text-xs font-medium text-zinc-200">
+            IP / URL сервера для синхронизации
           </p>
           <div className="flex gap-2">
             <input
-              type="url"
+              type="text"
               value={serverInput}
               onChange={(e) => setServerInput(e.target.value)}
-              placeholder="http://192.168.1.10:3000 или https://..."
-              className="h-10 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+              placeholder="192.168.1.15 или https://..."
+              className="h-10 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
             />
             <button
               type="submit"
@@ -844,13 +1038,10 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
               OK
             </button>
           </div>
-          <p className="text-[11px] text-zinc-400">
-            Без сервера редактор работает локально на телефоне; укажите адрес сервера для синхронизации с командой.
-          </p>
         </form>
       )}
 
-      {/* Room Link & Status */}
+      {/* Room Status & Invite */}
       <div className="rounded-xl border border-white/10 bg-zinc-900/80 p-3 space-y-2.5">
         <div className="flex items-center justify-between text-xs">
           <span className="font-medium text-zinc-200">
@@ -874,68 +1065,57 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
           </span>
         </div>
 
-        <div className="flex gap-2">
-          <button
-            type="button"
-            onClick={handleCopy}
-            className="flex min-h-[44px] flex-1 items-center justify-center gap-2 rounded-xl bg-cyan-500 px-3 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 active:scale-[0.98]"
-          >
-            {copied ? (
-              <>
-                <Check className="h-4 w-4" />
-                Ссылка скопирована
-              </>
-            ) : (
-              <>
-                <Copy className="h-4 w-4" />
-                Пригласить по ссылке
-              </>
-            )}
-          </button>
-          <button
-            type="button"
-            onClick={() => onCreateNewRoom(false)}
-            className="min-h-[44px] rounded-xl border border-white/15 bg-zinc-800 px-3 text-xs font-medium text-zinc-200 hover:bg-zinc-700 whitespace-nowrap"
-          >
-            + Новая
-          </button>
-        </div>
+        <button
+          type="button"
+          onClick={handleCopy}
+          className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-xl bg-zinc-800 px-3 text-xs font-medium text-zinc-100 hover:bg-zinc-700"
+        >
+          {copied ? (
+            <>
+              <Check className="h-4 w-4 text-emerald-400" />
+              Ссылка скопирована
+            </>
+          ) : (
+            <>
+              <Copy className="h-4 w-4 text-cyan-400" />
+              Копировать ссылку-приглашение
+            </>
+          )}
+        </button>
 
         {lanUrls.length > 0 && (
           <div className="rounded-lg bg-zinc-950/70 px-2.5 py-2 text-[11px] text-zinc-400">
             <span className="block text-zinc-500">
-              Открыть с телефона в той же Wi-Fi сети:
+              Локальный адрес в вашей Wi-Fi сети:
             </span>
             <span className="font-mono text-zinc-300 break-all">
-              {lanUrls[0]}/?room={roomId}
+              {lanUrls[0]}
             </span>
           </div>
         )}
 
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (roomInput.trim()) {
-              onSwitchRoom(roomInput.trim());
-              setRoomInput('');
-            }
-          }}
-          className="flex gap-2 pt-1"
-        >
-          <input
-            type="text"
-            value={roomInput}
-            onChange={(e) => setRoomInput(e.target.value)}
-            placeholder="Код комнаты для входа..."
-            className="h-10 flex-1 rounded-lg border border-white/10 bg-zinc-950 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
-          />
-          <button
-            type="submit"
-            className="h-10 rounded-lg border border-white/15 bg-zinc-800 px-3 text-xs font-medium text-zinc-200 hover:bg-zinc-700"
-          >
-            Войти
-          </button>
-        </form>
+        {/* Quick 1-tap switch between open rooms */}
+        {availableRooms.length > 1 && (
+          <div className="space-y-1 pt-1">
+            <p className="text-[11px] text-zinc-400">Быстрый вход в комнату:</p>
+            <div className="flex flex-wrap gap-1.5">
+              {availableRooms.slice(0, 4).map((r) => (
+                <button
+                  key={r.roomId}
+                  type="button"
+                  onClick={() => onSwitchRoom(r.roomId)}
+                  className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium border ${
+                    r.roomId === roomId
+                      ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300'
+                      : 'border-white/10 bg-zinc-950 text-zinc-300 hover:border-white/25'
+                  }`}
+                >
+                  {r.title} ({r.collaboratorsCount})
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Your Profile */}
@@ -998,12 +1178,12 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
       {/* Live Studio Chat */}
       <div className="space-y-2 border-t border-white/10 pt-3">
         <p className="text-xs font-medium text-zinc-400">Чат монтажёров</p>
-        <div className="studio-scrollbar max-h-36 space-y-1.5 overflow-y-auto rounded-xl bg-zinc-950/80 p-2.5 border border-white/5">
+        <div className="studio-scrollbar max-h-36 space-y-1.5 overflow-y-auto rounded-xl border border-white/5 bg-zinc-950/80 p-2.5">
           {chat.map((m) => (
             <div key={m.id} className="text-xs leading-relaxed">
               <span
                 style={{color: m.userColor}}
-                className="font-semibold mr-1.5"
+                className="mr-1.5 font-semibold"
               >
                 {m.userName}:
               </span>
@@ -1053,7 +1233,7 @@ export const BottomSheet: React.FC<BottomSheetProps> = ({
 }) => {
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-xs lg:hidden">
-      <div className="max-h-[78dvh] w-full overflow-y-auto rounded-t-3xl border-t border-white/15 bg-[#141418] px-4 pt-2 pb-6 shadow-2xl">
+      <div className="max-h-[80dvh] w-full overflow-y-auto rounded-t-3xl border-t border-white/15 bg-[#141418] px-4 pt-2 pb-6 shadow-2xl">
         <div className="mx-auto mb-3 h-1.5 w-10 rounded-full bg-zinc-700" />
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold text-white">{title}</h2>
@@ -1079,10 +1259,9 @@ export const TOOL_TABS: Array<{
 }> = [
   {id: 'edit', label: 'Монтаж', icon: Film},
   {id: 'media', label: 'Медиа', icon: Plus},
+  {id: 'overlay', label: 'Наложение', icon: Layers},
   {id: 'text', label: 'Текст', icon: Type},
   {id: 'effects', label: 'Эффекты', icon: Sparkles},
   {id: 'audio', label: 'Аудио', icon: Music},
-  {id: 'team', label: 'Команда', icon: Users},
+  {id: 'team', label: 'Сеть', icon: Users},
 ];
-
-export type TrackFilter = TrackType;

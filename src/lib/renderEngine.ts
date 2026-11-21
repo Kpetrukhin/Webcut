@@ -3,6 +3,7 @@ import type {
   Clip,
   Collaborator,
   FilterPreset,
+  Track,
 } from '../shared/types.ts';
 import type {StudioAudioEngine} from './audioEngine.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
@@ -47,7 +48,7 @@ export class MediaPool {
       vid = document.createElement('video');
       vid.crossOrigin = 'anonymous';
       vid.playsInline = true;
-      vid.muted = true; // Video preview playback synced separately
+      vid.muted = true;
       vid.preload = 'auto';
       vid.src = resolved;
       this.videos.set(resolved, vid);
@@ -55,16 +56,29 @@ export class MediaPool {
     return vid;
   }
 
-  public syncVideos(clips: Clip[], time: number, isPlaying: boolean) {
+  public syncVideos(
+    clips: Clip[],
+    time: number,
+    isPlaying: boolean,
+    tracks?: Track[]
+  ) {
+    const hiddenIds = new Set(
+      (tracks ?? []).filter((t) => t.hidden).map((t) => t.id)
+    );
+    const mutedIds = new Set(
+      (tracks ?? []).filter((t) => t.muted).map((t) => t.id)
+    );
     const activeVideos = new Map<string, Clip>();
     for (const c of clips) {
       if (
         c.kind === 'video' &&
         c.src &&
+        !hiddenIds.has(c.trackId) &&
         time >= c.start &&
         time < c.start + c.duration
       ) {
-        activeVideos.set(c.src, c);
+        const resolved = resolveMediaSrc(c.src) || c.src;
+        activeVideos.set(resolved, c);
       }
     }
 
@@ -79,8 +93,9 @@ export class MediaPool {
         activeClip.trimStart +
         (time - activeClip.start) * (activeClip.speed || 1);
       vid.playbackRate = activeClip.speed || 1;
-      vid.muted = activeClip.volume <= 0.01;
-      vid.volume = Math.max(0, Math.min(1, activeClip.volume));
+      const isMuted = mutedIds.has(activeClip.trackId) || activeClip.volume <= 0.01;
+      vid.muted = isMuted;
+      vid.volume = isMuted ? 0 : Math.max(0, Math.min(1, activeClip.volume));
 
       if (vid.readyState >= 1) {
         const clampedTarget = Math.min(
@@ -169,10 +184,11 @@ function drawCoverMedia(
     offsetX = (progress - 0.5) * cw * 0.08;
   }
 
-  // Transition In (first 0.45s)
   const elapsed = progress * clip.duration;
+  const remaining = (1 - progress) * clip.duration;
   const transDur = Math.min(0.45, clip.duration * 0.4);
   let transAlpha = clip.opacity;
+
   if (elapsed < transDur && clip.transitionIn !== 'none') {
     const t = Math.max(0, Math.min(1, elapsed / transDur));
     const eased = 1 - Math.pow(1 - t, 3);
@@ -187,6 +203,20 @@ function drawCoverMedia(
     }
   }
 
+  if (remaining < transDur && clip.transitionOut && clip.transitionOut !== 'none') {
+    const t = Math.max(0, Math.min(1, remaining / transDur));
+    const eased = 1 - Math.pow(1 - t, 3);
+    if (clip.transitionOut === 'fade') {
+      transAlpha *= eased;
+    } else if (clip.transitionOut === 'zoom') {
+      zoom *= 1.25 - 0.25 * eased;
+      transAlpha *= eased;
+    } else if (clip.transitionOut === 'slide') {
+      offsetX -= (1 - eased) * cw * 0.35;
+      transAlpha *= eased;
+    }
+  }
+
   const drawW = mw * baseScale * zoom;
   const drawH = mh * baseScale * zoom;
   const centerX = cw * (clip.mediaX ?? 0.5) + offsetX;
@@ -194,13 +224,209 @@ function drawCoverMedia(
 
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, transAlpha));
+  ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
   ctx.filter = buildFilterString(
     clip.filter,
     clip.brightness,
     clip.contrast,
     clip.saturate
   );
-  ctx.drawImage(media, centerX - drawW / 2, centerY - drawH / 2, drawW, drawH);
+  if (clip.rotation) {
+    ctx.translate(centerX, centerY);
+    ctx.rotate((clip.rotation * Math.PI) / 180);
+    ctx.drawImage(media, -drawW / 2, -drawH / 2, drawW, drawH);
+  } else {
+    ctx.drawImage(media, centerX - drawW / 2, centerY - drawH / 2, drawW, drawH);
+  }
+  ctx.restore();
+}
+
+function drawOverlayClip(
+  ctx: CanvasRenderingContext2D,
+  cw: number,
+  ch: number,
+  clip: Clip,
+  time: number,
+  pool: MediaPool,
+  selectedClipId: string | null,
+  collaborators: Collaborator[]
+) {
+  const media =
+    clip.kind === 'video' && clip.src
+      ? pool.getVideo(clip.src)
+      : clip.src
+        ? pool.getImage(clip.src)
+        : null;
+
+  const mw =
+    media instanceof HTMLVideoElement
+      ? media.videoWidth
+      : media instanceof HTMLImageElement
+        ? media.naturalWidth
+        : 0;
+  const mh =
+    media instanceof HTMLVideoElement
+      ? media.videoHeight
+      : media instanceof HTMLImageElement
+        ? media.naturalHeight
+        : 0;
+
+  const scale = clip.mediaScale ?? 0.42;
+  const aspect = mw && mh ? mw / mh : 9 / 16;
+  const pipW = cw * scale;
+  const pipH = pipW / aspect;
+  const cx = cw * (clip.mediaX ?? 0.72);
+  const cy = ch * (clip.mediaY ?? 0.25);
+
+  const elapsed = time - clip.start;
+  const remaining = clip.start + clip.duration - time;
+  const transDur = Math.min(0.4, clip.duration * 0.35);
+  let alpha = clip.opacity;
+  let animScale = 1;
+  if (elapsed < transDur && clip.transitionIn !== 'none') {
+    const t = Math.max(0, elapsed / transDur);
+    alpha *= t;
+    if (clip.transitionIn === 'zoom') animScale = 0.75 + 0.25 * t;
+  }
+  if (remaining < transDur && clip.transitionOut && clip.transitionOut !== 'none') {
+    const t = Math.max(0, remaining / transDur);
+    alpha *= t;
+  }
+
+  const radius = (clip.borderRadius ?? 20) * (cw / 720);
+  const rotRad = ((clip.rotation ?? 0) * Math.PI) / 180;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  if (rotRad !== 0) ctx.rotate(rotRad);
+  if (animScale !== 1) ctx.scale(animScale, animScale);
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
+
+  ctx.beginPath();
+  ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
+  ctx.clip();
+
+  if (
+    media &&
+    (media instanceof HTMLImageElement || media.readyState >= 2) &&
+    mw &&
+    mh
+  ) {
+    ctx.filter = buildFilterString(
+      clip.filter,
+      clip.brightness,
+      clip.contrast,
+      clip.saturate
+    );
+    ctx.drawImage(media, -pipW / 2, -pipH / 2, pipW, pipH);
+  } else {
+    ctx.fillStyle = '#18181b';
+    ctx.fillRect(-pipW / 2, -pipH / 2, pipW, pipH);
+  }
+  ctx.restore();
+
+  const remoteOwner = collaborators.find((u) => u.selectedClipId === clip.id);
+  if (clip.id === selectedClipId || remoteOwner) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    if (rotRad !== 0) ctx.rotate(rotRad);
+    ctx.strokeStyle =
+      clip.id === selectedClipId ? '#22d3ee' : remoteOwner!.color;
+    ctx.lineWidth = 3 * (cw / 720);
+    ctx.setLineDash([8 * (cw / 720), 6 * (cw / 720)]);
+    ctx.beginPath();
+    ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawTextClip(
+  ctx: CanvasRenderingContext2D,
+  cw: number,
+  ch: number,
+  clip: Clip,
+  time: number,
+  selectedClipId: string | null,
+  collaborators: Collaborator[]
+) {
+  const style = clip.textStyle ?? {
+    fontSize: 48,
+    color: '#ffffff',
+    bgColor: 'rgba(9,9,11,0.72)',
+    fontWeight: 'bold',
+    x: 0.5,
+    y: 0.78,
+    align: 'center',
+  };
+  const textVal = clip.text ?? clip.name;
+  const elapsed = time - clip.start;
+  const transDur = Math.min(0.35, clip.duration * 0.3);
+  let alpha = clip.opacity;
+  if (clip.transitionIn === 'fade' && elapsed < transDur) {
+    alpha *= Math.max(0, elapsed / transDur);
+  }
+
+  ctx.save();
+  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+  const scaleFactor = cw / 720;
+  const fontSize = Math.round(style.fontSize * scaleFactor);
+  ctx.font = `${style.fontWeight === 'bold' ? '700' : '500'} ${fontSize}px "Plus Jakarta Sans", sans-serif`;
+  ctx.textAlign = style.align;
+  ctx.textBaseline = 'middle';
+
+  const lines = textVal.split('\n');
+  const lineHeight = fontSize * 1.25;
+  let maxLineW = 0;
+  for (const line of lines) {
+    const m = ctx.measureText(line);
+    if (m.width > maxLineW) maxLineW = m.width;
+  }
+
+  const padX = fontSize * 0.45;
+  const padY = fontSize * 0.28;
+  const boxW = maxLineW + padX * 2;
+  const boxH = lines.length * lineHeight + padY * 2;
+  const anchorX = cw * style.x;
+  const anchorY = ch * style.y;
+
+  let boxX = anchorX - boxW / 2;
+  if (style.align === 'left') boxX = anchorX - padX;
+  if (style.align === 'right') boxX = anchorX - boxW + padX;
+  const boxY = anchorY - boxH / 2;
+
+  if (style.bgColor && style.bgColor !== 'transparent') {
+    ctx.fillStyle = style.bgColor;
+    ctx.beginPath();
+    ctx.roundRect(boxX, boxY, boxW, boxH, 16 * scaleFactor);
+    ctx.fill();
+  }
+
+  ctx.fillStyle = style.color;
+  ctx.shadowColor = 'rgba(0,0,0,0.55)';
+  ctx.shadowBlur = 10 * scaleFactor;
+  lines.forEach((line, i) => {
+    const ly =
+      anchorY - ((lines.length - 1) * lineHeight) / 2 + i * lineHeight;
+    ctx.fillText(line, anchorX, ly);
+  });
+
+  const remoteUser = collaborators.find((u) => u.selectedClipId === clip.id);
+  if (clip.id === selectedClipId || remoteUser) {
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle =
+      clip.id === selectedClipId ? '#22d3ee' : remoteUser!.color;
+    ctx.lineWidth = 3 * scaleFactor;
+    ctx.setLineDash([8 * scaleFactor, 6 * scaleFactor]);
+    ctx.strokeRect(
+      boxX - 6 * scaleFactor,
+      boxY - 6 * scaleFactor,
+      boxW + 12 * scaleFactor,
+      boxH + 12 * scaleFactor
+    );
+  }
+
   ctx.restore();
 }
 
@@ -212,21 +438,40 @@ export function renderCompositeFrame(
   time: number,
   pool: MediaPool,
   selectedClipId: string | null,
-  collaborators: Collaborator[]
+  collaborators: Collaborator[],
+  tracks?: Track[]
 ) {
   ctx.fillStyle = '#09090b';
   ctx.fillRect(0, 0, cw, ch);
 
-  const activeAtTime = (track: Clip['track']) =>
-    clips
+  const trackList = tracks ?? [];
+  const hiddenTrackIds = new Set(
+    trackList.filter((t) => t.hidden).map((t) => t.id)
+  );
+
+  const orderedClipsForType = (type: Clip['track']) => {
+    const matchingTracks = trackList.filter((t) => t.type === type);
+    const trackOrder = new Map<string, number>();
+    matchingTracks.forEach((t, i) => trackOrder.set(t.id, i));
+
+    return clips
       .filter(
         (c) =>
-          c.track === track && time >= c.start && time < c.start + c.duration
+          c.track === type &&
+          !hiddenTrackIds.has(c.trackId) &&
+          time >= c.start &&
+          time < c.start + c.duration
       )
-      .sort((a, b) => a.start - b.start);
+      .sort((a, b) => {
+        const ta = trackOrder.get(a.trackId) ?? 0;
+        const tb = trackOrder.get(b.trackId) ?? 0;
+        if (ta !== tb) return ta - tb;
+        return a.start - b.start;
+      });
+  };
 
-  // 1. Main Video Track
-  for (const clip of activeAtTime('video')) {
+  // 1. Base Video Tracks (bottom-to-top)
+  for (const clip of orderedClipsForType('video')) {
     const progress = Math.max(
       0,
       Math.min(1, (time - clip.start) / Math.max(0.01, clip.duration))
@@ -242,157 +487,29 @@ export function renderCompositeFrame(
     }
   }
 
-  // 2. Overlay / PIP Track
-  for (const clip of activeAtTime('overlay')) {
-    const progress = Math.max(
-      0,
-      Math.min(1, (time - clip.start) / Math.max(0.01, clip.duration))
+  // 2. Overlay / PIP Tracks (each overlay track renders cleanly in layer order)
+  for (const clip of orderedClipsForType('overlay')) {
+    drawOverlayClip(
+      ctx,
+      cw,
+      ch,
+      clip,
+      time,
+      pool,
+      selectedClipId,
+      collaborators
     );
-    const scale = clip.mediaScale ?? 0.45;
-    const pipW = cw * scale;
-    const pipH = ch * scale;
-    const cx = cw * (clip.mediaX ?? 0.72);
-    const cy = ch * (clip.mediaY ?? 0.25);
-
-    ctx.save();
-    ctx.beginPath();
-    ctx.roundRect(cx - pipW / 2, cy - pipH / 2, pipW, pipH, 24);
-    ctx.clip();
-
-    const media =
-      clip.kind === 'video' && clip.src
-        ? pool.getVideo(clip.src)
-        : clip.src
-          ? pool.getImage(clip.src)
-          : null;
-
-    if (
-      media &&
-      (media instanceof HTMLImageElement || media.readyState >= 2)
-    ) {
-      ctx.globalAlpha = clip.opacity;
-      ctx.filter = buildFilterString(
-        clip.filter,
-        clip.brightness,
-        clip.contrast,
-        clip.saturate
-      );
-      const mw =
-        media instanceof HTMLVideoElement
-          ? media.videoWidth
-          : media.naturalWidth;
-      const mh =
-        media instanceof HTMLVideoElement
-          ? media.videoHeight
-          : media.naturalHeight;
-      if (mw && mh) {
-        const s = Math.max(pipW / mw, pipH / mh);
-        const dw = mw * s;
-        const dh = mh * s;
-        ctx.drawImage(media, cx - dw / 2, cy - dh / 2, dw, dh);
-      }
-    } else {
-      ctx.fillStyle = '#18181b';
-      ctx.fillRect(cx - pipW / 2, cy - pipH / 2, pipW, pipH);
-    }
-    ctx.restore();
-
-    if (clip.id === selectedClipId) {
-      ctx.save();
-      ctx.strokeStyle = '#22d3ee';
-      ctx.lineWidth = 3;
-      ctx.setLineDash([8, 6]);
-      ctx.strokeRect(cx - pipW / 2, cy - pipH / 2, pipW, pipH);
-      ctx.restore();
-    }
-    void progress;
   }
 
-  // 3. Text Overlay Track
-  for (const clip of activeAtTime('text')) {
-    const style = clip.textStyle ?? {
-      fontSize: 48,
-      color: '#ffffff',
-      bgColor: 'rgba(9,9,11,0.72)',
-      fontWeight: 'bold',
-      x: 0.5,
-      y: 0.78,
-      align: 'center',
-    };
-    const textVal = clip.text ?? clip.name;
-    const elapsed = time - clip.start;
-    const transDur = Math.min(0.35, clip.duration * 0.3);
-    let alpha = clip.opacity;
-    if (clip.transitionIn === 'fade' && elapsed < transDur) {
-      alpha *= Math.max(0, elapsed / transDur);
-    }
-
-    ctx.save();
-    ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-    const scaleFactor = cw / 720;
-    const fontSize = Math.round(style.fontSize * scaleFactor);
-    ctx.font = `${style.fontWeight === 'bold' ? '700' : '500'} ${fontSize}px "Plus Jakarta Sans", sans-serif`;
-    ctx.textAlign = style.align;
-    ctx.textBaseline = 'middle';
-
-    const lines = textVal.split('\n');
-    const lineHeight = fontSize * 1.25;
-    let maxLineW = 0;
-    for (const line of lines) {
-      const m = ctx.measureText(line);
-      if (m.width > maxLineW) maxLineW = m.width;
-    }
-
-    const padX = fontSize * 0.45;
-    const padY = fontSize * 0.28;
-    const boxW = maxLineW + padX * 2;
-    const boxH = lines.length * lineHeight + padY * 2;
-    const anchorX = cw * style.x;
-    const anchorY = ch * style.y;
-
-    let boxX = anchorX - boxW / 2;
-    if (style.align === 'left') boxX = anchorX - padX;
-    if (style.align === 'right') boxX = anchorX - boxW + padX;
-    const boxY = anchorY - boxH / 2;
-
-    if (style.bgColor && style.bgColor !== 'transparent') {
-      ctx.fillStyle = style.bgColor;
-      ctx.beginPath();
-      ctx.roundRect(boxX, boxY, boxW, boxH, 16 * scaleFactor);
-      ctx.fill();
-    }
-
-    ctx.fillStyle = style.color;
-    ctx.shadowColor = 'rgba(0,0,0,0.55)';
-    ctx.shadowBlur = 10 * scaleFactor;
-    lines.forEach((line, i) => {
-      const ly =
-        anchorY - ((lines.length - 1) * lineHeight) / 2 + i * lineHeight;
-      ctx.fillText(line, anchorX, ly);
-    });
-
-    // Selection or collaborator border on text
-    const remoteUser = collaborators.find((u) => u.selectedClipId === clip.id);
-    if (clip.id === selectedClipId || remoteUser) {
-      ctx.shadowBlur = 0;
-      ctx.strokeStyle =
-        clip.id === selectedClipId ? '#22d3ee' : remoteUser!.color;
-      ctx.lineWidth = 3 * scaleFactor;
-      ctx.setLineDash([8 * scaleFactor, 6 * scaleFactor]);
-      ctx.strokeRect(
-        boxX - 6 * scaleFactor,
-        boxY - 6 * scaleFactor,
-        boxW + 12 * scaleFactor,
-        boxH + 12 * scaleFactor
-      );
-    }
-
-    ctx.restore();
+  // 3. Text Tracks (each text track renders cleanly in layer order)
+  for (const clip of orderedClipsForType('text')) {
+    drawTextClip(ctx, cw, ch, clip, time, selectedClipId, collaborators);
   }
 }
 
 export async function exportProjectToVideo(opts: {
   clips: Clip[];
+  tracks: Track[];
   aspectRatio: AspectRatio;
   duration: number;
   pool: MediaPool;
@@ -449,15 +566,25 @@ export async function exportProjectToVideo(opts: {
     const tick = () => {
       const elapsedSec = (performance.now() - startWall) / 1000;
       const t = Math.min(totalDuration, elapsedSec);
-      opts.pool.syncVideos(opts.clips, t, true);
-      opts.audioEngine.sync(opts.clips, t, true);
-      renderCompositeFrame(ctx, width, height, opts.clips, t, opts.pool, null, []);
+      opts.pool.syncVideos(opts.clips, t, true, opts.tracks);
+      opts.audioEngine.sync(opts.clips, t, true, opts.tracks);
+      renderCompositeFrame(
+        ctx,
+        width,
+        height,
+        opts.clips,
+        t,
+        opts.pool,
+        null,
+        [],
+        opts.tracks
+      );
       opts.onProgress(Math.min(99, Math.round((t / totalDuration) * 100)));
 
       if (t >= totalDuration) {
         opts.audioEngine.stopAll();
         opts.audioEngine.clearExportDestination();
-        opts.pool.syncVideos(opts.clips, 0, false);
+        opts.pool.syncVideos(opts.clips, 0, false, opts.tracks);
         resolve();
         return;
       }

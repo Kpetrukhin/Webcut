@@ -4,18 +4,19 @@ import {
   CopyPlus,
   Download,
   Gauge,
+  Layers,
   Pause,
   Play,
   Redo2,
   RotateCcw,
   Scissors,
-  Share2,
   Sparkles,
   Trash2,
   Undo2,
-  Users,
+  Wifi,
 } from 'lucide-react';
 import {
+  createDefaultTracks,
   createStarterClips,
   getProjectDuration,
 } from './shared/types.ts';
@@ -26,11 +27,13 @@ import {getApiUrl} from './lib/serverConfig.ts';
 import {useCollaborativeRoom} from './hooks/useCollaborativeRoom.ts';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
 import {Timeline} from './components/Timeline.tsx';
+import {RoomsLobbyModal} from './components/RoomsLobbyModal.tsx';
 import {
   AudioPanel,
   BottomSheet,
   EffectsPanel,
   MediaPanel,
+  OverlayPanel,
   TeamPanel,
   TOOL_TABS,
   TextPanel,
@@ -60,8 +63,12 @@ export default function App() {
     project,
     collaborators,
     allCollaborators,
+    availableRooms,
     canUndo,
     canRedo,
+    addTrack,
+    updateTrack,
+    deleteTrack,
     addClip,
     updateClip,
     deleteClip,
@@ -75,6 +82,7 @@ export default function App() {
     switchRoom,
     updateUserProfile,
     updateServerConnection,
+    refreshRooms,
   } = useCollaborativeRoom();
 
   const [currentTime, setCurrentTime] = useState(0);
@@ -83,6 +91,7 @@ export default function App() {
   const [pxPerSec, setPxPerSec] = useState(64);
   const [desktopTab, setDesktopTab] = useState<ActiveToolTab>('media');
   const [mobileSheet, setMobileSheet] = useState<ActiveToolTab | null>(null);
+  const [showLobbyModal, setShowLobbyModal] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(project.title);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
@@ -91,7 +100,6 @@ export default function App() {
     filename: string;
   } | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
-  const [copiedInvite, setCopiedInvite] = useState(false);
 
   const mediaPoolRef = useRef<MediaPool | null>(null);
   if (!mediaPoolRef.current) mediaPoolRef.current = new MediaPool();
@@ -113,19 +121,16 @@ export default function App() {
     setTitleDraft(project.title);
   }, [project.title]);
 
-  // Clear selection if remote user deleted selected clip
   useEffect(() => {
     if (selectedClipId && !project.clips.some((c) => c.id === selectedClipId)) {
       setSelectedClipId(null);
     }
   }, [project.clips, selectedClipId]);
 
-  // Broadcast live playhead & selected clip presence to collaborators
   useEffect(() => {
     sendPresence(currentTime, selectedClipId, isPlaying);
   }, [currentTime, selectedClipId, isPlaying, sendPresence]);
 
-  // Playback loop
   useEffect(() => {
     if (!isPlaying) {
       audioEngineRef.current?.stopAll();
@@ -144,7 +149,7 @@ export default function App() {
           setIsPlaying(false);
           return 0;
         }
-        audioEngineRef.current?.sync(project.clips, next, true);
+        audioEngineRef.current?.sync(project.clips, next, true, project.tracks);
         return next;
       });
       raf = requestAnimationFrame(tick);
@@ -155,15 +160,20 @@ export default function App() {
       cancelAnimationFrame(raf);
       audioEngineRef.current?.stopAll();
     };
-  }, [isPlaying, duration, project.clips]);
+  }, [isPlaying, duration, project.clips, project.tracks]);
 
   const handleSeek = useCallback(
     (time: number) => {
       const clamped = Math.max(0, Math.min(duration, time));
       setCurrentTime(clamped);
-      audioEngineRef.current?.sync(project.clips, clamped, isPlaying);
+      audioEngineRef.current?.sync(
+        project.clips,
+        clamped,
+        isPlaying,
+        project.tracks
+      );
     },
-    [duration, project.clips, isPlaying]
+    [duration, project.clips, project.tracks, isPlaying]
   );
 
   const handleSplitSelectedOrCurrent = useCallback(() => {
@@ -182,13 +192,16 @@ export default function App() {
 
   const handleDuplicateSelected = useCallback(() => {
     if (!selectedClip) return;
-    const copy: Clip = {
-      ...structuredClone(selectedClip),
-      id: `clip-${Math.random().toString(36).slice(2, 9)}`,
-      name: `${selectedClip.name} (копия)`,
-      start: Math.round((selectedClip.start + selectedClip.duration) * 100) / 100,
-    };
-    addClip(copy);
+    const copy = addClip(
+      {
+        ...structuredClone(selectedClip),
+        id: `clip-${Math.random().toString(36).slice(2, 9)}`,
+        name: `${selectedClip.name} (копия)`,
+        start:
+          Math.round((selectedClip.start + selectedClip.duration) * 100) / 100,
+      },
+      {forceNewTrack: selectedClip.track !== 'video'}
+    );
     setSelectedClipId(copy.id);
   }, [selectedClip, addClip]);
 
@@ -207,7 +220,6 @@ export default function App() {
     });
   }, [selectedClip, updateClip]);
 
-  // Keyboard shortcuts for desktop editors
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       const tag = (e.target as HTMLElement | null)?.tagName;
@@ -232,13 +244,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [
-    selectedClipId,
-    deleteClip,
-    undo,
-    redo,
-    handleSplitSelectedOrCurrent,
-  ]);
+  }, [selectedClipId, deleteClip, undo, redo, handleSplitSelectedOrCurrent]);
 
   const handleAddMediaClip = useCallback(
     (opts: {
@@ -247,6 +253,7 @@ export default function App() {
       src: string;
       duration: number;
       track: 'video' | 'overlay';
+      forceNewTrack?: boolean;
     }) => {
       const sameTrack = project.clips.filter((c) => c.track === opts.track);
       const trackEnd = sameTrack.reduce(
@@ -254,34 +261,42 @@ export default function App() {
         0
       );
       const start =
-        opts.track === 'video'
+        opts.track === 'video' && !opts.forceNewTrack
           ? Math.round(trackEnd * 100) / 100
           : Math.round(currentTime * 100) / 100;
 
-      const clip: Clip = {
-        id: `clip-${Math.random().toString(36).slice(2, 9)}`,
-        track: opts.track,
-        kind: opts.kind,
-        name: opts.name,
-        src: opts.src,
-        start,
-        duration: opts.duration,
-        trimStart: 0,
-        sourceDuration: opts.kind === 'image' ? 60 : opts.duration,
-        speed: 1,
-        volume: opts.kind === 'video' ? 1 : 0,
-        opacity: 1,
-        filter: 'none',
-        brightness: 1,
-        contrast: 1,
-        saturate: 1,
-        transitionIn: 'fade',
-        motionEffect: opts.kind === 'image' ? 'kenburns-in' : 'none',
-        mediaScale: opts.track === 'overlay' ? 0.45 : 1,
-        mediaX: opts.track === 'overlay' ? 0.72 : 0.5,
-        mediaY: opts.track === 'overlay' ? 0.25 : 0.5,
-      };
-      addClip(clip);
+      const clip = addClip(
+        {
+          id: `clip-${Math.random().toString(36).slice(2, 9)}`,
+          track: opts.track,
+          kind: opts.kind,
+          name: opts.name,
+          src: opts.src,
+          start,
+          duration: opts.duration,
+          trimStart: 0,
+          sourceDuration: opts.kind === 'image' ? 60 : opts.duration,
+          speed: 1,
+          volume: opts.kind === 'video' ? 1 : 0,
+          opacity: 1,
+          filter: 'none',
+          brightness: 1,
+          contrast: 1,
+          saturate: 1,
+          transitionIn: 'fade',
+          motionEffect:
+            opts.kind === 'image' && opts.track === 'video'
+              ? 'kenburns-in'
+              : 'none',
+          mediaScale: opts.track === 'overlay' ? 0.42 : 1,
+          mediaX: opts.track === 'overlay' ? 0.72 : 0.5,
+          mediaY: opts.track === 'overlay' ? 0.26 : 0.5,
+          rotation: 0,
+          borderRadius: opts.track === 'overlay' ? 20 : 0,
+          blendMode: 'source-over',
+        },
+        {forceNewTrack: opts.forceNewTrack}
+      );
       setSelectedClipId(clip.id);
       setCurrentTime(start);
     },
@@ -289,37 +304,39 @@ export default function App() {
   );
 
   const handleAddText = useCallback(
-    (text: string) => {
-      const clip: Clip = {
-        id: `clip-${Math.random().toString(36).slice(2, 9)}`,
-        track: 'text',
-        kind: 'text',
-        name: text.slice(0, 18),
-        start: Math.round(currentTime * 100) / 100,
-        duration: 3.5,
-        trimStart: 0,
-        sourceDuration: 60,
-        speed: 1,
-        volume: 1,
-        opacity: 1,
-        filter: 'none',
-        brightness: 1,
-        contrast: 1,
-        saturate: 1,
-        transitionIn: 'fade',
-        motionEffect: 'none',
-        text,
-        textStyle: {
-          fontSize: 48,
-          color: '#ffffff',
-          bgColor: 'rgba(9, 9, 11, 0.72)',
-          fontWeight: 'bold',
-          x: 0.5,
-          y: 0.75,
-          align: 'center',
+    (text: string, forceNewTrack = true) => {
+      const clip = addClip(
+        {
+          id: `clip-${Math.random().toString(36).slice(2, 9)}`,
+          track: 'text',
+          kind: 'text',
+          name: text.slice(0, 18),
+          start: Math.round(currentTime * 100) / 100,
+          duration: 3.5,
+          trimStart: 0,
+          sourceDuration: 60,
+          speed: 1,
+          volume: 1,
+          opacity: 1,
+          filter: 'none',
+          brightness: 1,
+          contrast: 1,
+          saturate: 1,
+          transitionIn: 'fade',
+          motionEffect: 'none',
+          text,
+          textStyle: {
+            fontSize: 48,
+            color: '#ffffff',
+            bgColor: 'rgba(9, 9, 11, 0.72)',
+            fontWeight: 'bold',
+            x: 0.5,
+            y: 0.75,
+            align: 'center',
+          },
         },
-      };
-      addClip(clip);
+        {forceNewTrack}
+      );
       setSelectedClipId(clip.id);
     },
     [currentTime, addClip]
@@ -331,28 +348,31 @@ export default function App() {
       kind: 'audio' | 'synth';
       src: string;
       duration: number;
+      forceNewTrack?: boolean;
     }) => {
-      const clip: Clip = {
-        id: `clip-${Math.random().toString(36).slice(2, 9)}`,
-        track: 'audio',
-        kind: opts.kind,
-        name: opts.name,
-        src: opts.src,
-        start: Math.round(currentTime * 100) / 100,
-        duration: opts.duration,
-        trimStart: 0,
-        sourceDuration: opts.kind === 'synth' ? 60 : opts.duration,
-        speed: 1,
-        volume: 0.8,
-        opacity: 1,
-        filter: 'none',
-        brightness: 1,
-        contrast: 1,
-        saturate: 1,
-        transitionIn: 'none',
-        motionEffect: 'none',
-      };
-      addClip(clip);
+      const clip = addClip(
+        {
+          id: `clip-${Math.random().toString(36).slice(2, 9)}`,
+          track: 'audio',
+          kind: opts.kind,
+          name: opts.name,
+          src: opts.src,
+          start: Math.round(currentTime * 100) / 100,
+          duration: opts.duration,
+          trimStart: 0,
+          sourceDuration: opts.kind === 'synth' ? 60 : opts.duration,
+          speed: 1,
+          volume: 0.8,
+          opacity: 1,
+          filter: 'none',
+          brightness: 1,
+          contrast: 1,
+          saturate: 1,
+          transitionIn: 'none',
+          motionEffect: 'none',
+        },
+        {forceNewTrack: opts.forceNewTrack}
+      );
       setSelectedClipId(clip.id);
     },
     [currentTime, addClip]
@@ -402,11 +422,20 @@ export default function App() {
     [updateClip]
   );
 
-  const handleCreateNewRoom = async (blank: boolean) => {
+  const handleCreateRoom = async (opts: {
+    title: string;
+    aspectRatio: AspectRatio;
+    blank: boolean;
+    isPublicLan: boolean;
+  }) => {
     const endpoint = getApiUrl('/api/rooms');
     if (!endpoint) {
       const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
-      if (blank) replaceClips([]);
+      replaceClips(opts.blank ? [] : createStarterClips(), {
+        title: opts.title,
+        aspectRatio: opts.aspectRatio,
+        tracks: createDefaultTracks(),
+      });
       switchRoom(localId);
       return;
     }
@@ -414,26 +443,16 @@ export default function App() {
       const res = await fetch(endpoint, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({blank}),
+        body: JSON.stringify(opts),
       });
       const data = (await res.json()) as {roomId?: string};
       if (data.roomId) {
         switchRoom(data.roomId);
+        void refreshRooms();
       }
     } catch {
       const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
       switchRoom(localId);
-    }
-  };
-
-  const handleCopyInvite = async () => {
-    const url = `${window.location.origin}/?room=${encodeURIComponent(roomId)}`;
-    try {
-      await navigator.clipboard.writeText(url);
-      setCopiedInvite(true);
-      setTimeout(() => setCopiedInvite(false), 1800);
-    } catch {
-      setMobileSheet('team');
     }
   };
 
@@ -447,6 +466,7 @@ export default function App() {
     try {
       const {blob, ext} = await exportProjectToVideo({
         clips: project.clips,
+        tracks: project.tracks,
         aspectRatio: project.aspectRatio,
         duration,
         pool: mediaPoolRef.current!,
@@ -498,13 +518,9 @@ export default function App() {
       {/* Top Studio Header */}
       <header className="flex h-12 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#111114] px-3 sm:h-13 sm:px-4">
         {/* Left: Brand & Project Title */}
-        <div className="flex min-w-0 items-center gap-2.5">
-          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-zinc-900 border border-white/10">
-            <img
-              src="/icon.svg"
-              alt="CutSync"
-              className="h-6 w-6 rounded"
-            />
+        <div className="flex min-w-0 items-center gap-2">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-zinc-900">
+            <img src="/icon.svg" alt="CutSync" className="h-6 w-6 rounded" />
           </div>
           {editingTitle ? (
             <input
@@ -526,13 +542,13 @@ export default function App() {
                   }
                 }
               }}
-              className="h-8 w-32 rounded-md border border-cyan-400 bg-zinc-900 px-2 text-xs font-semibold text-white focus:outline-none sm:w-44 sm:text-sm"
+              className="h-8 w-28 rounded-md border border-cyan-400 bg-zinc-900 px-2 text-xs font-semibold text-white focus:outline-none sm:w-44 sm:text-sm"
             />
           ) : (
             <button
               type="button"
               onClick={() => setEditingTitle(true)}
-              className="truncate text-left text-xs font-semibold text-white hover:text-cyan-300 sm:text-sm max-w-[115px] sm:max-w-[220px]"
+              className="max-w-[100px] truncate text-left text-xs font-semibold text-white hover:text-cyan-300 sm:max-w-[210px] sm:text-sm"
               title="Нажмите, чтобы переименовать проект"
             >
               {project.title}
@@ -540,38 +556,42 @@ export default function App() {
           )}
         </div>
 
-        {/* Center: Live Collaborators Presence Stack */}
+        {/* Center: Minecraft-style LAN Room Browser Trigger */}
         <button
           type="button"
-          onClick={() => {
-            setDesktopTab('team');
-            setMobileSheet('team');
-          }}
-          className="flex h-9 items-center gap-2 rounded-lg border border-white/10 bg-zinc-900/90 px-2.5 hover:border-cyan-400/50 active:scale-95"
-          title="Участники и приглашение"
+          onClick={() => setShowLobbyModal(true)}
+          className="flex h-9 items-center gap-2 rounded-lg border border-white/15 bg-zinc-900 px-2.5 hover:border-cyan-400/60 active:scale-95"
+          title="Комнаты в локальной сети"
         >
           <span
             className={`h-2 w-2 shrink-0 rounded-full ${
-              status === 'connected' ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
+              status === 'connected'
+                ? 'bg-emerald-400'
+                : status === 'offline'
+                  ? 'bg-zinc-500'
+                  : 'bg-amber-400 animate-pulse'
             }`}
           />
-          <div className="flex -space-x-1.5">
-            {allCollaborators.slice(0, 3).map((c) => (
-              <span
-                key={c.id}
-                style={{backgroundColor: c.color}}
-                className="flex h-5 w-5 items-center justify-center rounded-full border border-[#111114] text-[10px] font-bold text-zinc-950"
-              >
-                {c.name.slice(0, 1).toUpperCase()}
-              </span>
-            ))}
-          </div>
-          <span className="hidden text-xs font-medium text-zinc-300 sm:inline whitespace-nowrap">
-            {allCollaborators.length} в комнате
+          <Wifi className="h-3.5 w-3.5 text-cyan-400" />
+          <span className="text-xs font-medium text-zinc-200 whitespace-nowrap">
+            Комнаты ({availableRooms.length})
           </span>
+          {allCollaborators.length > 0 && (
+            <div className="hidden -space-x-1.5 sm:flex">
+              {allCollaborators.slice(0, 3).map((c) => (
+                <span
+                  key={c.id}
+                  style={{backgroundColor: c.color}}
+                  className="flex h-5 w-5 items-center justify-center rounded-full border border-[#111114] text-[10px] font-bold text-zinc-950"
+                >
+                  {c.name.slice(0, 1).toUpperCase()}
+                </span>
+              ))}
+            </div>
+          )}
         </button>
 
-        {/* Right: Aspect Ratio, PWA Install, Invite, Export */}
+        {/* Right: Aspect Ratio, PWA Install, Export */}
         <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
           <button
             type="button"
@@ -586,16 +606,6 @@ export default function App() {
 
           <button
             type="button"
-            onClick={handleCopyInvite}
-            aria-label="Поделиться ссылкой"
-            className="hidden h-9 items-center gap-1.5 rounded-lg border border-white/10 bg-zinc-900 px-3 text-xs font-medium text-zinc-200 hover:bg-zinc-800 sm:flex whitespace-nowrap"
-          >
-            <Share2 className="h-3.5 w-3.5 text-cyan-400" />
-            <span>{copiedInvite ? 'Скопировано' : 'Поделиться'}</span>
-          </button>
-
-          <button
-            type="button"
             onClick={handleExportVideo}
             disabled={project.clips.length === 0 || exportProgress !== null}
             className="flex h-9 items-center gap-1.5 rounded-lg bg-cyan-500 px-3 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 disabled:opacity-45 active:scale-95 whitespace-nowrap"
@@ -607,10 +617,10 @@ export default function App() {
       </header>
 
       {/* Main Studio Body */}
-      <div className="flex flex-1 min-h-0 flex-col lg:grid lg:grid-cols-[340px_1fr_300px]">
-        {/* Desktop Left Sidebar: Tool Tabs & Active Panel */}
-        <aside className="hidden border-r border-white/10 bg-[#111114] lg:flex lg:flex-col lg:min-h-0">
-          <div className="grid grid-cols-5 border-b border-white/10 p-1.5 gap-1">
+      <div className="flex flex-1 min-h-0 flex-col lg:grid lg:grid-cols-[350px_1fr_300px]">
+        {/* Desktop Left Sidebar */}
+        <aside className="hidden border-r border-white/10 bg-[#111114] lg:flex lg:min-h-0 lg:flex-col">
+          <div className="grid grid-cols-6 gap-1 border-b border-white/10 p-1.5">
             {TOOL_TABS.filter((t) => t.id !== 'edit').map((tab) => {
               const Icon = tab.icon;
               const active = desktopTab === tab.id;
@@ -619,14 +629,14 @@ export default function App() {
                   key={tab.id}
                   type="button"
                   onClick={() => setDesktopTab(tab.id)}
-                  className={`flex flex-col items-center justify-center gap-1 rounded-lg py-2 text-[11px] font-medium transition ${
+                  className={`flex flex-col items-center justify-center gap-1 rounded-lg py-2 text-[10px] font-medium transition ${
                     active
                       ? 'bg-cyan-500/15 text-cyan-300'
                       : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'
                   }`}
                 >
                   <Icon className="h-4 w-4" />
-                  <span className="truncate">{tab.label}</span>
+                  <span className="truncate max-w-full px-0.5">{tab.label}</span>
                 </button>
               );
             })}
@@ -634,6 +644,13 @@ export default function App() {
           <div className="studio-scrollbar flex-1 overflow-y-auto p-4">
             {desktopTab === 'media' && (
               <MediaPanel onAddMediaClip={handleAddMediaClip} />
+            )}
+            {desktopTab === 'overlay' && (
+              <OverlayPanel
+                selectedClip={selectedClip}
+                onAddMediaClip={handleAddMediaClip}
+                onUpdateClip={(id, patch) => updateClip(id, patch)}
+              />
             )}
             {desktopTab === 'text' && (
               <TextPanel
@@ -661,11 +678,12 @@ export default function App() {
                 serverUrl={serverUrl}
                 user={user}
                 allCollaborators={allCollaborators}
+                availableRooms={availableRooms}
                 chat={project.chat}
                 status={status}
                 onUpdateProfile={updateUserProfile}
+                onOpenLobby={() => setShowLobbyModal(true)}
                 onSwitchRoom={switchRoom}
-                onCreateNewRoom={handleCreateNewRoom}
                 onSendChat={sendChatMessage}
                 onUpdateServerUrl={updateServerConnection}
               />
@@ -677,6 +695,7 @@ export default function App() {
         <main className="flex flex-1 min-h-0 flex-col bg-[#09090b]">
           <div className="flex-1 min-h-0">
             <PreviewCanvas
+              tracks={project.tracks}
               clips={project.clips}
               aspectRatio={project.aspectRatio}
               currentTime={currentTime}
@@ -725,7 +744,7 @@ export default function App() {
                 {isPlaying ? (
                   <Pause className="h-4 w-4 fill-current" />
                 ) : (
-                  <Play className="h-4 w-4 fill-current ml-0.5" />
+                  <Play className="ml-0.5 h-4 w-4 fill-current" />
                 )}
               </button>
               <span className="font-mono text-xs tabular-nums text-zinc-500">
@@ -746,7 +765,11 @@ export default function App() {
               </button>
               <button
                 type="button"
-                onClick={() => replaceClips(createStarterClips())}
+                onClick={() =>
+                  replaceClips(createStarterClips(), {
+                    tracks: createDefaultTracks(),
+                  })
+                }
                 title="Сбросить к демо-проекту"
                 className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-400 hover:bg-white/10 hover:text-white"
               >
@@ -757,7 +780,7 @@ export default function App() {
         </main>
 
         {/* Desktop Right Sidebar: Selected Clip Inspector */}
-        <aside className="hidden border-l border-white/10 bg-[#111114] p-4 lg:flex lg:flex-col lg:min-h-0 lg:overflow-y-auto studio-scrollbar">
+        <aside className="studio-scrollbar hidden border-l border-white/10 bg-[#111114] p-4 lg:flex lg:min-h-0 lg:flex-col lg:overflow-y-auto">
           {selectedClip ? (
             <div className="space-y-4">
               <div className="flex items-center justify-between border-b border-white/10 pb-3">
@@ -791,7 +814,7 @@ export default function App() {
                   disabled={!canSplitNow}
                   className="flex h-10 flex-col items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-[11px] text-zinc-200 hover:border-cyan-400 disabled:opacity-35"
                 >
-                  <Scissors className="h-3.5 w-3.5 mb-0.5 text-cyan-400" />
+                  <Scissors className="mb-0.5 h-3.5 w-3.5 text-cyan-400" />
                   Разделить
                 </button>
                 <button
@@ -799,7 +822,7 @@ export default function App() {
                   onClick={handleDuplicateSelected}
                   className="flex h-10 flex-col items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-[11px] text-zinc-200 hover:border-cyan-400"
                 >
-                  <CopyPlus className="h-3.5 w-3.5 mb-0.5 text-cyan-400" />
+                  <CopyPlus className="mb-0.5 h-3.5 w-3.5 text-cyan-400" />
                   Дубликат
                 </button>
                 <button
@@ -807,33 +830,56 @@ export default function App() {
                   onClick={handleCycleSpeed}
                   className="flex h-10 flex-col items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-[11px] text-zinc-200 hover:border-cyan-400"
                 >
-                  <Gauge className="h-3.5 w-3.5 mb-0.5 text-cyan-400" />
+                  <Gauge className="mb-0.5 h-3.5 w-3.5 text-cyan-400" />
                   {selectedClip.speed}x
                 </button>
               </div>
 
               {selectedClip.track === 'overlay' && (
-                <label className="block space-y-1 text-xs text-zinc-400">
-                  <div className="flex justify-between">
-                    <span>Размер слоя (PIP)</span>
-                    <span className="font-mono text-zinc-200">
-                      {Math.round((selectedClip.mediaScale ?? 0.45) * 100)}%
-                    </span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0.2}
-                    max={0.9}
-                    step={0.05}
-                    value={selectedClip.mediaScale ?? 0.45}
-                    onChange={(e) =>
-                      updateClip(selectedClip.id, {
-                        mediaScale: Number(e.target.value),
-                      })
-                    }
-                    className="w-full accent-cyan-400"
-                  />
-                </label>
+                <div className="space-y-3 rounded-xl border border-indigo-500/25 bg-indigo-500/5 p-3">
+                  <label className="block space-y-1 text-xs text-zinc-300">
+                    <div className="flex justify-between">
+                      <span>Размер (PIP)</span>
+                      <span className="font-mono text-zinc-200">
+                        {Math.round((selectedClip.mediaScale ?? 0.42) * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0.15}
+                      max={0.95}
+                      step={0.05}
+                      value={selectedClip.mediaScale ?? 0.42}
+                      onChange={(e) =>
+                        updateClip(selectedClip.id, {
+                          mediaScale: Number(e.target.value),
+                        })
+                      }
+                      className="w-full accent-indigo-400"
+                    />
+                  </label>
+                  <label className="block space-y-1 text-xs text-zinc-300">
+                    <div className="flex justify-between">
+                      <span>Поворот</span>
+                      <span className="font-mono text-zinc-200">
+                        {selectedClip.rotation ?? 0}°
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={-180}
+                      max={180}
+                      step={2}
+                      value={selectedClip.rotation ?? 0}
+                      onChange={(e) =>
+                        updateClip(selectedClip.id, {
+                          rotation: Number(e.target.value),
+                        })
+                      }
+                      className="w-full accent-indigo-400"
+                    />
+                  </label>
+                </div>
               )}
 
               {(selectedClip.track === 'audio' ||
@@ -875,10 +921,10 @@ export default function App() {
                   Свойства клипа
                 </p>
                 <p>
-                  Нажмите на любой фрагмент на таймлайне ниже, чтобы обрезать края, разделить, изменить скорость или наложить фильтр.
+                  Нажмите на любой клип на таймлайне, чтобы обрезать края, перенести на другую дорожку или настроить эффекты наложения.
                 </p>
               </div>
-              <div className="rounded-xl border border-white/10 bg-zinc-900/70 p-3 space-y-2 text-xs">
+              <div className="space-y-2 rounded-xl border border-white/10 bg-zinc-900/70 p-3 text-xs">
                 <p className="font-medium text-zinc-200">
                   Горячие клавиши (ПК)
                 </p>
@@ -894,9 +940,10 @@ export default function App() {
         </aside>
       </div>
 
-      {/* Multi-Track Timeline */}
-      <div className="h-[206px] shrink-0 sm:h-[235px] lg:h-[250px]">
+      {/* Multi-Track Dynamic Timeline */}
+      <div className="h-[220px] shrink-0 sm:h-[245px] lg:h-[260px]">
         <Timeline
+          tracks={project.tracks}
           clips={project.clips}
           duration={duration}
           currentTime={currentTime}
@@ -906,11 +953,14 @@ export default function App() {
           onSeek={handleSeek}
           onSelectClip={setSelectedClipId}
           onZoomChange={setPxPerSec}
+          onAddTrack={addTrack}
+          onUpdateTrack={updateTrack}
+          onDeleteTrack={deleteTrack}
           onClipTransform={handleClipTransform}
         />
       </div>
 
-      {/* Mobile Bottom Thumb Toolbar (CapCut-style contextual vs primary tabs) */}
+      {/* Mobile Bottom Thumb Toolbar */}
       <nav className="shrink-0 border-t border-white/10 bg-[#111114] pb-safe lg:hidden">
         {selectedClip ? (
           <div className="no-scrollbar flex h-14 items-center gap-1 overflow-x-auto px-2">
@@ -931,10 +981,20 @@ export default function App() {
               <Scissors className="h-4 w-4 text-cyan-400" />
               <span>Разделить</span>
             </button>
+            {selectedClip.track === 'overlay' && (
+              <button
+                type="button"
+                onClick={() => setMobileSheet('overlay')}
+                className="flex h-11 min-w-[70px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-indigo-300 hover:bg-white/5"
+              >
+                <Layers className="h-4 w-4 text-indigo-400" />
+                <span>Слой PIP</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={handleCycleSpeed}
-              className="flex h-11 min-w-[64px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
+              className="flex h-11 min-w-[60px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
             >
               <Gauge className="h-4 w-4 text-cyan-400" />
               <span>{selectedClip.speed}x</span>
@@ -982,7 +1042,7 @@ export default function App() {
             </button>
           </div>
         ) : (
-          <div className="grid h-14 grid-cols-6 items-center px-1">
+          <div className="grid h-14 grid-cols-7 items-center px-0.5">
             {TOOL_TABS.map((tab) => {
               const Icon = tab.icon;
               const isOpen = mobileSheet === tab.id;
@@ -1000,11 +1060,13 @@ export default function App() {
                     }
                   }}
                   className={`flex h-12 flex-col items-center justify-center gap-0.5 rounded-lg text-[10px] font-medium transition ${
-                    isOpen ? 'text-cyan-400' : 'text-zinc-300 active:bg-white/5'
+                    isOpen
+                      ? 'text-cyan-400'
+                      : 'text-zinc-300 active:bg-white/5'
                   }`}
                 >
-                  <Icon className="h-5 w-5" />
-                  <span className="truncate">{tab.label}</span>
+                  <Icon className="h-4 w-4 sm:h-5 sm:w-5" />
+                  <span className="max-w-full truncate px-0.5">{tab.label}</span>
                 </button>
               );
             })}
@@ -1020,6 +1082,19 @@ export default function App() {
         >
           <MediaPanel
             onAddMediaClip={handleAddMediaClip}
+            onClose={() => setMobileSheet(null)}
+          />
+        </BottomSheet>
+      )}
+      {mobileSheet === 'overlay' && (
+        <BottomSheet
+          title="Наложение (картинка поверх)"
+          onClose={() => setMobileSheet(null)}
+        >
+          <OverlayPanel
+            selectedClip={selectedClip}
+            onAddMediaClip={handleAddMediaClip}
+            onUpdateClip={(id, patch) => updateClip(id, patch)}
             onClose={() => setMobileSheet(null)}
           />
         </BottomSheet>
@@ -1059,7 +1134,7 @@ export default function App() {
       )}
       {mobileSheet === 'team' && (
         <BottomSheet
-          title="Совместный монтаж"
+          title="Сеть и команда"
           onClose={() => setMobileSheet(null)}
         >
           <TeamPanel
@@ -1067,21 +1142,42 @@ export default function App() {
             serverUrl={serverUrl}
             user={user}
             allCollaborators={allCollaborators}
+            availableRooms={availableRooms}
             chat={project.chat}
             status={status}
             onUpdateProfile={updateUserProfile}
+            onOpenLobby={() => {
+              setMobileSheet(null);
+              setShowLobbyModal(true);
+            }}
             onSwitchRoom={switchRoom}
-            onCreateNewRoom={handleCreateNewRoom}
             onSendChat={sendChatMessage}
             onUpdateServerUrl={updateServerConnection}
           />
         </BottomSheet>
       )}
 
+      {/* Minecraft-style LAN Room Browser Modal */}
+      {showLobbyModal && (
+        <RoomsLobbyModal
+          currentRoomId={roomId}
+          serverUrl={serverUrl}
+          status={status}
+          availableRooms={availableRooms}
+          onSelectRoom={(nextId) => switchRoom(nextId)}
+          onCreateRoom={handleCreateRoom}
+          onRefreshRooms={() => {
+            void refreshRooms();
+          }}
+          onConnectServer={(url) => updateServerConnection(url)}
+          onClose={() => setShowLobbyModal(false)}
+        />
+      )}
+
       {/* Video Export Modal */}
       {(exportProgress !== null || exportError) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs">
-          <div className="w-full max-w-sm rounded-2xl border border-white/15 bg-[#141418] p-5 shadow-2xl space-y-4">
+          <div className="w-full max-w-sm space-y-4 rounded-2xl border border-white/15 bg-[#141418] p-5 shadow-2xl">
             <div className="flex items-center justify-between">
               <h3 className="text-base font-semibold text-white">
                 {exportError
@@ -1143,18 +1239,6 @@ export default function App() {
             )}
           </div>
         </div>
-      )}
-
-      {/* Quick Mobile Invite FAB-less access via Team tab or top header */}
-      {collaborators.length === 0 && !mobileSheet && !selectedClip && (
-        <button
-          type="button"
-          onClick={() => setMobileSheet('team')}
-          className="fixed right-3 bottom-16 z-30 flex h-9 items-center gap-1.5 rounded-full border border-white/15 bg-zinc-900/90 px-3 text-[11px] font-medium text-zinc-200 shadow-lg backdrop-blur-md lg:hidden"
-        >
-          <Users className="h-3.5 w-3.5 text-cyan-400" />
-          Пригласить
-        </button>
       )}
 
       <OfflineIndicator />

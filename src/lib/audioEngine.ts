@@ -1,16 +1,17 @@
-import type {Clip} from '../shared/types.ts';
+import type {Clip, Track} from '../shared/types.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
 
 /**
  * Web Audio engine supporting uploaded audio files AND procedural backing tracks
- * (`synth:lofi`, `synth:pulse`, `synth:cinema`) for live preview and video export.
+ * (`synth:lofi`, `synth:pulse`, `synth:cinema`) for live preview and video export,
+ * respecting per-track mute flags across multiple audio tracks.
  */
 export class StudioAudioEngine {
   private ctx: AudioContext | null = null;
   private audioElements = new Map<string, HTMLAudioElement>();
   private mediaNodes = new Map<string, MediaElementAudioSourceNode>();
-  private synthTimer: ReturnType<typeof setInterval> | null = null;
-  private synthStep = 0;
+  private synthTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private synthSteps = new Map<string, number>();
   private exportDestination: MediaStreamAudioDestinationNode | null = null;
 
   private ensureContext(): AudioContext {
@@ -63,14 +64,15 @@ export class StudioAudioEngine {
     }
   }
 
-  private triggerSynthStep(preset: string, volume: number) {
+  private triggerSynthStep(clipId: string, preset: string, volume: number) {
     const ctx = this.ensureContext();
     const now = ctx.currentTime;
     const masterGain = ctx.createGain();
     masterGain.gain.setValueAtTime(Math.max(0.01, volume * 0.25), now);
     this.connectToOutput(masterGain);
 
-    const step = this.synthStep % 8;
+    const prevStep = this.synthSteps.get(clipId) ?? 0;
+    const step = prevStep % 8;
 
     if (preset === 'synth:lofi') {
       const chords = [220, 261.63, 329.63, 392.0];
@@ -87,7 +89,6 @@ export class StudioAudioEngine {
       osc.start(now);
       osc.stop(now + 0.44);
 
-      // Soft kick on beats 0 and 4
       if (step === 0 || step === 4) {
         const kick = ctx.createOscillator();
         const kGain = ctx.createGain();
@@ -120,7 +121,6 @@ export class StudioAudioEngine {
       osc.start(now);
       osc.stop(now + 0.24);
     } else {
-      // synth:cinema
       if (step % 2 === 0) {
         const padNotes = [130.81, 196.0, 246.94, 293.66];
         const freq = padNotes[(step / 2) % padNotes.length];
@@ -138,19 +138,31 @@ export class StudioAudioEngine {
       }
     }
 
-    this.synthStep += 1;
+    this.synthSteps.set(clipId, prevStep + 1);
   }
 
-  public sync(clips: Clip[], time: number, isPlaying: boolean) {
+  public sync(
+    clips: Clip[],
+    time: number,
+    isPlaying: boolean,
+    tracks?: Track[]
+  ) {
+    const mutedTrackIds = new Set(
+      (tracks ?? []).filter((t) => t.muted).map((t) => t.id)
+    );
+
     const activeAudioClips = clips.filter(
-      (c) => c.track === 'audio' && time >= c.start && time < c.start + c.duration
+      (c) =>
+        c.track === 'audio' &&
+        !mutedTrackIds.has(c.trackId) &&
+        time >= c.start &&
+        time < c.start + c.duration
     );
 
     const activeSrcs = new Set(
-      activeAudioClips.map((c) => c.src).filter(Boolean) as string[]
+      activeAudioClips.map((c) => resolveMediaSrc(c.src) || c.src).filter(Boolean) as string[]
     );
 
-    // Pause inactive HTMLAudioElements
     for (const [src, el] of this.audioElements.entries()) {
       if (!isPlaying || !activeSrcs.has(src)) {
         if (!el.paused) el.pause();
@@ -158,32 +170,37 @@ export class StudioAudioEngine {
     }
 
     if (!isPlaying) {
-      this.stopSynth();
+      this.stopAllSynths();
       return;
     }
 
-    const activeSynth = activeAudioClips.find((c) => c.kind === 'synth');
-    if (activeSynth && activeSynth.src) {
-      if (!this.synthTimer) {
-        const intervalMs = activeSynth.src === 'synth:pulse' ? 255 : 350;
-        this.triggerSynthStep(activeSynth.src, activeSynth.volume);
-        this.synthTimer = setInterval(() => {
-          this.triggerSynthStep(activeSynth.src!, activeSynth.volume);
-        }, intervalMs);
+    const activeSynthIds = new Set(
+      activeAudioClips.filter((c) => c.kind === 'synth').map((c) => c.id)
+    );
+    for (const [id, timer] of this.synthTimers.entries()) {
+      if (!activeSynthIds.has(id)) {
+        clearInterval(timer);
+        this.synthTimers.delete(id);
       }
-    } else {
-      this.stopSynth();
     }
 
     for (const clip of activeAudioClips) {
-      if (clip.kind === 'audio' && clip.src) {
+      if (clip.kind === 'synth' && clip.src && !this.synthTimers.has(clip.id)) {
+        const intervalMs = clip.src === 'synth:pulse' ? 255 : 350;
+        this.triggerSynthStep(clip.id, clip.src, clip.volume);
+        const timer = setInterval(() => {
+          this.triggerSynthStep(clip.id, clip.src!, clip.volume);
+        }, intervalMs);
+        this.synthTimers.set(clip.id, timer);
+      } else if (clip.kind === 'audio' && clip.src) {
         const el = this.getOrCreateAudioEl(clip.src);
+        const resolved = resolveMediaSrc(clip.src) || clip.src;
         const ctx = this.ensureContext();
-        if (!this.mediaNodes.has(clip.src)) {
+        if (!this.mediaNodes.has(resolved)) {
           try {
             const sourceNode = ctx.createMediaElementSource(el);
             this.connectToOutput(sourceNode);
-            this.mediaNodes.set(clip.src, sourceNode);
+            this.mediaNodes.set(resolved, sourceNode);
           } catch {
             // Already connected
           }
@@ -202,15 +219,15 @@ export class StudioAudioEngine {
     }
   }
 
-  public stopSynth() {
-    if (this.synthTimer) {
-      clearInterval(this.synthTimer);
-      this.synthTimer = null;
+  public stopAllSynths() {
+    for (const timer of this.synthTimers.values()) {
+      clearInterval(timer);
     }
+    this.synthTimers.clear();
   }
 
   public stopAll() {
-    this.stopSynth();
+    this.stopAllSynths();
     for (const el of this.audioElements.values()) {
       if (!el.paused) el.pause();
     }

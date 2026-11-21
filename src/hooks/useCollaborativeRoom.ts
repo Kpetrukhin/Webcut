@@ -1,7 +1,11 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {
   applyClipSplit,
+  createDefaultTracks,
   createStarterClips,
+  createTrackOfType,
+  normalizeProjectTracks,
+  resolveTrackPlacement,
 } from '../shared/types.ts';
 import type {
   AspectRatio,
@@ -10,9 +14,13 @@ import type {
   Clip,
   Collaborator,
   ProjectState,
+  RoomSummary,
   ServerWsMessage,
+  Track,
+  TrackType,
 } from '../shared/types.ts';
 import {
+  getApiUrl,
   getSavedServerUrl,
   getWebSocketUrl,
   saveServerUrl,
@@ -65,8 +73,16 @@ export function getRoomIdFromUrl(): string {
   return 'studio-demo';
 }
 
+interface UndoSnapshot {
+  clips: Clip[];
+  tracks: Track[];
+}
+
 export function useCollaborativeRoom() {
   const [user, setUser] = useState(getInitialUser);
+  const userRef = useRef(user);
+  userRef.current = user;
+
   const [roomId, setRoomId] = useState<string>(getRoomIdFromUrl);
   const [serverUrl, setServerUrl] = useState<string>(getSavedServerUrl);
   const [status, setStatus] = useState<
@@ -77,14 +93,17 @@ export function useCollaborativeRoom() {
     title: 'Ночной ролик',
     aspectRatio: '9:16',
     fps: 30,
+    isPublicLan: true,
+    tracks: createDefaultTracks(),
     clips: createStarterClips(),
     revision: 0,
     updatedAt: Date.now(),
     chat: [],
   }));
   const [collaborators, setCollaborators] = useState<Collaborator[]>([]);
-  const [undoStack, setUndoStack] = useState<Clip[][]>([]);
-  const [redoStack, setRedoStack] = useState<Clip[][]>([]);
+  const [availableRooms, setAvailableRooms] = useState<RoomSummary[]>([]);
+  const [undoStack, setUndoStack] = useState<UndoSnapshot[]>([]);
+  const [redoStack, setRedoStack] = useState<UndoSnapshot[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -102,6 +121,22 @@ export function useCollaborativeRoom() {
       ws.send(JSON.stringify(msg));
     }
   }, []);
+
+  const refreshRooms = useCallback(async () => {
+    sendRaw({type: 'lobby:get_rooms'});
+    const endpoint = getApiUrl('/api/rooms');
+    if (!endpoint) return;
+    try {
+      const res = await fetch(endpoint);
+      if (!res.ok) return;
+      const data = (await res.json()) as {rooms?: RoomSummary[]};
+      if (Array.isArray(data.rooms)) {
+        setAvailableRooms(data.rooms);
+      }
+    } catch {
+      // ignore
+    }
+  }, [sendRaw]);
 
   useEffect(() => {
     let closedByEffect = false;
@@ -126,7 +161,7 @@ export function useCollaborativeRoom() {
           JSON.stringify({
             type: 'join',
             roomId,
-            user,
+            user: userRef.current,
           } satisfies ClientWsMessage)
         );
       };
@@ -141,15 +176,58 @@ export function useCollaborativeRoom() {
 
         switch (msg.type) {
           case 'room:init':
-            setProject(msg.project);
+            setProject(normalizeProjectTracks(msg.project));
             setCollaborators(msg.collaborators);
+            if (Array.isArray(msg.rooms)) {
+              setAvailableRooms(msg.rooms);
+            }
+            break;
+
+          case 'lobby:rooms_update':
+            setAvailableRooms(msg.rooms);
+            break;
+
+          case 'op:track_add':
+            setProject((prev) => {
+              if (prev.tracks.some((t) => t.id === msg.track.id)) return prev;
+              return {
+                ...prev,
+                tracks: [...prev.tracks, msg.track],
+                revision: msg.revision,
+              };
+            });
+            break;
+
+          case 'op:track_update':
+            setProject((prev) => ({
+              ...prev,
+              revision: msg.revision,
+              tracks: prev.tracks.map((t) =>
+                t.id === msg.trackId ? {...t, ...msg.patch, id: t.id} : t
+              ),
+            }));
+            break;
+
+          case 'op:track_delete':
+            setProject((prev) => ({
+              ...prev,
+              revision: msg.revision,
+              tracks: prev.tracks.filter((t) => t.id !== msg.trackId),
+              clips: prev.clips.filter((c) => c.trackId !== msg.trackId),
+            }));
             break;
 
           case 'op:clip_add':
             setProject((prev) => {
               if (prev.clips.some((c) => c.id === msg.clip.id)) return prev;
+              const nextTracks =
+                msg.newTrack &&
+                !prev.tracks.some((t) => t.id === msg.newTrack!.id)
+                  ? [...prev.tracks, msg.newTrack]
+                  : prev.tracks;
               return {
                 ...prev,
+                tracks: nextTracks,
                 clips: [...prev.clips, msg.clip],
                 revision: msg.revision,
               };
@@ -199,6 +277,7 @@ export function useCollaborativeRoom() {
             setProject((prev) => ({
               ...prev,
               clips: msg.clips,
+              tracks: msg.tracks || prev.tracks,
               aspectRatio: msg.aspectRatio,
               title: msg.title,
               revision: msg.revision,
@@ -225,7 +304,7 @@ export function useCollaborativeRoom() {
         if (closedByEffect) return;
         setStatus('reconnecting');
         attempt += 1;
-        const delay = Math.min(4000, 600 * Math.pow(1.4, attempt));
+        const delay = Math.min(2500, 350 * Math.pow(1.4, attempt));
         reconnectTimerRef.current = setTimeout(connect, delay);
       };
 
@@ -243,22 +322,102 @@ export function useCollaborativeRoom() {
         clearTimeout(pendingPresenceTimerRef.current);
       wsRef.current?.close();
     };
-  }, [roomId, user, serverUrl]);
+  }, [roomId, serverUrl]);
 
   const pushUndo = useCallback(() => {
-    const snapshot = structuredClone(projectRef.current.clips);
+    const snapshot: UndoSnapshot = {
+      clips: structuredClone(projectRef.current.clips),
+      tracks: structuredClone(projectRef.current.tracks),
+    };
     setUndoStack((prev) => [...prev.slice(-29), snapshot]);
     setRedoStack([]);
   }, []);
 
-  const addClip = useCallback(
-    (clip: Clip) => {
+  const addTrack = useCallback(
+    (type: TrackType): Track => {
       pushUndo();
+      const newTrack = createTrackOfType(projectRef.current.tracks, type);
+      setProject((prev) => ({
+        ...prev,
+        tracks: [...prev.tracks, newTrack],
+      }));
+      sendRaw({type: 'op:track_add', track: newTrack});
+      return newTrack;
+    },
+    [pushUndo, sendRaw]
+  );
+
+  const updateTrack = useCallback(
+    (trackId: string, patch: Partial<Track>) => {
+      setProject((prev) => ({
+        ...prev,
+        tracks: prev.tracks.map((t) =>
+          t.id === trackId ? {...t, ...patch, id: t.id} : t
+        ),
+      }));
+      sendRaw({type: 'op:track_update', trackId, patch});
+    },
+    [sendRaw]
+  );
+
+  const deleteTrack = useCallback(
+    (trackId: string) => {
+      if (projectRef.current.tracks.length <= 1) return;
+      pushUndo();
+      setProject((prev) => ({
+        ...prev,
+        tracks: prev.tracks.filter((t) => t.id !== trackId),
+        clips: prev.clips.filter((c) => c.trackId !== trackId),
+      }));
+      sendRaw({type: 'op:track_delete', trackId});
+    },
+    [pushUndo, sendRaw]
+  );
+
+  const addClip = useCallback(
+    (
+      clipInput: Omit<Clip, 'trackId'> & {trackId?: string},
+      opts?: {forceNewTrack?: boolean}
+    ): Clip => {
+      pushUndo();
+      const curTracks = projectRef.current.tracks;
+      const curClips = projectRef.current.clips;
+
+      let resolvedTrackId = clipInput.trackId;
+      let newTrack: Track | undefined;
+
+      if (!resolvedTrackId || opts?.forceNewTrack) {
+        const placed = resolveTrackPlacement(
+          curTracks,
+          curClips,
+          clipInput.track,
+          clipInput.start,
+          clipInput.duration,
+          Boolean(opts?.forceNewTrack)
+        );
+        resolvedTrackId = placed.trackId;
+        newTrack = placed.newTrack;
+      }
+
+      const clip: Clip = {
+        ...clipInput,
+        trackId: resolvedTrackId,
+      };
+
       setProject((prev) => {
         if (prev.clips.some((c) => c.id === clip.id)) return prev;
-        return {...prev, clips: [...prev.clips, clip]};
+        const nextTracks =
+          newTrack && !prev.tracks.some((t) => t.id === newTrack!.id)
+            ? [...prev.tracks, newTrack]
+            : prev.tracks;
+        return {
+          ...prev,
+          tracks: nextTracks,
+          clips: [...prev.clips, clip],
+        };
       });
-      sendRaw({type: 'op:clip_add', clip});
+      sendRaw({type: 'op:clip_add', clip, newTrack});
+      return clip;
     },
     [pushUndo, sendRaw]
   );
@@ -315,7 +474,7 @@ export function useCollaborativeRoom() {
   );
 
   const updateProjectMeta = useCallback(
-    (patch: {title?: string; aspectRatio?: AspectRatio}) => {
+    (patch: {title?: string; aspectRatio?: AspectRatio; isPublicLan?: boolean}) => {
       setProject((prev) => ({...prev, ...patch}));
       sendRaw({type: 'op:project_meta', patch});
     },
@@ -323,16 +482,23 @@ export function useCollaborativeRoom() {
   );
 
   const replaceClips = useCallback(
-    (clips: Clip[], meta?: {title?: string; aspectRatio?: AspectRatio}) => {
+    (
+      clips: Clip[],
+      meta?: {title?: string; aspectRatio?: AspectRatio; tracks?: Track[]}
+    ) => {
       pushUndo();
+      const tracks = meta?.tracks ?? createDefaultTracks();
       setProject((prev) => ({
         ...prev,
         clips,
-        ...(meta ?? {}),
+        tracks,
+        ...(meta?.title ? {title: meta.title} : {}),
+        ...(meta?.aspectRatio ? {aspectRatio: meta.aspectRatio} : {}),
       }));
       sendRaw({
         type: 'op:project_replace',
         clips,
+        tracks,
         title: meta?.title,
         aspectRatio: meta?.aspectRatio,
       });
@@ -344,10 +510,17 @@ export function useCollaborativeRoom() {
     setUndoStack((prev) => {
       if (prev.length === 0) return prev;
       const last = prev[prev.length - 1];
-      const current = structuredClone(projectRef.current.clips);
+      const current: UndoSnapshot = {
+        clips: structuredClone(projectRef.current.clips),
+        tracks: structuredClone(projectRef.current.tracks),
+      };
       setRedoStack((r) => [...r, current]);
-      setProject((p) => ({...p, clips: last}));
-      sendRaw({type: 'op:project_replace', clips: last});
+      setProject((p) => ({...p, clips: last.clips, tracks: last.tracks}));
+      sendRaw({
+        type: 'op:project_replace',
+        clips: last.clips,
+        tracks: last.tracks,
+      });
       return prev.slice(0, -1);
     });
   }, [sendRaw]);
@@ -356,10 +529,17 @@ export function useCollaborativeRoom() {
     setRedoStack((prev) => {
       if (prev.length === 0) return prev;
       const next = prev[prev.length - 1];
-      const current = structuredClone(projectRef.current.clips);
+      const current: UndoSnapshot = {
+        clips: structuredClone(projectRef.current.clips),
+        tracks: structuredClone(projectRef.current.tracks),
+      };
       setUndoStack((u) => [...u, current]);
-      setProject((p) => ({...p, clips: next}));
-      sendRaw({type: 'op:project_replace', clips: next});
+      setProject((p) => ({...p, clips: next.clips, tracks: next.tracks}));
+      sendRaw({
+        type: 'op:project_replace',
+        clips: next.clips,
+        tracks: next.tracks,
+      });
       return prev.slice(0, -1);
     });
   }, [sendRaw]);
@@ -416,7 +596,8 @@ export function useCollaborativeRoom() {
   );
 
   const switchRoom = useCallback((nextRoomId: string) => {
-    const clean = nextRoomId.trim().replace(/[^a-zA-Z0-9_-]/g, '') || 'studio-demo';
+    const clean =
+      nextRoomId.trim().replace(/[^a-zA-Z0-9_-]/g, '') || 'studio-demo';
     setUndoStack([]);
     setRedoStack([]);
     setRoomId(clean);
@@ -427,9 +608,10 @@ export function useCollaborativeRoom() {
 
   const updateUserProfile = useCallback(
     (name: string, color: string) => {
+      const cleanName = name.trim().slice(0, 28) || userRef.current.name;
       const updated = {
-        ...user,
-        name: name.trim().slice(0, 28) || user.name,
+        ...userRef.current,
+        name: cleanName,
         color,
       };
       setUser(updated);
@@ -438,8 +620,9 @@ export function useCollaborativeRoom() {
       } catch {
         // ignore
       }
+      sendRaw({type: 'presence:profile', name: cleanName, color});
     },
-    [user]
+    [sendRaw]
   );
 
   const updateServerConnection = useCallback((rawUrl: string) => {
@@ -455,8 +638,12 @@ export function useCollaborativeRoom() {
     project,
     collaborators: collaborators.filter((c) => c.id !== user.id),
     allCollaborators: collaborators,
+    availableRooms,
     canUndo: undoStack.length > 0,
     canRedo: redoStack.length > 0,
+    addTrack,
+    updateTrack,
+    deleteTrack,
     addClip,
     updateClip,
     deleteClip,
@@ -470,5 +657,6 @@ export function useCollaborativeRoom() {
     switchRoom,
     updateUserProfile,
     updateServerConnection,
+    refreshRooms,
   };
 }

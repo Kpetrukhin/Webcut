@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import crypto from 'node:crypto';
+import dgram from 'node:dgram';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -9,12 +10,16 @@ import multer from 'multer';
 import {WebSocket, WebSocketServer} from 'ws';
 import {
   applyClipSplit,
+  createDefaultTracks,
   createStarterClips,
+  normalizeProjectTracks,
 } from './src/shared/types.ts';
 import type {
+  AspectRatio,
   ClientWsMessage,
   Collaborator,
   ProjectState,
+  RoomSummary,
   ServerWsMessage,
 } from './src/shared/types.ts';
 
@@ -31,6 +36,7 @@ fs.mkdirSync(DATA_DIR, {recursive: true});
 
 const rooms = new Map<string, ProjectState>();
 const roomConnections = new Map<string, Set<ClientSession>>();
+const allSockets = new Set<WebSocket>();
 
 interface ClientSession {
   ws: WebSocket;
@@ -44,13 +50,20 @@ function sanitizeRoomId(raw: string): string {
   return cleaned || 'studio-demo';
 }
 
-function createDefaultProject(roomId: string, blank = false): ProjectState {
+function createDefaultProject(
+  roomId: string,
+  opts?: {blank?: boolean; title?: string; aspectRatio?: AspectRatio; isPublicLan?: boolean}
+): ProjectState {
+  const defaultTitle =
+    roomId === 'studio-demo' ? 'Ночной ролик' : `Проект ${roomId}`;
   return {
     roomId,
-    title: roomId === 'studio-demo' ? 'Ночной ролик' : `Проект ${roomId}`,
-    aspectRatio: '9:16',
+    title: opts?.title?.trim().slice(0, 60) || defaultTitle,
+    aspectRatio: opts?.aspectRatio || '9:16',
     fps: 30,
-    clips: blank ? [] : createStarterClips(),
+    isPublicLan: opts?.isPublicLan ?? true,
+    tracks: createDefaultTracks(),
+    clips: opts?.blank ? [] : createStarterClips(),
     revision: 1,
     updatedAt: Date.now(),
     chat: [
@@ -59,7 +72,7 @@ function createDefaultProject(roomId: string, blank = false): ProjectState {
         userId: 'system',
         userName: 'Студия',
         userColor: '#22d3ee',
-        text: 'Комната готова. Отправьте ссылку участникам, чтобы монтировать одно видео вместе.',
+        text: 'Комната открыта для совместного монтажа. Все участники видят изменения в реальном времени.',
         timestamp: Date.now(),
       },
     ],
@@ -73,7 +86,7 @@ function loadRoomsFromDisk() {
       const parsed = JSON.parse(raw) as Record<string, ProjectState>;
       for (const [key, val] of Object.entries(parsed)) {
         if (val && typeof val.roomId === 'string' && Array.isArray(val.clips)) {
-          rooms.set(key, val);
+          rooms.set(key, normalizeProjectTracks(val));
         }
       }
     }
@@ -81,7 +94,7 @@ function loadRoomsFromDisk() {
     console.error('Failed to load rooms.json:', err);
   }
   if (!rooms.has('studio-demo')) {
-    rooms.set('studio-demo', createDefaultProject('studio-demo', false));
+    rooms.set('studio-demo', createDefaultProject('studio-demo'));
   }
 }
 
@@ -100,11 +113,14 @@ function scheduleSaveRooms() {
   }, 400);
 }
 
-function getOrCreateRoom(roomId: string, blank = false): ProjectState {
+function getOrCreateRoom(
+  roomId: string,
+  opts?: {blank?: boolean; title?: string; aspectRatio?: AspectRatio; isPublicLan?: boolean}
+): ProjectState {
   const safeId = sanitizeRoomId(roomId);
   let project = rooms.get(safeId);
   if (!project) {
-    project = createDefaultProject(safeId, blank);
+    project = createDefaultProject(safeId, opts);
     rooms.set(safeId, project);
     scheduleSaveRooms();
   }
@@ -121,6 +137,32 @@ function getRoomCollaborators(roomId: string): Collaborator[] {
   return list;
 }
 
+function getPublicRoomSummaries(): RoomSummary[] {
+  const summaries: RoomSummary[] = [];
+  for (const project of rooms.values()) {
+    const active = getRoomCollaborators(project.roomId);
+    if (project.isPublicLan === false && active.length === 0) continue;
+    summaries.push({
+      roomId: project.roomId,
+      title: project.title,
+      aspectRatio: project.aspectRatio,
+      collaboratorsCount: active.length,
+      collaborators: active.slice(0, 5).map((u) => ({name: u.name, color: u.color})),
+      clipsCount: project.clips.length,
+      tracksCount: project.tracks.length,
+      updatedAt: project.updatedAt,
+      isPublicLan: project.isPublicLan !== false,
+    });
+  }
+  summaries.sort((a, b) => {
+    if (b.collaboratorsCount !== a.collaboratorsCount) {
+      return b.collaboratorsCount - a.collaboratorsCount;
+    }
+    return b.updatedAt - a.updatedAt;
+  });
+  return summaries;
+}
+
 function broadcastToRoom(
   roomId: string,
   payload: ServerWsMessage,
@@ -135,6 +177,23 @@ function broadcastToRoom(
       conn.ws.send(serialized);
     }
   }
+}
+
+let lobbyBroadcastTimer: ReturnType<typeof setTimeout> | null = null;
+function broadcastLobbyRooms() {
+  if (lobbyBroadcastTimer) return;
+  lobbyBroadcastTimer = setTimeout(() => {
+    lobbyBroadcastTimer = null;
+    const payload = JSON.stringify({
+      type: 'lobby:rooms_update',
+      rooms: getPublicRoomSummaries(),
+    } satisfies ServerWsMessage);
+    for (const ws of allSockets) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(payload);
+      }
+    }
+  }, 120);
 }
 
 function getLocalLanIps(): string[] {
@@ -155,15 +214,31 @@ loadRoomsFromDisk();
 
 const app = express();
 app.set('trust proxy', true);
+
+// Allow APK (http://localhost) and LAN devices to connect freely to API & uploads
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
+
 app.use(express.json({limit: '10mb'}));
 
-// Configure Multer for real video/image/audio uploads from phones & desktops
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
     cb(null, UPLOADS_DIR);
   },
   filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 10) || '.bin';
+    const ext =
+      path
+        .extname(file.originalname)
+        .replace(/[^a-zA-Z0-9.]/g, '')
+        .slice(0, 10) || '.bin';
     const token = crypto.randomBytes(8).toString('hex');
     cb(null, `${Date.now()}-${token}${ext}`);
   },
@@ -171,7 +246,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({
   storage,
-  limits: {fileSize: 150 * 1024 * 1024}, // 150MB max
+  limits: {fileSize: 150 * 1024 * 1024},
   fileFilter: (_req, file, cb) => {
     if (
       file.mimetype.startsWith('video/') ||
@@ -196,7 +271,10 @@ app.use(
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
-    rooms: rooms.size,
+    app: 'CutSync',
+    host: os.hostname(),
+    roomsCount: rooms.size,
+    onlineUsers: allSockets.size,
     uptime: Math.round(process.uptime()),
   });
 });
@@ -208,22 +286,44 @@ app.get('/api/network-info', (req, res) => {
   res.json({
     origin: `${protocol}://${host}`,
     lanUrls: ips.map((ip) => `http://${ip}:${PORT}`),
+    hostName: os.hostname(),
+  });
+});
+
+// Minecraft-style LAN Room Browser list
+app.get('/api/rooms', (_req, res) => {
+  res.json({
+    rooms: getPublicRoomSummaries(),
+    host: os.hostname(),
   });
 });
 
 app.post('/api/rooms', (req, res) => {
   const blank = Boolean(req.body?.blank);
+  const title = typeof req.body?.title === 'string' ? req.body.title : undefined;
+  const aspectRatio =
+    typeof req.body?.aspectRatio === 'string'
+      ? (req.body.aspectRatio as AspectRatio)
+      : undefined;
+  const isPublicLan =
+    typeof req.body?.isPublicLan === 'boolean' ? req.body.isPublicLan : true;
   const customId = typeof req.body?.roomId === 'string' ? req.body.roomId : '';
   const roomId = customId
     ? sanitizeRoomId(customId)
     : `cut-${crypto.randomBytes(3).toString('hex')}`;
-  const project = getOrCreateRoom(roomId, blank);
+  const project = getOrCreateRoom(roomId, {
+    blank,
+    title,
+    aspectRatio,
+    isPublicLan,
+  });
+  broadcastLobbyRooms();
   res.json({roomId: project.roomId, title: project.title});
 });
 
 app.get('/api/rooms/:roomId', (req, res) => {
   const safeId = sanitizeRoomId(req.params.roomId);
-  const project = getOrCreateRoom(safeId, false);
+  const project = getOrCreateRoom(safeId);
   res.json({
     roomId: project.roomId,
     title: project.title,
@@ -244,7 +344,6 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
       ? 'audio'
       : 'image';
 
-  // Preserve UTF-8 original filename cleanly
   let displayName = file.originalname;
   try {
     displayName = Buffer.from(file.originalname, 'latin1').toString('utf8');
@@ -261,7 +360,6 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
   });
 });
 
-// Error handler for Multer/API
 app.use(
   (
     err: Error,
@@ -289,10 +387,12 @@ function removeSession(session: ClientSession | null) {
         collaborators: getRoomCollaborators(session.roomId),
       });
     }
+    broadcastLobbyRooms();
   }
 }
 
 wss.on('connection', (ws) => {
+  allSockets.add(ws);
   let session: ClientSession | null = null;
 
   ws.on('pong', () => {
@@ -307,12 +407,22 @@ wss.on('connection', (ws) => {
       return;
     }
 
+    if (msg.type === 'lobby:get_rooms') {
+      ws.send(
+        JSON.stringify({
+          type: 'lobby:rooms_update',
+          rooms: getPublicRoomSummaries(),
+        } satisfies ServerWsMessage)
+      );
+      return;
+    }
+
     if (msg.type === 'join') {
       if (session) {
         removeSession(session);
       }
       const roomId = sanitizeRoomId(msg.roomId);
-      const project = getOrCreateRoom(roomId, false);
+      const project = getOrCreateRoom(roomId);
       const user: Collaborator = {
         id: String(msg.user.id).slice(0, 48),
         name: String(msg.user.name || 'Редактор').slice(0, 28),
@@ -335,6 +445,7 @@ wss.on('connection', (ws) => {
         type: 'room:init',
         project,
         collaborators: getRoomCollaborators(roomId),
+        rooms: getPublicRoomSummaries(),
       };
       ws.send(JSON.stringify(initPayload));
 
@@ -346,6 +457,7 @@ wss.on('connection', (ws) => {
         },
         ws
       );
+      broadcastLobbyRooms();
       return;
     }
 
@@ -355,9 +467,90 @@ wss.on('connection', (ws) => {
     session.user.lastActive = Date.now();
 
     switch (msg.type) {
+      case 'presence:profile': {
+        session.user.name = String(msg.name || 'Редактор').slice(0, 28);
+        session.user.color = String(msg.color || '#22d3ee').slice(0, 16);
+        broadcastToRoom(session.roomId, {
+          type: 'presence:update',
+          collaborators: getRoomCollaborators(session.roomId),
+        });
+        broadcastLobbyRooms();
+        break;
+      }
+
+      case 'op:track_add': {
+        if (project.tracks.some((t) => t.id === msg.track.id)) return;
+        project.tracks.push(msg.track);
+        project.revision += 1;
+        project.updatedAt = Date.now();
+        scheduleSaveRooms();
+        broadcastToRoom(
+          session.roomId,
+          {
+            type: 'op:track_add',
+            track: msg.track,
+            revision: project.revision,
+            senderId: session.user.id,
+          },
+          ws
+        );
+        broadcastLobbyRooms();
+        break;
+      }
+
+      case 'op:track_update': {
+        const idx = project.tracks.findIndex((t) => t.id === msg.trackId);
+        if (idx === -1) return;
+        project.tracks[idx] = {
+          ...project.tracks[idx],
+          ...msg.patch,
+          id: project.tracks[idx].id,
+        };
+        project.revision += 1;
+        project.updatedAt = Date.now();
+        scheduleSaveRooms();
+        broadcastToRoom(
+          session.roomId,
+          {
+            type: 'op:track_update',
+            trackId: msg.trackId,
+            patch: msg.patch,
+            revision: project.revision,
+            senderId: session.user.id,
+          },
+          ws
+        );
+        break;
+      }
+
+      case 'op:track_delete': {
+        if (project.tracks.length <= 1) return;
+        project.tracks = project.tracks.filter((t) => t.id !== msg.trackId);
+        project.clips = project.clips.filter((c) => c.trackId !== msg.trackId);
+        project.revision += 1;
+        project.updatedAt = Date.now();
+        scheduleSaveRooms();
+        broadcastToRoom(
+          session.roomId,
+          {
+            type: 'op:track_delete',
+            trackId: msg.trackId,
+            revision: project.revision,
+            senderId: session.user.id,
+          },
+          ws
+        );
+        broadcastLobbyRooms();
+        break;
+      }
+
       case 'op:clip_add': {
-        if (project.clips.some((c) => c.id === msg.clip.id)) {
-          return; // Idempotent guard
+        if (project.clips.some((c) => c.id === msg.clip.id)) return;
+        if (
+          msg.newTrack &&
+          !project.tracks.some((t) => t.id === msg.newTrack!.id)
+        ) {
+          project.tracks.push(msg.newTrack);
         }
         project.clips.push(msg.clip);
         project.revision += 1;
@@ -368,11 +561,13 @@ wss.on('connection', (ws) => {
           {
             type: 'op:clip_add',
             clip: msg.clip,
+            newTrack: msg.newTrack,
             revision: project.revision,
             senderId: session.user.id,
           },
           ws
         );
+        broadcastLobbyRooms();
         break;
       }
 
@@ -418,6 +613,7 @@ wss.on('connection', (ws) => {
           },
           ws
         );
+        broadcastLobbyRooms();
         break;
       }
 
@@ -455,6 +651,9 @@ wss.on('connection', (ws) => {
         if (msg.patch.aspectRatio) {
           project.aspectRatio = msg.patch.aspectRatio;
         }
+        if (typeof msg.patch.isPublicLan === 'boolean') {
+          project.isPublicLan = msg.patch.isPublicLan;
+        }
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -468,11 +667,13 @@ wss.on('connection', (ws) => {
           },
           ws
         );
+        broadcastLobbyRooms();
         break;
       }
 
       case 'op:project_replace': {
         project.clips = msg.clips;
+        if (msg.tracks) project.tracks = msg.tracks;
         if (msg.aspectRatio) project.aspectRatio = msg.aspectRatio;
         if (typeof msg.title === 'string') project.title = msg.title.slice(0, 60);
         project.revision += 1;
@@ -483,6 +684,7 @@ wss.on('connection', (ws) => {
           {
             type: 'op:project_replace',
             clips: project.clips,
+            tracks: project.tracks,
             aspectRatio: project.aspectRatio,
             title: project.title,
             revision: project.revision,
@@ -490,6 +692,7 @@ wss.on('connection', (ws) => {
           },
           ws
         );
+        broadcastLobbyRooms();
         break;
       }
 
@@ -535,17 +738,18 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    allSockets.delete(ws);
     removeSession(session);
     session = null;
   });
 
   ws.on('error', () => {
+    allSockets.delete(ws);
     removeSession(session);
     session = null;
   });
 });
 
-// Keep mobile WebSockets healthy & prune stale connections
 setInterval(() => {
   for (const set of roomConnections.values()) {
     for (const conn of set) {
@@ -559,6 +763,42 @@ setInterval(() => {
     }
   }
 }, 25000);
+
+// Minecraft-style UDP LAN discovery beacon on local Wi-Fi networks
+function startLanBeacon() {
+  try {
+    const udp = dgram.createSocket('udp4');
+    udp.on('error', () => {
+      // Ignore if container/OS restricts UDP broadcast
+    });
+    udp.bind(() => {
+      try {
+        udp.setBroadcast(true);
+      } catch {
+        // ignore
+      }
+    });
+    setInterval(() => {
+      const publicRooms = getPublicRoomSummaries();
+      if (publicRooms.length === 0) return;
+      const packet = Buffer.from(
+        JSON.stringify({
+          app: 'CutSync',
+          port: PORT,
+          host: os.hostname(),
+          roomsCount: publicRooms.length,
+        })
+      );
+      try {
+        udp.send(packet, 41234, '255.255.255.255');
+      } catch {
+        // ignore
+      }
+    }, 2500);
+  } catch {
+    // ignore
+  }
+}
 
 async function startServer() {
   if (!IS_PROD) {
@@ -578,6 +818,7 @@ async function startServer() {
 
   server.listen(PORT, '0.0.0.0', () => {
     console.log(`CutSync server listening on http://0.0.0.0:${PORT}`);
+    startLanBeacon();
   });
 }
 

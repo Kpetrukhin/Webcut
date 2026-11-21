@@ -1,5 +1,5 @@
 import React, {useEffect, useRef} from 'react';
-import type {AspectRatio, Clip, Collaborator} from '../shared/types.ts';
+import type {AspectRatio, Clip, Collaborator, Track} from '../shared/types.ts';
 import {
   getCanvasDimensions,
   MediaPool,
@@ -7,6 +7,7 @@ import {
 } from '../lib/renderEngine.ts';
 
 interface PreviewCanvasProps {
+  tracks: Track[];
   clips: Clip[];
   aspectRatio: AspectRatio;
   currentTime: number;
@@ -24,6 +25,7 @@ interface PreviewCanvasProps {
 }
 
 export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
+  tracks,
   clips,
   aspectRatio,
   currentTime,
@@ -41,7 +43,6 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     startY: number;
     origX: number;
     origY: number;
-    isText: boolean;
   } | null>(null);
 
   const {width, height} = getCanvasDimensions(aspectRatio);
@@ -52,7 +53,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    mediaPool.syncVideos(clips, currentTime, isPlaying);
+    mediaPool.syncVideos(clips, currentTime, isPlaying, tracks);
     renderCompositeFrame(
       ctx,
       width,
@@ -61,9 +62,11 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       currentTime,
       mediaPool,
       selectedClipId,
-      collaborators
+      collaborators,
+      tracks
     );
   }, [
+    tracks,
     clips,
     aspectRatio,
     currentTime,
@@ -75,7 +78,6 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     height,
   ]);
 
-  // Continuous animation loop when playing or loading images/videos
   useEffect(() => {
     if (!isPlaying) return;
     let raf = 0;
@@ -91,7 +93,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           currentTime,
           mediaPool,
           selectedClipId,
-          collaborators
+          collaborators,
+          tracks
         );
       }
       raf = requestAnimationFrame(loop);
@@ -100,6 +103,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     return () => cancelAnimationFrame(raf);
   }, [
     isPlaying,
+    tracks,
     clips,
     currentTime,
     width,
@@ -116,10 +120,12 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     const nx = (e.clientX - rect.left) / rect.width;
     const ny = (e.clientY - rect.top) / rect.height;
 
-    // Hit-test active text clips first, then overlay PIP clips
+    const hiddenIds = new Set(tracks.filter((t) => t.hidden).map((t) => t.id));
+
     const activeTexts = clips.filter(
       (c) =>
         c.track === 'text' &&
+        !hiddenIds.has(c.trackId) &&
         currentTime >= c.start &&
         currentTime < c.start + c.duration
     );
@@ -136,7 +142,6 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           startY: e.clientY,
           origX: cx,
           origY: cy,
-          isText: true,
         };
         return;
       }
@@ -145,6 +150,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     const activeOverlays = clips.filter(
       (c) =>
         c.track === 'overlay' &&
+        !hiddenIds.has(c.trackId) &&
         currentTime >= c.start &&
         currentTime < c.start + c.duration
     );
@@ -152,7 +158,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       const c = activeOverlays[i];
       const cx = c.mediaX ?? 0.72;
       const cy = c.mediaY ?? 0.25;
-      const half = (c.mediaScale ?? 0.45) / 2;
+      const half = (c.mediaScale ?? 0.42) / 2;
       if (Math.abs(nx - cx) <= half && Math.abs(ny - cy) <= half) {
         onSelectClip(c.id);
         canvas.setPointerCapture(e.pointerId);
@@ -162,7 +168,6 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           startY: e.clientY,
           origX: cx,
           origY: cy,
-          isText: false,
         };
         return;
       }
@@ -213,14 +218,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       <div
         className={`relative max-h-full max-w-full ${aspectClass} overflow-hidden rounded-xl border border-white/10 bg-[#09090b] shadow-2xl`}
         style={{
-          height:
-            aspectRatio === '16:9'
-              ? 'auto'
-              : '100%',
-          width:
-            aspectRatio === '16:9'
-              ? '100%'
-              : 'auto',
+          height: aspectRatio === '16:9' ? 'auto' : '100%',
+          width: aspectRatio === '16:9' ? '100%' : 'auto',
         }}
       >
         <canvas
@@ -236,9 +235,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
 
         {clips.length === 0 && (
           <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center p-4 text-center">
-            <p className="text-sm font-medium text-zinc-300">
-              Таймлайн пуст
-            </p>
+            <p className="text-sm font-medium text-zinc-300">Таймлайн пуст</p>
             <p className="mt-1 text-xs text-zinc-500">
               Нажмите «Медиа» внизу, чтобы добавить видео или фото
             </p>
