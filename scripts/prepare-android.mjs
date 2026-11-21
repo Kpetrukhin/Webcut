@@ -49,6 +49,7 @@ if (fs.existsSync(manifestPath)) {
 // Copy PWA icon into Android mipmap launcher resources
 const icon512 = path.join(root, 'public/pwa-512x512.png');
 const icon192 = path.join(root, 'public/pwa-192x192.png');
+const iconMaskable = path.join(root, 'public/pwa-maskable-512x512.png');
 const resDir = path.join(androidDir, 'app/src/main/res');
 if (fs.existsSync(resDir) && fs.existsSync(icon512) && fs.existsSync(icon192)) {
   const targets = [
@@ -63,6 +64,12 @@ if (fs.existsSync(resDir) && fs.existsSync(icon512) && fs.existsSync(icon192)) {
     if (fs.existsSync(dir)) {
       fs.copyFileSync(srcIcon, path.join(dir, 'ic_launcher.png'));
       fs.copyFileSync(srcIcon, path.join(dir, 'ic_launcher_round.png'));
+      if (fs.existsSync(iconMaskable)) {
+        fs.copyFileSync(
+          iconMaskable,
+          path.join(dir, 'ic_launcher_foreground.png')
+        );
+      }
     }
   }
   console.log('Copied CutSync launcher icons to Android mipmap folders.');
