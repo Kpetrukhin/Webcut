@@ -185,7 +185,9 @@ function drawCoverMedia(
   ch: number,
   clip: Clip,
   time: number,
-  progress: number
+  progress: number,
+  selectedClipId: string | null,
+  collaborators: Collaborator[]
 ) {
   const mw =
     media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
@@ -223,10 +225,8 @@ function drawCoverMedia(
       transAlpha *= eased;
     } else if (clip.transitionIn === 'zoom') {
       zoom *= 1.25 - 0.25 * eased;
-      transAlpha *= eased;
     } else if (clip.transitionIn === 'slide') {
       offsetX += (1 - eased) * cw * 0.35;
-      transAlpha *= eased;
     }
   }
 
@@ -241,10 +241,8 @@ function drawCoverMedia(
       transAlpha *= eased;
     } else if (clip.transitionOut === 'zoom') {
       zoom *= 1.25 - 0.25 * eased;
-      transAlpha *= eased;
     } else if (clip.transitionOut === 'slide') {
       offsetX -= (1 - eased) * cw * 0.35;
-      transAlpha *= eased;
     }
   }
 
@@ -283,6 +281,19 @@ function drawCoverMedia(
     grad.addColorStop(1, `rgba(0,0,0,${Math.min(0.85, clip.vignette)})`);
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, cw, ch);
+    ctx.restore();
+  }
+
+  const remoteOwner = collaborators.find((u) => u.selectedClipId === clip.id);
+  if (clip.id === selectedClipId || remoteOwner) {
+    const sf = cw / 720;
+    ctx.save();
+    ctx.translate(centerX, centerY);
+    if (kf.rotation) ctx.rotate((kf.rotation * Math.PI) / 180);
+    ctx.strokeStyle =
+      clip.id === selectedClipId ? '#22d3ee' : remoteOwner!.color;
+    ctx.lineWidth = 2.5 * sf;
+    ctx.strokeRect(-drawW / 2 + 2 * sf, -drawH / 2 + 2 * sf, drawW - 4 * sf, drawH - 4 * sf);
     ctx.restore();
   }
 }
@@ -332,7 +343,7 @@ function drawOverlayClip(
   let animScale = 1;
   if (elapsed < transDur && clip.transitionIn !== 'none') {
     const t = Math.max(0, elapsed / transDur);
-    alpha *= t;
+    if (clip.transitionIn === 'fade') alpha *= t;
     if (clip.transitionIn === 'zoom') animScale = 0.75 + 0.25 * t;
   }
   if (
@@ -341,7 +352,7 @@ function drawOverlayClip(
     clip.transitionOut !== 'none'
   ) {
     const t = Math.max(0, remaining / transDur);
-    alpha *= t;
+    if (clip.transitionOut === 'fade') alpha *= t;
   }
 
   const radius = (clip.borderRadius ?? 20) * (cw / 720);
@@ -375,9 +386,6 @@ function drawOverlayClip(
     );
     ctx.drawImage(media, -pipW / 2, -pipH / 2, pipW, pipH);
     ctx.restore();
-  } else {
-    ctx.fillStyle = '#18181b';
-    ctx.fillRect(-pipW / 2, -pipH / 2, pipW, pipH);
   }
   ctx.restore();
 
@@ -397,16 +405,31 @@ function drawOverlayClip(
 
   const remoteOwner = collaborators.find((u) => u.selectedClipId === clip.id);
   if (clip.id === selectedClipId || remoteOwner) {
+    const sf = cw / 720;
     ctx.save();
     ctx.translate(cx, cy);
     if (rotRad !== 0) ctx.rotate(rotRad);
     ctx.strokeStyle =
       clip.id === selectedClipId ? '#22d3ee' : remoteOwner!.color;
-    ctx.lineWidth = 3 * (cw / 720);
-    ctx.setLineDash([8 * (cw / 720), 6 * (cw / 720)]);
+    ctx.lineWidth = 2.5 * sf;
     ctx.beginPath();
     ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
     ctx.stroke();
+
+    // Corner handles for active turquoise selection frame
+    const corners = [
+      [-pipW / 2, -pipH / 2],
+      [pipW / 2, -pipH / 2],
+      [-pipW / 2, pipH / 2],
+      [pipW / 2, pipH / 2],
+    ];
+    ctx.fillStyle =
+      clip.id === selectedClipId ? '#22d3ee' : remoteOwner!.color;
+    for (const [hx, hy] of corners) {
+      ctx.beginPath();
+      ctx.arc(hx, hy, 5 * sf, 0, Math.PI * 2);
+      ctx.fill();
+    }
     ctx.restore();
   }
 }
@@ -512,8 +535,7 @@ function drawTextClip(
     ctx.shadowBlur = 0;
     ctx.strokeStyle =
       clip.id === selectedClipId ? '#22d3ee' : remoteUser!.color;
-    ctx.lineWidth = 3 * scaleFactor;
-    ctx.setLineDash([8 * scaleFactor, 6 * scaleFactor]);
+    ctx.lineWidth = 2.5 * scaleFactor;
     ctx.strokeRect(
       localBoxX - 6 * scaleFactor,
       localBoxY - 6 * scaleFactor,
@@ -535,7 +557,8 @@ export function renderCompositeFrame(
   selectedClipId: string | null,
   collaborators: Collaborator[],
   tracks?: Track[],
-  backgroundColor?: string
+  backgroundColor?: string,
+  snapGuides?: {x: boolean; y: boolean}
 ) {
   ctx.fillStyle = backgroundColor || '#09090b';
   ctx.fillRect(0, 0, cw, ch);
@@ -574,11 +597,32 @@ export function renderCompositeFrame(
     );
     if (clip.kind === 'image' && clip.src) {
       const img = pool.getImage(clip.src);
-      if (img) drawCoverMedia(ctx, img, cw, ch, clip, time, progress);
+      if (img)
+        drawCoverMedia(
+          ctx,
+          img,
+          cw,
+          ch,
+          clip,
+          time,
+          progress,
+          selectedClipId,
+          collaborators
+        );
     } else if (clip.kind === 'video' && clip.src) {
       const vid = pool.getVideo(clip.src);
       if (vid.readyState >= 2) {
-        drawCoverMedia(ctx, vid, cw, ch, clip, time, progress);
+        drawCoverMedia(
+          ctx,
+          vid,
+          cw,
+          ch,
+          clip,
+          time,
+          progress,
+          selectedClipId,
+          collaborators
+        );
       }
     }
   }
@@ -600,6 +644,29 @@ export function renderCompositeFrame(
   // 3. Text Tracks
   for (const clip of orderedClipsForType('text')) {
     drawTextClip(ctx, cw, ch, clip, time, selectedClipId, collaborators);
+  }
+
+  // 4. Magnetic Center Snap Guide Lines
+  if (snapGuides && (snapGuides.x || snapGuides.y)) {
+    const sf = cw / 720;
+    ctx.save();
+    ctx.strokeStyle = '#22d3ee';
+    ctx.lineWidth = 2 * sf;
+    ctx.shadowColor = 'rgba(34, 211, 238, 0.7)';
+    ctx.shadowBlur = 6 * sf;
+    if (snapGuides.x) {
+      ctx.beginPath();
+      ctx.moveTo(cw / 2, 0);
+      ctx.lineTo(cw / 2, ch);
+      ctx.stroke();
+    }
+    if (snapGuides.y) {
+      ctx.beginPath();
+      ctx.moveTo(0, ch / 2);
+      ctx.lineTo(cw, ch / 2);
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 }
 

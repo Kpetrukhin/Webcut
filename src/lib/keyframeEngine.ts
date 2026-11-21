@@ -45,7 +45,7 @@ export function getBaseClipTransform(clip: Clip): EvaluatedTransform {
     return {
       x: clip.textStyle?.x ?? 0.5,
       y: clip.textStyle?.y ?? 0.76,
-      scale: 1,
+      scale: clip.mediaScale ?? 1,
       rotation: clip.rotation ?? 0,
       opacity: clip.opacity ?? 1,
     };

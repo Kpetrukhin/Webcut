@@ -1332,9 +1332,9 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
           </div>
           <input
             type="range"
-            min={0.1}
+            min={0}
             max={1}
-            step={0.05}
+            step={0.01}
             value={selectedClip.opacity}
             onChange={(e) =>
               onUpdateClip(selectedClip.id, {opacity: Number(e.target.value)})

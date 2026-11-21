@@ -3,6 +3,7 @@ import {
   ChevronLeft,
   CopyPlus,
   Download,
+  Droplet,
   Gauge,
   Home,
   Layers,
@@ -24,7 +25,10 @@ import {
 } from './shared/types.ts';
 import type {AspectRatio, Clip} from './shared/types.ts';
 import {StudioAudioEngine} from './lib/audioEngine.ts';
-import {upsertKeyframeAtTime} from './lib/keyframeEngine.ts';
+import {
+  evaluateClipTransform,
+  upsertKeyframeAtTime,
+} from './lib/keyframeEngine.ts';
 import {
   getLocalProjects,
   removeLocalProject,
@@ -39,6 +43,7 @@ import {
 } from './hooks/useCollaborativeRoom.ts';
 import {HomeScreen} from './components/HomeScreen.tsx';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
+import type {CanvasTransformPatch} from './components/PreviewCanvas.tsx';
 import {Timeline} from './components/Timeline.tsx';
 import {RoomsLobbyModal} from './components/RoomsLobbyModal.tsx';
 import {
@@ -112,6 +117,7 @@ export default function App() {
   const [pxPerSec, setPxPerSec] = useState(64);
   const [desktopTab, setDesktopTab] = useState<ActiveToolTab>('media');
   const [mobileSheet, setMobileSheet] = useState<ActiveToolTab | null>(null);
+  const [showOpacitySlider, setShowOpacitySlider] = useState(false);
   const [showLobbyModal, setShowLobbyModal] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(project.title);
@@ -147,6 +153,12 @@ export default function App() {
       setSelectedClipId(null);
     }
   }, [project.clips, selectedClipId]);
+
+  useEffect(() => {
+    if (!selectedClip || selectedClip.track === 'audio') {
+      setShowOpacitySlider(false);
+    }
+  }, [selectedClip]);
 
   useEffect(() => {
     if (screen !== 'editor') return;
@@ -331,7 +343,7 @@ export default function App() {
           brightness: 1,
           contrast: 1,
           saturate: 1,
-          transitionIn: 'fade',
+          transitionIn: 'none',
           motionEffect:
             opts.kind === 'image' && opts.track === 'video'
               ? 'kenburns-in'
@@ -370,7 +382,7 @@ export default function App() {
           brightness: 1,
           contrast: 1,
           saturate: 1,
-          transitionIn: 'fade',
+          transitionIn: 'none',
           motionEffect: 'none',
           text,
           textStyle: {
@@ -428,13 +440,18 @@ export default function App() {
     [currentTime, addClip]
   );
 
-  const handleDragClipPosition = useCallback(
-    (clipId: string, x: number, y: number, commit: boolean) => {
+  const handleTransformClipOnCanvas = useCallback(
+    (clipId: string, patch: CanvasTransformPatch, commit: boolean) => {
       const target = project.clips.find((c) => c.id === clipId);
       if (!target) return;
 
       if (target.keyframes && target.keyframes.length > 0) {
-        const {keyframes} = upsertKeyframeAtTime(target, currentTime, {x, y});
+        const {keyframes} = upsertKeyframeAtTime(target, currentTime, {
+          x: patch.x,
+          y: patch.y,
+          ...(patch.scale !== undefined ? {scale: patch.scale} : {}),
+          ...(patch.rotation !== undefined ? {rotation: patch.rotation} : {}),
+        });
         updateClip(
           clipId,
           {keyframes},
@@ -455,18 +472,57 @@ export default function App() {
         };
         updateClip(
           clipId,
-          {textStyle: {...baseStyle, x, y}},
+          {
+            textStyle: {...baseStyle, x: patch.x, y: patch.y},
+            ...(patch.scale !== undefined ? {mediaScale: patch.scale} : {}),
+            ...(patch.rotation !== undefined ? {rotation: patch.rotation} : {}),
+          },
           {skipUndo: !commit, skipSync: !commit}
         );
       } else {
         updateClip(
           clipId,
-          {mediaX: x, mediaY: y},
+          {
+            mediaX: patch.x,
+            mediaY: patch.y,
+            ...(patch.scale !== undefined ? {mediaScale: patch.scale} : {}),
+            ...(patch.rotation !== undefined ? {rotation: patch.rotation} : {}),
+          },
           {skipUndo: !commit, skipSync: !commit}
         );
       }
     },
     [project.clips, currentTime, updateClip]
+  );
+
+  const handleAddKeyframeAtPlayhead = useCallback(() => {
+    if (!selectedClip || selectedClip.track === 'audio') return;
+    const {keyframes} = upsertKeyframeAtTime(selectedClip, currentTime);
+    updateClip(selectedClip.id, {keyframes});
+  }, [selectedClip, currentTime, updateClip]);
+
+  const handleChangeSelectedOpacity = useCallback(
+    (nextOpacity: number, commit = true) => {
+      if (!selectedClip || selectedClip.track === 'audio') return;
+      const clamped = Math.max(0, Math.min(1, Math.round(nextOpacity * 100) / 100));
+      if (selectedClip.keyframes && selectedClip.keyframes.length > 0) {
+        const {keyframes} = upsertKeyframeAtTime(selectedClip, currentTime, {
+          opacity: clamped,
+        });
+        updateClip(
+          selectedClip.id,
+          {opacity: clamped, keyframes},
+          {skipUndo: !commit, skipSync: !commit}
+        );
+        return;
+      }
+      updateClip(
+        selectedClip.id,
+        {opacity: clamped},
+        {skipUndo: !commit, skipSync: !commit}
+      );
+    },
+    [selectedClip, currentTime, updateClip]
   );
 
   const lastTimelineSyncRef = useRef(0);
@@ -615,6 +671,17 @@ export default function App() {
             currentTime < c.start + c.duration - 0.15
         )
   );
+
+  const hasKeyframeAtPlayhead = Boolean(
+    selectedClip &&
+      selectedClip.keyframes?.some(
+        (k) => Math.abs(k.timeOffset - (currentTime - selectedClip.start)) <= 0.12
+      )
+  );
+
+  const selectedOpacityValue = selectedClip
+    ? evaluateClipTransform(selectedClip, currentTime).opacity
+    : 1;
 
   if (screen === 'home') {
     return (
@@ -882,7 +949,7 @@ export default function App() {
               collaborators={collaborators}
               mediaPool={mediaPoolRef.current}
               onSelectClip={setSelectedClipId}
-              onDragClipPosition={handleDragClipPosition}
+              onTransformClip={handleTransformClipOnCanvas}
             />
           </div>
 
@@ -909,7 +976,7 @@ export default function App() {
               </button>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 sm:gap-3">
               <span className="font-mono text-xs tabular-nums text-white">
                 {formatTimecode(currentTime)}
               </span>
@@ -924,6 +991,32 @@ export default function App() {
                 ) : (
                   <Play className="ml-0.5 h-4 w-4 fill-current" />
                 )}
+              </button>
+              <button
+                type="button"
+                onClick={handleAddKeyframeAtPlayhead}
+                disabled={!selectedClip || selectedClip.track === 'audio'}
+                title="Поставить ключевой кадр в текущем времени"
+                aria-label="Ключевой кадр"
+                className={`flex h-8 w-8 items-center justify-center rounded-lg border transition active:scale-95 disabled:opacity-30 ${
+                  hasKeyframeAtPlayhead
+                    ? 'border-amber-400/70 bg-amber-500/20 text-amber-300'
+                    : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-amber-400/60 hover:text-amber-200'
+                }`}
+              >
+                <svg
+                  viewBox="0 0 24 24"
+                  className="h-4 w-4"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <path d="M12 3l7.5 9L12 21 4.5 12 12 3z" />
+                  <path d="M12 9v6" />
+                  <path d="M9 12h6" />
+                </svg>
               </button>
               <span className="font-mono text-xs tabular-nums text-zinc-500">
                 {formatTimecode(duration)}
@@ -1103,6 +1196,46 @@ export default function App() {
 
       {/* Mobile Bottom Thumb Toolbar */}
       <nav className="shrink-0 border-t border-white/10 bg-[#111114] pb-safe lg:hidden">
+        {selectedClip && selectedClip.track !== 'audio' && showOpacitySlider && (
+          <div className="flex items-center gap-3 border-b border-white/10 bg-[#15151a] px-3 py-2">
+            <span className="shrink-0 text-[11px] font-medium text-cyan-300">
+              Прозрачность
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={selectedOpacityValue}
+              onChange={(e) =>
+                handleChangeSelectedOpacity(Number(e.target.value), false)
+              }
+              onPointerUp={(e) =>
+                handleChangeSelectedOpacity(
+                  Number((e.target as HTMLInputElement).value),
+                  true
+                )
+              }
+              onTouchEnd={(e) =>
+                handleChangeSelectedOpacity(
+                  Number((e.target as HTMLInputElement).value),
+                  true
+                )
+              }
+              className="h-2 flex-1 cursor-pointer accent-cyan-400"
+            />
+            <span className="w-10 shrink-0 text-right font-mono text-xs tabular-nums text-white">
+              {Math.round(selectedOpacityValue * 100)}%
+            </span>
+            <button
+              type="button"
+              onClick={() => setShowOpacitySlider(false)}
+              className="rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-zinc-200"
+            >
+              Готово
+            </button>
+          </div>
+        )}
         {selectedClip ? (
           <div className="no-scrollbar flex h-14 items-center gap-1 overflow-x-auto px-2">
             <button
@@ -1122,6 +1255,20 @@ export default function App() {
               <Scissors className="h-4 w-4 text-cyan-400" />
               <span>Разделить</span>
             </button>
+            {selectedClip.track !== 'audio' && (
+              <button
+                type="button"
+                onClick={() => setShowOpacitySlider((v) => !v)}
+                className={`flex h-11 min-w-[78px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  showOpacitySlider
+                    ? 'bg-cyan-500/20 text-cyan-300'
+                    : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <Droplet className="h-4 w-4 text-cyan-400" />
+                <span>Прозрачность</span>
+              </button>
+            )}
             {selectedClip.track === 'overlay' && (
               <button
                 type="button"
