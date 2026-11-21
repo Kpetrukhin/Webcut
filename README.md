@@ -1,11 +1,66 @@
-<div align="center">
+# CutSync — Совместный видеоредактор в стиле CapCut
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+Мобильный и десктопный видеоредактор с многопользовательским монтажом в реальном времени через WebSocket. Работает прямо в браузере на телефоне (iOS / Android) и ПК, устанавливается как PWA-приложение на экран телефона и позволяет нескольким людям одновременно редактировать один проект.
 
-  <h1>Built with AI Studio</h2>
+## Основные возможности
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+- **Совместный монтаж в реальном времени (WebSocket)**:
+  - Комнаты по ссылке (`/?room=КОД`), вход с любого устройства (телефон + ПК).
+  - Живые курсоры и линии воспроизведения других участников на таймлайне.
+  - Подсветка клипов, которые сейчас редактируют другие участники.
+  - Встроенный чат команды внутри комнаты и автосохранение проектов в `data/rooms.json`.
+- **Интерфейс в стиле CapCut (Mobile-First + Desktop Studio)**:
+  - Адаптация под телефон (сенсорное управление таймлайном, нижние шторки инструментов, `100dvh`) и полноэкранная студия на ПК.
+  - 4 дорожки: **Видео**, **Слой (PIP)**, **Текст**, **Аудио**.
+  - Обрезка краёв клипов перетаскиванием ручек, сдвиг по таймлайну, разделение по линии времени (`Разделить`), изменение скорости (`0.5x – 2x`), дублирование, Undo / Redo.
+  - Загрузка реальных видео, фото и аудио с телефона или компьютера (`/api/upload`).
+  - Фильтры (`Кино`, `Тёплый`, `Холод`, `Яркий`, `Винтаж`, `Ч/Б`), переходы (`Плавный`, `Зум`, `Слайд`), анимация камеры (`Ken Burns` / панорама), цветокоррекция.
+  - Текстовые титры с перетаскиванием прямо по экрану предпросмотра.
+  - Встроенные синтезированные саундтреки (Web Audio API) + экспорт готового видео через Canvas `MediaRecorder`.
+- **PWA (Установка на телефон)**:
+  - Кнопка установки приложения в интерфейсе для Android / Chrome и инструкция для iOS Safari (`На экран «Домой»`).
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+## Быстрый старт и проверка сборки
 
-</div>
+Требования: **Node.js 22+** (для нативного запуска `node server.ts` в production) и **npm 10+**.
+
+```bash
+# 1. Установка зависимостей
+npm install
+
+# 2. Запуск в режиме разработки (Express + WebSocket + Vite на порту 3000)
+npm run dev
+
+# 3. Проверка TypeScript
+npm run lint
+
+# 4. Сборка production-бандла
+npm run build
+
+# 5. Запуск собранного приложения
+npm start
+```
+
+После запуска откройте `http://localhost:3000` на ПК. Чтобы подключиться с телефона в той же Wi-Fi сети, откройте вкладку **Команда** — там автоматически отобразится локальный LAN-адрес вида `http://192.168.x.x:3000/?room=studio-demo`.
+
+## Стек
+
+- **Frontend**: React 19, TypeScript, Tailwind CSS v4, Lucide Icons, Vite, `vite-plugin-pwa`
+- **Backend**: Node.js, Express 4, `ws` (WebSocket), Multer (загрузка медиа)
+- **Рендер и звук**: HTML5 Canvas 2D, `MediaRecorder` API, Web Audio API
+
+## Структура проекта
+
+- `server.ts` — Express-сервер, WebSocket-комнаты, загрузка файлов в `/uploads`, хранение комнат в `/data/rooms.json`
+- `src/shared/types.ts` — общие типы данных, протокол WebSocket и стартовые пресеты
+- `src/lib/renderEngine.ts` — композитинг кадров на Canvas и экспорт видео
+- `src/lib/audioEngine.ts` — синхронизация аудио и процедурный Web Audio синтезатор
+- `src/hooks/useCollaborativeRoom.ts` — WebSocket-клиент, undo/redo и presence-синхронизация
+- `src/components/` — `Timeline.tsx`, `PreviewCanvas.tsx`, `ToolSheets.tsx`, `PWAInstallButton.tsx`
+
+## Деплой через Docker
+
+```bash
+docker build -t cutsync .
+docker run -p 3000:3000 -v $(pwd)/uploads:/app/uploads -v $(pwd)/data:/app/data cutsync
+```

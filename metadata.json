@@ -1,0 +1,6 @@
+{
+  "name": "CutSync",
+  "description": "Совместный мобильный и десктопный видеоредактор в стиле CapCut с редактированием в реальном времени.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
