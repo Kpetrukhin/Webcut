@@ -1,5 +1,13 @@
-import React, {useEffect, useRef} from 'react';
-import type {AspectRatio, Clip, Collaborator, Track} from '../shared/types.ts';
+import React, {useEffect, useRef, useState} from 'react';
+import type {
+  AspectRatio,
+  Clip,
+  Collaborator,
+  ProjectFont,
+  Track,
+} from '../shared/types.ts';
+import {preloadProjectFonts, subscribeFontLoads} from '../lib/fontLoader.ts';
+import {evaluateClipTransform} from '../lib/keyframeEngine.ts';
 import {
   getCanvasDimensions,
   MediaPool,
@@ -10,6 +18,8 @@ interface PreviewCanvasProps {
   tracks: Track[];
   clips: Clip[];
   aspectRatio: AspectRatio;
+  backgroundColor?: string;
+  customFonts?: ProjectFont[];
   currentTime: number;
   isPlaying: boolean;
   selectedClipId: string | null;
@@ -28,6 +38,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   tracks,
   clips,
   aspectRatio,
+  backgroundColor,
+  customFonts,
   currentTime,
   isPlaying,
   selectedClipId,
@@ -37,6 +49,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   onDragClipPosition,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [renderNonce, setRenderNonce] = useState(0);
   const dragStateRef = useRef<{
     clipId: string;
     startX: number;
@@ -46,6 +59,25 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   } | null>(null);
 
   const {width, height} = getCanvasDimensions(aspectRatio);
+
+  useEffect(() => {
+    mediaPool.setOnAssetReady(() => {
+      setRenderNonce((n) => n + 1);
+    });
+    const unsubFonts = subscribeFontLoads(() => {
+      setRenderNonce((n) => n + 1);
+    });
+    return () => {
+      mediaPool.setOnAssetReady(undefined);
+      unsubFonts();
+    };
+  }, [mediaPool]);
+
+  useEffect(() => {
+    if (customFonts && customFonts.length > 0) {
+      void preloadProjectFonts(customFonts);
+    }
+  }, [customFonts]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -63,12 +95,14 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       mediaPool,
       selectedClipId,
       collaborators,
-      tracks
+      tracks,
+      backgroundColor
     );
   }, [
     tracks,
     clips,
     aspectRatio,
+    backgroundColor,
     currentTime,
     isPlaying,
     selectedClipId,
@@ -76,6 +110,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     mediaPool,
     width,
     height,
+    renderNonce,
   ]);
 
   useEffect(() => {
@@ -94,7 +129,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           mediaPool,
           selectedClipId,
           collaborators,
-          tracks
+          tracks,
+          backgroundColor
         );
       }
       raf = requestAnimationFrame(loop);
@@ -105,6 +141,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     isPlaying,
     tracks,
     clips,
+    backgroundColor,
     currentTime,
     width,
     height,
@@ -131,17 +168,16 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     );
     for (let i = activeTexts.length - 1; i >= 0; i--) {
       const c = activeTexts[i];
-      const cx = c.textStyle?.x ?? 0.5;
-      const cy = c.textStyle?.y ?? 0.78;
-      if (Math.abs(nx - cx) < 0.28 && Math.abs(ny - cy) < 0.1) {
+      const tr = evaluateClipTransform(c, currentTime);
+      if (Math.abs(nx - tr.x) < 0.28 && Math.abs(ny - tr.y) < 0.12) {
         onSelectClip(c.id);
         canvas.setPointerCapture(e.pointerId);
         dragStateRef.current = {
           clipId: c.id,
           startX: e.clientX,
           startY: e.clientY,
-          origX: cx,
-          origY: cy,
+          origX: tr.x,
+          origY: tr.y,
         };
         return;
       }
@@ -156,18 +192,17 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     );
     for (let i = activeOverlays.length - 1; i >= 0; i--) {
       const c = activeOverlays[i];
-      const cx = c.mediaX ?? 0.72;
-      const cy = c.mediaY ?? 0.25;
-      const half = (c.mediaScale ?? 0.42) / 2;
-      if (Math.abs(nx - cx) <= half && Math.abs(ny - cy) <= half) {
+      const tr = evaluateClipTransform(c, currentTime);
+      const half = Math.max(0.1, tr.scale / 2);
+      if (Math.abs(nx - tr.x) <= half && Math.abs(ny - tr.y) <= half) {
         onSelectClip(c.id);
         canvas.setPointerCapture(e.pointerId);
         dragStateRef.current = {
           clipId: c.id,
           startX: e.clientX,
           startY: e.clientY,
-          origX: cx,
-          origY: cy,
+          origX: tr.x,
+          origY: tr.y,
         };
         return;
       }
@@ -181,8 +216,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     const rect = canvas.getBoundingClientRect();
     const dx = (e.clientX - drag.startX) / rect.width;
     const dy = (e.clientY - drag.startY) / rect.height;
-    const nextX = Math.max(0.08, Math.min(0.92, drag.origX + dx));
-    const nextY = Math.max(0.08, Math.min(0.92, drag.origY + dy));
+    const nextX = Math.max(0.05, Math.min(0.95, drag.origX + dx));
+    const nextY = Math.max(0.05, Math.min(0.95, drag.origY + dy));
     onDragClipPosition(drag.clipId, nextX, nextY, false);
   };
 
@@ -193,8 +228,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     const rect = canvas.getBoundingClientRect();
     const dx = (e.clientX - drag.startX) / rect.width;
     const dy = (e.clientY - drag.startY) / rect.height;
-    const nextX = Math.max(0.08, Math.min(0.92, drag.origX + dx));
-    const nextY = Math.max(0.08, Math.min(0.92, drag.origY + dy));
+    const nextX = Math.max(0.05, Math.min(0.95, drag.origX + dx));
+    const nextY = Math.max(0.05, Math.min(0.95, drag.origY + dy));
     dragStateRef.current = null;
     try {
       canvas.releasePointerCapture(e.pointerId);
@@ -216,8 +251,9 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   return (
     <div className="relative flex h-full w-full items-center justify-center overflow-hidden p-2 sm:p-4">
       <div
-        className={`relative max-h-full max-w-full ${aspectClass} overflow-hidden rounded-xl border border-white/10 bg-[#09090b] shadow-2xl`}
+        className={`relative max-h-full max-w-full ${aspectClass} overflow-hidden rounded-xl border border-white/10 shadow-2xl`}
         style={{
+          backgroundColor: backgroundColor || '#09090b',
           height: aspectRatio === '16:9' ? 'auto' : '100%',
           width: aspectRatio === '16:9' ? '100%' : 'auto',
         }}
@@ -235,9 +271,11 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
 
         {clips.length === 0 && (
           <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center p-4 text-center">
-            <p className="text-sm font-medium text-zinc-300">Таймлайн пуст</p>
-            <p className="mt-1 text-xs text-zinc-500">
-              Нажмите «Медиа» внизу, чтобы добавить видео или фото
+            <p className="text-sm font-medium text-zinc-200 drop-shadow">
+              Пустой холст
+            </p>
+            <p className="mt-1 text-xs text-zinc-400 drop-shadow">
+              Нажмите «Медиа», «Наложение» или «Текст» внизу
             </p>
           </div>
         )}

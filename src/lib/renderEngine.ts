@@ -3,9 +3,12 @@ import type {
   Clip,
   Collaborator,
   FilterPreset,
+  ProjectFont,
   Track,
 } from '../shared/types.ts';
 import type {StudioAudioEngine} from './audioEngine.ts';
+import {loadCustomFont, preloadProjectFonts} from './fontLoader.ts';
+import {evaluateClipTransform} from './keyframeEngine.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
 
 export function getCanvasDimensions(aspect: AspectRatio): {
@@ -28,6 +31,11 @@ export function getCanvasDimensions(aspect: AspectRatio): {
 export class MediaPool {
   private images = new Map<string, HTMLImageElement>();
   private videos = new Map<string, HTMLVideoElement>();
+  private onAssetReady?: () => void;
+
+  public setOnAssetReady(cb?: () => void) {
+    this.onAssetReady = cb;
+  }
 
   public getImage(src: string): HTMLImageElement | null {
     const resolved = resolveMediaSrc(src) || src;
@@ -35,6 +43,12 @@ export class MediaPool {
     if (!img) {
       img = new Image();
       img.crossOrigin = 'anonymous';
+      img.onload = () => {
+        this.onAssetReady?.();
+      };
+      img.onerror = () => {
+        this.onAssetReady?.();
+      };
       img.src = resolved;
       this.images.set(resolved, img);
     }
@@ -50,6 +64,12 @@ export class MediaPool {
       vid.playsInline = true;
       vid.muted = true;
       vid.preload = 'auto';
+      vid.onloadeddata = () => {
+        this.onAssetReady?.();
+      };
+      vid.onseeked = () => {
+        this.onAssetReady?.();
+      };
       vid.src = resolved;
       this.videos.set(resolved, vid);
     }
@@ -93,7 +113,8 @@ export class MediaPool {
         activeClip.trimStart +
         (time - activeClip.start) * (activeClip.speed || 1);
       vid.playbackRate = activeClip.speed || 1;
-      const isMuted = mutedIds.has(activeClip.trackId) || activeClip.volume <= 0.01;
+      const isMuted =
+        mutedIds.has(activeClip.trackId) || activeClip.volume <= 0.01;
       vid.muted = isMuted;
       vid.volume = isMuted ? 0 : Math.max(0, Math.min(1, activeClip.volume));
 
@@ -102,7 +123,9 @@ export class MediaPool {
           Math.max(0, targetTime),
           Math.max(0, (vid.duration || 60) - 0.05)
         );
-        if (Math.abs(vid.currentTime - clampedTarget) > (isPlaying ? 0.3 : 0.08)) {
+        if (
+          Math.abs(vid.currentTime - clampedTarget) > (isPlaying ? 0.3 : 0.08)
+        ) {
           vid.currentTime = clampedTarget;
         }
       }
@@ -120,12 +143,14 @@ export function buildFilterString(
   preset: FilterPreset,
   brightness: number,
   contrast: number,
-  saturate: number
+  saturate: number,
+  blur?: number
 ): string {
   const parts: string[] = [];
   if (brightness !== 1) parts.push(`brightness(${brightness})`);
   if (contrast !== 1) parts.push(`contrast(${contrast})`);
   if (saturate !== 1) parts.push(`saturate(${saturate})`);
+  if (blur && blur > 0) parts.push(`blur(${blur}px)`);
 
   switch (preset) {
     case 'cinema':
@@ -159,6 +184,7 @@ function drawCoverMedia(
   cw: number,
   ch: number,
   clip: Clip,
+  time: number,
   progress: number
 ) {
   const mw =
@@ -167,10 +193,11 @@ function drawCoverMedia(
     media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
   if (!mw || !mh) return;
 
+  const kf = evaluateClipTransform(clip, time);
   const baseScale = Math.max(cw / mw, ch / mh);
-  let zoom = clip.mediaScale ?? 1;
+  let zoom = kf.scale;
   let offsetX = 0;
-  let offsetY = 0;
+  const offsetY = 0;
 
   if (clip.motionEffect === 'kenburns-in') {
     zoom *= 1 + progress * 0.14;
@@ -187,7 +214,7 @@ function drawCoverMedia(
   const elapsed = progress * clip.duration;
   const remaining = (1 - progress) * clip.duration;
   const transDur = Math.min(0.45, clip.duration * 0.4);
-  let transAlpha = clip.opacity;
+  let transAlpha = kf.opacity;
 
   if (elapsed < transDur && clip.transitionIn !== 'none') {
     const t = Math.max(0, Math.min(1, elapsed / transDur));
@@ -203,7 +230,11 @@ function drawCoverMedia(
     }
   }
 
-  if (remaining < transDur && clip.transitionOut && clip.transitionOut !== 'none') {
+  if (
+    remaining < transDur &&
+    clip.transitionOut &&
+    clip.transitionOut !== 'none'
+  ) {
     const t = Math.max(0, Math.min(1, remaining / transDur));
     const eased = 1 - Math.pow(1 - t, 3);
     if (clip.transitionOut === 'fade') {
@@ -219,8 +250,8 @@ function drawCoverMedia(
 
   const drawW = mw * baseScale * zoom;
   const drawH = mh * baseScale * zoom;
-  const centerX = cw * (clip.mediaX ?? 0.5) + offsetX;
-  const centerY = ch * (clip.mediaY ?? 0.5) + offsetY;
+  const centerX = cw * kf.x + offsetX;
+  const centerY = ch * kf.y + offsetY;
 
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, transAlpha));
@@ -229,16 +260,31 @@ function drawCoverMedia(
     clip.filter,
     clip.brightness,
     clip.contrast,
-    clip.saturate
+    clip.saturate,
+    clip.blur
   );
-  if (clip.rotation) {
-    ctx.translate(centerX, centerY);
-    ctx.rotate((clip.rotation * Math.PI) / 180);
-    ctx.drawImage(media, -drawW / 2, -drawH / 2, drawW, drawH);
-  } else {
-    ctx.drawImage(media, centerX - drawW / 2, centerY - drawH / 2, drawW, drawH);
-  }
+  ctx.translate(centerX, centerY);
+  if (kf.rotation) ctx.rotate((kf.rotation * Math.PI) / 180);
+  if (clip.flipHorizontal) ctx.scale(-1, 1);
+  ctx.drawImage(media, -drawW / 2, -drawH / 2, drawW, drawH);
   ctx.restore();
+
+  if (clip.vignette && clip.vignette > 0) {
+    ctx.save();
+    const grad = ctx.createRadialGradient(
+      cw / 2,
+      ch / 2,
+      Math.min(cw, ch) * 0.25,
+      cw / 2,
+      ch / 2,
+      Math.max(cw, ch) * 0.72
+    );
+    grad.addColorStop(0, 'rgba(0,0,0,0)');
+    grad.addColorStop(1, `rgba(0,0,0,${Math.min(0.85, clip.vignette)})`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, cw, ch);
+    ctx.restore();
+  }
 }
 
 function drawOverlayClip(
@@ -271,30 +317,35 @@ function drawOverlayClip(
         ? media.naturalHeight
         : 0;
 
-  const scale = clip.mediaScale ?? 0.42;
+  const kf = evaluateClipTransform(clip, time);
+  const scale = kf.scale;
   const aspect = mw && mh ? mw / mh : 9 / 16;
   const pipW = cw * scale;
   const pipH = pipW / aspect;
-  const cx = cw * (clip.mediaX ?? 0.72);
-  const cy = ch * (clip.mediaY ?? 0.25);
+  const cx = cw * kf.x;
+  const cy = ch * kf.y;
 
   const elapsed = time - clip.start;
   const remaining = clip.start + clip.duration - time;
   const transDur = Math.min(0.4, clip.duration * 0.35);
-  let alpha = clip.opacity;
+  let alpha = kf.opacity;
   let animScale = 1;
   if (elapsed < transDur && clip.transitionIn !== 'none') {
     const t = Math.max(0, elapsed / transDur);
     alpha *= t;
     if (clip.transitionIn === 'zoom') animScale = 0.75 + 0.25 * t;
   }
-  if (remaining < transDur && clip.transitionOut && clip.transitionOut !== 'none') {
+  if (
+    remaining < transDur &&
+    clip.transitionOut &&
+    clip.transitionOut !== 'none'
+  ) {
     const t = Math.max(0, remaining / transDur);
     alpha *= t;
   }
 
   const radius = (clip.borderRadius ?? 20) * (cw / 720);
-  const rotRad = ((clip.rotation ?? 0) * Math.PI) / 180;
+  const rotRad = (kf.rotation * Math.PI) / 180;
 
   ctx.save();
   ctx.translate(cx, cy);
@@ -313,18 +364,36 @@ function drawOverlayClip(
     mw &&
     mh
   ) {
+    ctx.save();
+    if (clip.flipHorizontal) ctx.scale(-1, 1);
     ctx.filter = buildFilterString(
       clip.filter,
       clip.brightness,
       clip.contrast,
-      clip.saturate
+      clip.saturate,
+      clip.blur
     );
     ctx.drawImage(media, -pipW / 2, -pipH / 2, pipW, pipH);
+    ctx.restore();
   } else {
     ctx.fillStyle = '#18181b';
     ctx.fillRect(-pipW / 2, -pipH / 2, pipW, pipH);
   }
   ctx.restore();
+
+  if (clip.borderWidth && clip.borderWidth > 0) {
+    ctx.save();
+    ctx.translate(cx, cy);
+    if (rotRad !== 0) ctx.rotate(rotRad);
+    if (animScale !== 1) ctx.scale(animScale, animScale);
+    ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+    ctx.strokeStyle = clip.borderColor || '#ffffff';
+    ctx.lineWidth = clip.borderWidth * (cw / 720);
+    ctx.beginPath();
+    ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
+    ctx.stroke();
+    ctx.restore();
+  }
 
   const remoteOwner = collaborators.find((u) => u.selectedClipId === clip.id);
   if (clip.id === selectedClipId || remoteOwner) {
@@ -360,19 +429,33 @@ function drawTextClip(
     y: 0.78,
     align: 'center',
   };
+
+  if (style.fontFamily && style.fontSrc) {
+    void loadCustomFont(style.fontFamily, style.fontSrc);
+  }
+
+  const kf = evaluateClipTransform(clip, time);
   const textVal = clip.text ?? clip.name;
   const elapsed = time - clip.start;
+  const remaining = clip.start + clip.duration - time;
   const transDur = Math.min(0.35, clip.duration * 0.3);
-  let alpha = clip.opacity;
+  let alpha = kf.opacity;
   if (clip.transitionIn === 'fade' && elapsed < transDur) {
     alpha *= Math.max(0, elapsed / transDur);
   }
+  if (clip.transitionOut === 'fade' && remaining < transDur) {
+    alpha *= Math.max(0, remaining / transDur);
+  }
+
+  const scaleFactor = cw / 720;
+  const fontSize = Math.round(style.fontSize * scaleFactor * kf.scale);
+  const fontFamily = style.fontFamily
+    ? `"${style.fontFamily}", "Plus Jakarta Sans", sans-serif`
+    : '"Plus Jakarta Sans", sans-serif';
 
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-  const scaleFactor = cw / 720;
-  const fontSize = Math.round(style.fontSize * scaleFactor);
-  ctx.font = `${style.fontWeight === 'bold' ? '700' : '500'} ${fontSize}px "Plus Jakarta Sans", sans-serif`;
+  ctx.font = `${style.fontWeight === 'bold' ? '700' : '500'} ${fontSize}px ${fontFamily}`;
   ctx.textAlign = style.align;
   ctx.textBaseline = 'middle';
 
@@ -388,28 +471,40 @@ function drawTextClip(
   const padY = fontSize * 0.28;
   const boxW = maxLineW + padX * 2;
   const boxH = lines.length * lineHeight + padY * 2;
-  const anchorX = cw * style.x;
-  const anchorY = ch * style.y;
+  const anchorX = cw * kf.x;
+  const anchorY = ch * kf.y;
 
-  let boxX = anchorX - boxW / 2;
-  if (style.align === 'left') boxX = anchorX - padX;
-  if (style.align === 'right') boxX = anchorX - boxW + padX;
-  const boxY = anchorY - boxH / 2;
+  let localBoxX = -boxW / 2;
+  if (style.align === 'left') localBoxX = -padX;
+  if (style.align === 'right') localBoxX = -boxW + padX;
+  const localBoxY = -boxH / 2;
+
+  ctx.translate(anchorX, anchorY);
+  if (kf.rotation !== 0) {
+    ctx.rotate((kf.rotation * Math.PI) / 180);
+  }
 
   if (style.bgColor && style.bgColor !== 'transparent') {
     ctx.fillStyle = style.bgColor;
     ctx.beginPath();
-    ctx.roundRect(boxX, boxY, boxW, boxH, 16 * scaleFactor);
+    ctx.roundRect(localBoxX, localBoxY, boxW, boxH, 16 * scaleFactor);
     ctx.fill();
   }
 
   ctx.fillStyle = style.color;
-  ctx.shadowColor = 'rgba(0,0,0,0.55)';
-  ctx.shadowBlur = 10 * scaleFactor;
+  if (style.shadow !== false) {
+    ctx.shadowColor = 'rgba(0,0,0,0.65)';
+    ctx.shadowBlur = 10 * scaleFactor;
+  }
+
   lines.forEach((line, i) => {
-    const ly =
-      anchorY - ((lines.length - 1) * lineHeight) / 2 + i * lineHeight;
-    ctx.fillText(line, anchorX, ly);
+    const ly = -((lines.length - 1) * lineHeight) / 2 + i * lineHeight;
+    if (style.outline) {
+      ctx.lineWidth = Math.max(2, fontSize * 0.08);
+      ctx.strokeStyle = '#09090b';
+      ctx.strokeText(line, 0, ly);
+    }
+    ctx.fillText(line, 0, ly);
   });
 
   const remoteUser = collaborators.find((u) => u.selectedClipId === clip.id);
@@ -420,8 +515,8 @@ function drawTextClip(
     ctx.lineWidth = 3 * scaleFactor;
     ctx.setLineDash([8 * scaleFactor, 6 * scaleFactor]);
     ctx.strokeRect(
-      boxX - 6 * scaleFactor,
-      boxY - 6 * scaleFactor,
+      localBoxX - 6 * scaleFactor,
+      localBoxY - 6 * scaleFactor,
       boxW + 12 * scaleFactor,
       boxH + 12 * scaleFactor
     );
@@ -439,9 +534,10 @@ export function renderCompositeFrame(
   pool: MediaPool,
   selectedClipId: string | null,
   collaborators: Collaborator[],
-  tracks?: Track[]
+  tracks?: Track[],
+  backgroundColor?: string
 ) {
-  ctx.fillStyle = '#09090b';
+  ctx.fillStyle = backgroundColor || '#09090b';
   ctx.fillRect(0, 0, cw, ch);
 
   const trackList = tracks ?? [];
@@ -470,7 +566,7 @@ export function renderCompositeFrame(
       });
   };
 
-  // 1. Base Video Tracks (bottom-to-top)
+  // 1. Base Video Tracks
   for (const clip of orderedClipsForType('video')) {
     const progress = Math.max(
       0,
@@ -478,16 +574,16 @@ export function renderCompositeFrame(
     );
     if (clip.kind === 'image' && clip.src) {
       const img = pool.getImage(clip.src);
-      if (img) drawCoverMedia(ctx, img, cw, ch, clip, progress);
+      if (img) drawCoverMedia(ctx, img, cw, ch, clip, time, progress);
     } else if (clip.kind === 'video' && clip.src) {
       const vid = pool.getVideo(clip.src);
       if (vid.readyState >= 2) {
-        drawCoverMedia(ctx, vid, cw, ch, clip, progress);
+        drawCoverMedia(ctx, vid, cw, ch, clip, time, progress);
       }
     }
   }
 
-  // 2. Overlay / PIP Tracks (each overlay track renders cleanly in layer order)
+  // 2. Overlay / PIP Tracks
   for (const clip of orderedClipsForType('overlay')) {
     drawOverlayClip(
       ctx,
@@ -501,7 +597,7 @@ export function renderCompositeFrame(
     );
   }
 
-  // 3. Text Tracks (each text track renders cleanly in layer order)
+  // 3. Text Tracks
   for (const clip of orderedClipsForType('text')) {
     drawTextClip(ctx, cw, ch, clip, time, selectedClipId, collaborators);
   }
@@ -511,11 +607,20 @@ export async function exportProjectToVideo(opts: {
   clips: Clip[];
   tracks: Track[];
   aspectRatio: AspectRatio;
+  backgroundColor?: string;
+  customFonts?: ProjectFont[];
   duration: number;
   pool: MediaPool;
   audioEngine: StudioAudioEngine;
   onProgress: (pct: number) => void;
 }): Promise<{blob: Blob; ext: string}> {
+  await preloadProjectFonts(opts.customFonts);
+  for (const c of opts.clips) {
+    if (c.textStyle?.fontFamily && c.textStyle?.fontSrc) {
+      await loadCustomFont(c.textStyle.fontFamily, c.textStyle.fontSrc);
+    }
+  }
+
   const {width, height} = getCanvasDimensions(opts.aspectRatio);
   const canvas = document.createElement('canvas');
   canvas.width = width;
@@ -577,7 +682,8 @@ export async function exportProjectToVideo(opts: {
         opts.pool,
         null,
         [],
-        opts.tracks
+        opts.tracks,
+        opts.backgroundColor
       );
       opts.onProgress(Math.min(99, Math.round((t / totalDuration) * 100)));
 

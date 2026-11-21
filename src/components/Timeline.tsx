@@ -49,15 +49,28 @@ function getTrackIcon(type: TrackType) {
   }
 }
 
+function getTrackAccentClass(type: TrackType): string {
+  switch (type) {
+    case 'video':
+      return 'bg-cyan-400';
+    case 'overlay':
+      return 'bg-indigo-400';
+    case 'text':
+      return 'bg-amber-400';
+    case 'audio':
+      return 'bg-emerald-400';
+  }
+}
+
 function getTrackHeightClass(type: TrackType): string {
   switch (type) {
     case 'video':
-      return 'h-12 sm:h-14';
+      return 'h-13 sm:h-14';
     case 'overlay':
-      return 'h-10 sm:h-11';
+      return 'h-11 sm:h-12';
     case 'text':
     case 'audio':
-      return 'h-9 sm:h-10';
+      return 'h-10 sm:h-11';
   }
 }
 
@@ -77,8 +90,7 @@ export const Timeline: React.FC<TimelineProps> = ({
   onDeleteTrack,
   onClipTransform,
 }) => {
-  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
-  const trackAreaRef = useRef<HTMLDivElement | null>(null);
+  const rulerRef = useRef<HTMLDivElement | null>(null);
   const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrubActiveRef = useRef(false);
 
@@ -95,10 +107,10 @@ export const Timeline: React.FC<TimelineProps> = ({
     speed: number;
   } | null>(null);
 
-  const totalWidth = Math.max(600, Math.ceil((duration + 4) * pxPerSec));
+  const totalWidth = Math.max(640, Math.ceil((duration + 4) * pxPerSec));
 
   const clientXToTime = (clientX: number): number => {
-    const el = trackAreaRef.current;
+    const el = rulerRef.current;
     if (!el) return 0;
     const rect = el.getBoundingClientRect();
     const x = clientX - rect.left;
@@ -259,7 +271,7 @@ export const Timeline: React.FC<TimelineProps> = ({
             className="flex h-6 items-center gap-1 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 text-[10px] font-medium text-indigo-300 hover:bg-indigo-500/20 whitespace-nowrap"
           >
             <Plus className="h-3 w-3" />
-            Наложение
+            Слой
           </button>
           <button
             type="button"
@@ -302,99 +314,22 @@ export const Timeline: React.FC<TimelineProps> = ({
         </div>
       </div>
 
-      {/* Main vertically & horizontally scrollable track grid */}
-      <div className="studio-scrollbar flex flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
-        {/* Left Track Labels */}
-        <div className="z-20 flex w-20 shrink-0 flex-col border-r border-white/10 bg-[#141418] sm:w-32">
-          <div className="sticky top-0 z-10 h-6 shrink-0 border-b border-white/5 bg-[#16161b]" />
-          {tracks.map((track) => {
-            const Icon = getTrackIcon(track.type);
-            const hClass = getTrackHeightClass(track.type);
-            const trackClipsCount = clips.filter(
-              (c) => c.trackId === track.id
-            ).length;
-            const sameTypeCount = tracks.filter(
-              (t) => t.type === track.type
-            ).length;
-
-            return (
-              <div
-                key={track.id}
-                className={`flex ${hClass} shrink-0 items-center justify-between gap-1 border-b border-white/5 px-1.5 text-[10px] font-medium text-zinc-300 sm:px-2`}
-              >
-                <div className="flex min-w-0 items-center gap-1">
-                  <Icon className="h-3 w-3 shrink-0 text-zinc-500" />
-                  <span className="truncate">{track.name}</span>
-                </div>
-                <div className="flex shrink-0 items-center gap-0.5">
-                  {track.type === 'audio' ? (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onUpdateTrack(track.id, {muted: !track.muted})
-                      }
-                      aria-label="Отключить звук дорожки"
-                      className={`flex h-6 w-6 items-center justify-center rounded hover:bg-white/10 ${
-                        track.muted ? 'text-rose-400' : 'text-zinc-500'
-                      }`}
-                    >
-                      {track.muted ? (
-                        <VolumeX className="h-3 w-3" />
-                      ) : (
-                        <Volume2 className="h-3 w-3" />
-                      )}
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        onUpdateTrack(track.id, {hidden: !track.hidden})
-                      }
-                      aria-label="Скрыть слой дорожки"
-                      className={`flex h-6 w-6 items-center justify-center rounded hover:bg-white/10 ${
-                        track.hidden ? 'text-amber-400' : 'text-zinc-500'
-                      }`}
-                    >
-                      {track.hidden ? (
-                        <EyeOff className="h-3 w-3" />
-                      ) : (
-                        <Eye className="h-3 w-3" />
-                      )}
-                    </button>
-                  )}
-                  {trackClipsCount === 0 && sameTypeCount > 1 && (
-                    <button
-                      type="button"
-                      onClick={() => onDeleteTrack(track.id)}
-                      aria-label="Удалить пустую дорожку"
-                      className="flex h-6 w-6 items-center justify-center rounded text-zinc-500 hover:bg-rose-500/15 hover:text-rose-400"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-
-        {/* Scrollable Ruler + Dynamic Track Rows */}
-        <div
-          ref={scrollContainerRef}
-          className="studio-scrollbar relative flex-1 overflow-x-auto overflow-y-visible"
-        >
-          <div
-            ref={trackAreaRef}
-            style={{width: `${totalWidth}px`}}
-            className="relative"
-          >
-            {/* Interactive Time Ruler */}
+      {/* Unified Single Scroll Container: Sticky Left Cells + Track Lanes stay 100% aligned */}
+      <div className="studio-scrollbar relative flex-1 min-h-0 overflow-auto bg-[#0e0e11]">
+        <div className="relative min-w-max">
+          {/* Top Sticky Ruler Row */}
+          <div className="sticky top-0 z-40 flex h-6 border-b border-white/10 bg-[#16161b]">
+            <div className="sticky left-0 z-50 flex w-[112px] shrink-0 items-center border-r border-white/10 bg-[#16161b] px-2.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-400 sm:w-[136px]">
+              Дорожки
+            </div>
             <div
+              ref={rulerRef}
               onPointerDown={handleRulerPointerDown}
               onPointerMove={handleRulerPointerMove}
               onPointerUp={handleRulerPointerUp}
               onPointerCancel={handleRulerPointerUp}
-              className="sticky top-0 z-20 h-6 cursor-ew-resize touch-none border-b border-white/10 bg-[#16161b]"
+              style={{width: `${totalWidth}px`}}
+              className="relative h-full shrink-0 cursor-ew-resize touch-none bg-[#16161b]"
             >
               {ticks.map((sec) => (
                 <div
@@ -402,30 +337,106 @@ export const Timeline: React.FC<TimelineProps> = ({
                   style={{left: `${sec * pxPerSec}px`}}
                   className="pointer-events-none absolute top-0 flex h-full flex-col justify-between"
                 >
-                  <span className="pl-1 pt-1 font-mono text-[10px] leading-none text-zinc-500 tabular-nums">
+                  <span className="pl-1 pt-0.5 font-mono text-[10px] leading-none text-zinc-500 tabular-nums">
                     {sec}s
                   </span>
                   <span className="h-1.5 w-px bg-white/20" />
                 </div>
               ))}
+              {/* Playhead cap on ruler */}
+              <div
+                style={{left: `${currentTime * pxPerSec}px`}}
+                className="pointer-events-none absolute top-0 bottom-0 z-10 w-[2px] bg-white"
+              >
+                <div className="absolute top-0 -translate-x-1/2 h-3.5 w-3 rounded-b-sm bg-white" />
+              </div>
             </div>
+          </div>
 
-            {/* Track Rows */}
-            {tracks.map((track) => {
-              const hClass = getTrackHeightClass(track.type);
-              const trackClips = clips
-                .filter((c) => c.trackId === track.id)
-                .sort((a, b) => a.start - b.start);
+          {/* Unified Track Rows */}
+          {tracks.map((track) => {
+            const Icon = getTrackIcon(track.type);
+            const hClass = getTrackHeightClass(track.type);
+            const accentClass = getTrackAccentClass(track.type);
+            const trackClips = clips
+              .filter((c) => c.trackId === track.id)
+              .sort((a, b) => a.start - b.start);
+            const sameTypeCount = tracks.filter(
+              (t) => t.type === track.type
+            ).length;
 
-              return (
+            return (
+              <div
+                key={track.id}
+                ref={(el) => {
+                  if (el) rowRefs.current.set(track.id, el);
+                  else rowRefs.current.delete(track.id);
+                }}
+                className={`flex ${hClass} border-b border-white/5 bg-[#0e0e11]`}
+              >
+                {/* Sticky Left Track Header Cell */}
+                <div className="sticky left-0 z-30 flex w-[112px] shrink-0 items-center justify-between gap-1 border-r border-white/10 bg-[#141418] pl-2 pr-1 text-[11px] font-medium text-zinc-200 sm:w-[136px] sm:pl-2.5 sm:pr-1.5">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className={`h-4 w-1 shrink-0 rounded-full ${accentClass}`} />
+                    <Icon className="h-3 w-3 shrink-0 text-zinc-400" />
+                    <span className="truncate">{track.name}</span>
+                  </div>
+
+                  <div className="flex shrink-0 items-center">
+                    {track.type === 'audio' ? (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onUpdateTrack(track.id, {muted: !track.muted})
+                        }
+                        aria-label="Отключить звук дорожки"
+                        className={`flex h-6 w-6 items-center justify-center rounded hover:bg-white/10 ${
+                          track.muted ? 'text-rose-400' : 'text-zinc-500'
+                        }`}
+                      >
+                        {track.muted ? (
+                          <VolumeX className="h-3.5 w-3.5" />
+                        ) : (
+                          <Volume2 className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          onUpdateTrack(track.id, {hidden: !track.hidden})
+                        }
+                        aria-label="Скрыть слой дорожки"
+                        className={`flex h-6 w-6 items-center justify-center rounded hover:bg-white/10 ${
+                          track.hidden ? 'text-amber-400' : 'text-zinc-500'
+                        }`}
+                      >
+                        {track.hidden ? (
+                          <EyeOff className="h-3.5 w-3.5" />
+                        ) : (
+                          <Eye className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    )}
+
+                    {trackClips.length === 0 && sameTypeCount > 1 && (
+                      <button
+                        type="button"
+                        onClick={() => onDeleteTrack(track.id)}
+                        aria-label="Удалить пустую дорожку"
+                        className="flex h-6 w-6 items-center justify-center rounded text-zinc-500 hover:bg-rose-500/15 hover:text-rose-400"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {/* Track Clip Lane */}
                 <div
-                  key={track.id}
-                  ref={(el) => {
-                    if (el) rowRefs.current.set(track.id, el);
-                    else rowRefs.current.delete(track.id);
-                  }}
+                  style={{width: `${totalWidth}px`}}
                   onClick={() => onSelectClip(null)}
-                  className={`relative ${hClass} border-b border-white/5 bg-[#0e0e11] ${
+                  className={`relative h-full shrink-0 bg-[#0e0e11] ${
                     track.hidden || track.muted ? 'opacity-45' : ''
                   }`}
                 >
@@ -435,7 +446,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                       (u) => u.selectedClipId === clip.id
                     );
                     const leftPx = clip.start * pxPerSec;
-                    const widthPx = Math.max(26, clip.duration * pxPerSec);
+                    const widthPx = Math.max(28, clip.duration * pxPerSec);
 
                     const baseSurface =
                       track.type === 'video'
@@ -466,7 +477,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                         onPointerMove={handleClipPointerMove}
                         onPointerUp={handleClipPointerUp}
                         onPointerCancel={handleClipPointerUp}
-                        className={`group absolute top-1 bottom-1 flex touch-none cursor-grab items-center overflow-hidden rounded-lg ${baseSurface} active:cursor-grabbing`}
+                        className={`group absolute top-1 bottom-1 z-10 flex touch-none cursor-grab items-center overflow-hidden rounded-lg ${baseSurface} active:cursor-grabbing`}
                       >
                         {clip.kind === 'image' && clip.src && (
                           <div
@@ -505,6 +516,22 @@ export const Timeline: React.FC<TimelineProps> = ({
                             {clip.duration.toFixed(1)}с
                           </span>
                         </div>
+
+                        {/* Keyframe Diamond Markers on Clip */}
+                        {clip.keyframes &&
+                          clip.keyframes.map((kf) => (
+                            <span
+                              key={kf.id}
+                              style={{
+                                left: `${Math.max(
+                                  6,
+                                  Math.min(widthPx - 6, kf.timeOffset * pxPerSec)
+                                )}px`,
+                              }}
+                              title={`Ключ ${kf.timeOffset.toFixed(1)}с`}
+                              className="pointer-events-none absolute bottom-1 z-20 h-2 w-2 -translate-x-1/2 rotate-45 border border-zinc-950 bg-amber-300 shadow"
+                            />
+                          ))}
 
                         {remoteOwner && (
                           <span
@@ -545,10 +572,12 @@ export const Timeline: React.FC<TimelineProps> = ({
                     );
                   })}
                 </div>
-              );
-            })}
+              </div>
+            );
+          })}
 
-            {/* Remote Collaborators Live Playheads */}
+          {/* Continuous Playhead Lines Over Track Lanes Only (always slide cleanly under sticky left column z-30) */}
+          <div className="pointer-events-none absolute top-6 bottom-0 left-[112px] right-0 z-20 sm:left-[136px]">
             {collaborators.map((collab) => (
               <div
                 key={collab.id}
@@ -556,7 +585,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                   left: `${collab.playhead * pxPerSec}px`,
                   backgroundColor: collab.color,
                 }}
-                className="pointer-events-none absolute top-0 bottom-0 z-20 w-[2px] opacity-85 transition-transform duration-75"
+                className="absolute top-0 bottom-0 w-[2px] opacity-85 transition-transform duration-75"
               >
                 <div
                   style={{backgroundColor: collab.color}}
@@ -567,13 +596,10 @@ export const Timeline: React.FC<TimelineProps> = ({
               </div>
             ))}
 
-            {/* Local Master Playhead Needle */}
             <div
               style={{left: `${currentTime * pxPerSec}px`}}
-              className="pointer-events-none absolute top-0 bottom-0 z-30 w-[2px] bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]"
-            >
-              <div className="absolute top-0 -translate-x-1/2 h-3.5 w-3 rounded-b-sm bg-white" />
-            </div>
+              className="absolute top-0 bottom-0 w-[2px] bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)]"
+            />
           </div>
         </div>
       </div>

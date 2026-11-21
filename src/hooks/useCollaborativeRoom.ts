@@ -13,6 +13,7 @@ import type {
   ClientWsMessage,
   Clip,
   Collaborator,
+  ProjectFont,
   ProjectState,
   RoomSummary,
   ServerWsMessage,
@@ -73,6 +74,12 @@ export function getRoomIdFromUrl(): string {
   return 'studio-demo';
 }
 
+export function hasExplicitRoomInUrl(): boolean {
+  const params = new URLSearchParams(window.location.search);
+  if (params.get('room')) return true;
+  return /^\/room\/([a-zA-Z0-9_-]+)/.test(window.location.pathname);
+}
+
 interface UndoSnapshot {
   clips: Clip[];
   tracks: Track[];
@@ -92,8 +99,10 @@ export function useCollaborativeRoom() {
     roomId: getRoomIdFromUrl(),
     title: 'Ночной ролик',
     aspectRatio: '9:16',
+    backgroundColor: '#09090b',
     fps: 30,
     isPublicLan: true,
+    customFonts: [],
     tracks: createDefaultTracks(),
     clips: createStarterClips(),
     revision: 0,
@@ -280,6 +289,8 @@ export function useCollaborativeRoom() {
               tracks: msg.tracks || prev.tracks,
               aspectRatio: msg.aspectRatio,
               title: msg.title,
+              backgroundColor: msg.backgroundColor || prev.backgroundColor,
+              customFonts: msg.customFonts || prev.customFonts,
               revision: msg.revision,
             }));
             break;
@@ -474,9 +485,30 @@ export function useCollaborativeRoom() {
   );
 
   const updateProjectMeta = useCallback(
-    (patch: {title?: string; aspectRatio?: AspectRatio; isPublicLan?: boolean}) => {
+    (
+      patch: Partial<
+        Pick<
+          ProjectState,
+          | 'title'
+          | 'aspectRatio'
+          | 'isPublicLan'
+          | 'backgroundColor'
+          | 'hostName'
+          | 'customFonts'
+        >
+      >
+    ) => {
       setProject((prev) => ({...prev, ...patch}));
       sendRaw({type: 'op:project_meta', patch});
+    },
+    [sendRaw]
+  );
+
+  const addCustomFont = useCallback(
+    (font: ProjectFont) => {
+      const nextFonts = [...(projectRef.current.customFonts ?? []), font];
+      setProject((prev) => ({...prev, customFonts: nextFonts}));
+      sendRaw({type: 'op:project_meta', patch: {customFonts: nextFonts}});
     },
     [sendRaw]
   );
@@ -484,7 +516,13 @@ export function useCollaborativeRoom() {
   const replaceClips = useCallback(
     (
       clips: Clip[],
-      meta?: {title?: string; aspectRatio?: AspectRatio; tracks?: Track[]}
+      meta?: {
+        title?: string;
+        aspectRatio?: AspectRatio;
+        backgroundColor?: string;
+        customFonts?: ProjectFont[];
+        tracks?: Track[];
+      }
     ) => {
       pushUndo();
       const tracks = meta?.tracks ?? createDefaultTracks();
@@ -494,6 +532,10 @@ export function useCollaborativeRoom() {
         tracks,
         ...(meta?.title ? {title: meta.title} : {}),
         ...(meta?.aspectRatio ? {aspectRatio: meta.aspectRatio} : {}),
+        ...(meta?.backgroundColor
+          ? {backgroundColor: meta.backgroundColor}
+          : {}),
+        ...(meta?.customFonts ? {customFonts: meta.customFonts} : {}),
       }));
       sendRaw({
         type: 'op:project_replace',
@@ -501,6 +543,8 @@ export function useCollaborativeRoom() {
         tracks,
         title: meta?.title,
         aspectRatio: meta?.aspectRatio,
+        backgroundColor: meta?.backgroundColor,
+        customFonts: meta?.customFonts,
       });
     },
     [pushUndo, sendRaw]
@@ -649,6 +693,7 @@ export function useCollaborativeRoom() {
     deleteClip,
     splitClip,
     updateProjectMeta,
+    addCustomFont,
     replaceClips,
     undo,
     redo,

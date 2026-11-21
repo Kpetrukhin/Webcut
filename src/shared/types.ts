@@ -29,6 +29,31 @@ export type BlendMode =
   | 'overlay'
   | 'lighten';
 
+export type KeyframeEasing =
+  | 'linear'
+  | 'ease-in'
+  | 'ease-out'
+  | 'ease-in-out'
+  | 'bounce';
+
+export interface ClipKeyframe {
+  id: string;
+  timeOffset: number; // seconds relative to clip.start
+  x: number; // normalized 0..1
+  y: number; // normalized 0..1
+  scale: number;
+  rotation: number; // degrees -180..180
+  opacity: number; // 0..1
+  easing: KeyframeEasing;
+}
+
+export interface ProjectFont {
+  id: string;
+  name: string;
+  fontFamily: string;
+  src: string;
+}
+
 export interface Track {
   id: string;
   type: TrackType;
@@ -42,6 +67,11 @@ export interface TextStyle {
   color: string;
   bgColor: string;
   fontWeight: 'normal' | 'bold';
+  fontFamily?: string;
+  fontSrc?: string;
+  shadow?: boolean;
+  outline?: boolean;
+  letterSpacing?: number;
   x: number; // normalized 0..1
   y: number; // normalized 0..1
   align: 'left' | 'center' | 'right';
@@ -65,6 +95,8 @@ export interface Clip {
   brightness: number;
   contrast: number;
   saturate: number;
+  blur?: number;
+  vignette?: number;
   transitionIn: TransitionType;
   transitionOut?: TransitionType;
   motionEffect: MotionEffect;
@@ -75,7 +107,11 @@ export interface Clip {
   mediaY?: number;
   rotation?: number; // degrees -180..180
   borderRadius?: number; // px
+  borderWidth?: number;
+  borderColor?: string;
+  flipHorizontal?: boolean;
   blendMode?: BlendMode;
+  keyframes?: ClipKeyframe[];
   updatedBy?: string;
 }
 
@@ -102,8 +138,11 @@ export interface ProjectState {
   roomId: string;
   title: string;
   aspectRatio: AspectRatio;
+  backgroundColor: string;
+  hostName?: string;
   fps: number;
   isPublicLan: boolean;
+  customFonts?: ProjectFont[];
   tracks: Track[];
   clips: Clip[];
   revision: number;
@@ -115,6 +154,8 @@ export interface RoomSummary {
   roomId: string;
   title: string;
   aspectRatio: AspectRatio;
+  backgroundColor: string;
+  hostName?: string;
   collaboratorsCount: number;
   collaborators: Array<{name: string; color: string}>;
   clipsCount: number;
@@ -154,7 +195,17 @@ export type ClientWsMessage =
     }
   | {
       type: 'op:project_meta';
-      patch: Partial<Pick<ProjectState, 'title' | 'aspectRatio' | 'isPublicLan'>>;
+      patch: Partial<
+        Pick<
+          ProjectState,
+          | 'title'
+          | 'aspectRatio'
+          | 'isPublicLan'
+          | 'backgroundColor'
+          | 'hostName'
+          | 'customFonts'
+        >
+      >;
     }
   | {
       type: 'op:project_replace';
@@ -162,6 +213,8 @@ export type ClientWsMessage =
       tracks?: Track[];
       aspectRatio?: AspectRatio;
       title?: string;
+      backgroundColor?: string;
+      customFonts?: ProjectFont[];
     }
   | {
       type: 'presence:cursor';
@@ -213,7 +266,17 @@ export type ServerWsMessage =
     }
   | {
       type: 'op:project_meta';
-      patch: Partial<Pick<ProjectState, 'title' | 'aspectRatio' | 'isPublicLan'>>;
+      patch: Partial<
+        Pick<
+          ProjectState,
+          | 'title'
+          | 'aspectRatio'
+          | 'isPublicLan'
+          | 'backgroundColor'
+          | 'hostName'
+          | 'customFonts'
+        >
+      >;
       revision: number;
       senderId: string;
     }
@@ -223,6 +286,8 @@ export type ServerWsMessage =
       tracks: Track[];
       aspectRatio: AspectRatio;
       title: string;
+      backgroundColor?: string;
+      customFonts?: ProjectFont[];
       revision: number;
       senderId: string;
     }
@@ -287,7 +352,7 @@ export const SYNTH_AUDIO_PRESETS: Array<{
 export function createDefaultTracks(): Track[] {
   return [
     {id: 'track-video-1', type: 'video', name: 'Видео 1'},
-    {id: 'track-overlay-1', type: 'overlay', name: 'Наложение 1'},
+    {id: 'track-overlay-1', type: 'overlay', name: 'Слой 1'},
     {id: 'track-text-1', type: 'text', name: 'Текст 1'},
     {id: 'track-audio-1', type: 'audio', name: 'Аудио 1'},
   ];
@@ -298,7 +363,7 @@ export function getTrackLabelPrefix(type: TrackType): string {
     case 'video':
       return 'Видео';
     case 'overlay':
-      return 'Наложение';
+      return 'Слой';
     case 'text':
       return 'Текст';
     case 'audio':
@@ -350,9 +415,15 @@ export function resolveTrackPlacement(
 }
 
 export function normalizeProjectTracks(project: ProjectState): ProjectState {
-  let tracks = Array.isArray(project.tracks) && project.tracks.length > 0
-    ? [...project.tracks]
-    : createDefaultTracks();
+  let tracks =
+    Array.isArray(project.tracks) && project.tracks.length > 0
+      ? project.tracks.map((t) => ({
+          ...t,
+          name: t.name.startsWith('Наложение ')
+            ? t.name.replace('Наложение ', 'Слой ')
+            : t.name,
+        }))
+      : createDefaultTracks();
 
   const ensureTrackForType = (type: TrackType): string => {
     const existing = tracks.find((t) => t.type === type);
@@ -374,6 +445,8 @@ export function normalizeProjectTracks(project: ProjectState): ProjectState {
 
   return {
     ...project,
+    backgroundColor: project.backgroundColor || '#09090b',
+    customFonts: Array.isArray(project.customFonts) ? project.customFonts : [],
     isPublicLan: project.isPublicLan ?? true,
     tracks,
     clips,
@@ -497,6 +570,8 @@ export function createStarterClips(): Clip[] {
         color: '#ffffff',
         bgColor: 'rgba(9, 9, 11, 0.72)',
         fontWeight: 'bold',
+        fontFamily: 'Plus Jakarta Sans',
+        shadow: true,
         x: 0.5,
         y: 0.76,
         align: 'center',
@@ -527,6 +602,8 @@ export function createStarterClips(): Clip[] {
         color: '#22d3ee',
         bgColor: 'rgba(9, 9, 11, 0.78)',
         fontWeight: 'bold',
+        fontFamily: 'Plus Jakarta Sans',
+        shadow: true,
         x: 0.5,
         y: 0.2,
         align: 'center',
@@ -584,6 +661,9 @@ export function applyClipSplit(
   const firstHalf: Clip = {
     ...target,
     duration: Math.round(relOffset * 100) / 100,
+    keyframes: target.keyframes
+      ?.filter((k) => k.timeOffset <= relOffset)
+      .map((k) => ({...k})),
   };
 
   const secondHalf: Clip = {
@@ -595,6 +675,13 @@ export function applyClipSplit(
     trimStart:
       Math.round((target.trimStart + relOffset * target.speed) * 100) / 100,
     transitionIn: 'none',
+    keyframes: target.keyframes
+      ?.filter((k) => k.timeOffset >= relOffset)
+      .map((k) => ({
+        ...k,
+        id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+        timeOffset: Math.round((k.timeOffset - relOffset) * 100) / 100,
+      })),
   };
 
   const next = [...clips];

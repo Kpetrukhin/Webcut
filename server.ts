@@ -52,7 +52,14 @@ function sanitizeRoomId(raw: string): string {
 
 function createDefaultProject(
   roomId: string,
-  opts?: {blank?: boolean; title?: string; aspectRatio?: AspectRatio; isPublicLan?: boolean}
+  opts?: {
+    blank?: boolean;
+    title?: string;
+    aspectRatio?: AspectRatio;
+    backgroundColor?: string;
+    hostName?: string;
+    isPublicLan?: boolean;
+  }
 ): ProjectState {
   const defaultTitle =
     roomId === 'studio-demo' ? 'Ночной ролик' : `Проект ${roomId}`;
@@ -60,8 +67,11 @@ function createDefaultProject(
     roomId,
     title: opts?.title?.trim().slice(0, 60) || defaultTitle,
     aspectRatio: opts?.aspectRatio || '9:16',
+    backgroundColor: opts?.backgroundColor || '#09090b',
+    hostName: opts?.hostName?.trim().slice(0, 28) || undefined,
     fps: 30,
     isPublicLan: opts?.isPublicLan ?? true,
+    customFonts: [],
     tracks: createDefaultTracks(),
     clips: opts?.blank ? [] : createStarterClips(),
     revision: 1,
@@ -115,7 +125,14 @@ function scheduleSaveRooms() {
 
 function getOrCreateRoom(
   roomId: string,
-  opts?: {blank?: boolean; title?: string; aspectRatio?: AspectRatio; isPublicLan?: boolean}
+  opts?: {
+    blank?: boolean;
+    title?: string;
+    aspectRatio?: AspectRatio;
+    backgroundColor?: string;
+    hostName?: string;
+    isPublicLan?: boolean;
+  }
 ): ProjectState {
   const safeId = sanitizeRoomId(roomId);
   let project = rooms.get(safeId);
@@ -146,6 +163,8 @@ function getPublicRoomSummaries(): RoomSummary[] {
       roomId: project.roomId,
       title: project.title,
       aspectRatio: project.aspectRatio,
+      backgroundColor: project.backgroundColor || '#09090b',
+      hostName: project.hostName,
       collaboratorsCount: active.length,
       collaborators: active.slice(0, 5).map((u) => ({name: u.name, color: u.color})),
       clipsCount: project.clips.length,
@@ -244,18 +263,28 @@ const storage = multer.diskStorage({
   },
 });
 
+const FONT_EXTS = new Set(['.ttf', '.otf', '.woff', '.woff2']);
+
 const upload = multer({
   storage,
   limits: {fileSize: 150 * 1024 * 1024},
   fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname).toLowerCase();
     if (
       file.mimetype.startsWith('video/') ||
       file.mimetype.startsWith('image/') ||
-      file.mimetype.startsWith('audio/')
+      file.mimetype.startsWith('audio/') ||
+      file.mimetype.startsWith('font/') ||
+      file.mimetype.includes('font') ||
+      FONT_EXTS.has(ext)
     ) {
       cb(null, true);
     } else {
-      cb(new Error('Разрешены только видео, изображения и аудиофайлы'));
+      cb(
+        new Error(
+          'Разрешены только видео, изображения, аудио и шрифты (.ttf/.otf/.woff2)'
+        )
+      );
     }
   },
 });
@@ -305,6 +334,12 @@ app.post('/api/rooms', (req, res) => {
     typeof req.body?.aspectRatio === 'string'
       ? (req.body.aspectRatio as AspectRatio)
       : undefined;
+  const backgroundColor =
+    typeof req.body?.backgroundColor === 'string'
+      ? req.body.backgroundColor
+      : undefined;
+  const hostName =
+    typeof req.body?.hostName === 'string' ? req.body.hostName : undefined;
   const isPublicLan =
     typeof req.body?.isPublicLan === 'boolean' ? req.body.isPublicLan : true;
   const customId = typeof req.body?.roomId === 'string' ? req.body.roomId : '';
@@ -315,6 +350,8 @@ app.post('/api/rooms', (req, res) => {
     blank,
     title,
     aspectRatio,
+    backgroundColor,
+    hostName,
     isPublicLan,
   });
   broadcastLobbyRooms();
@@ -328,6 +365,7 @@ app.get('/api/rooms/:roomId', (req, res) => {
     roomId: project.roomId,
     title: project.title,
     aspectRatio: project.aspectRatio,
+    backgroundColor: project.backgroundColor,
     collaboratorsCount: roomConnections.get(safeId)?.size ?? 0,
   });
 });
@@ -338,11 +376,17 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     res.status(400).json({error: 'Файл не получен'});
     return;
   }
-  const kind = file.mimetype.startsWith('video/')
-    ? 'video'
-    : file.mimetype.startsWith('audio/')
-      ? 'audio'
-      : 'image';
+  const ext = path.extname(file.originalname).toLowerCase();
+  const kind =
+    FONT_EXTS.has(ext) ||
+    file.mimetype.startsWith('font/') ||
+    file.mimetype.includes('font')
+      ? 'font'
+      : file.mimetype.startsWith('video/')
+        ? 'video'
+        : file.mimetype.startsWith('audio/')
+          ? 'audio'
+          : 'image';
 
   let displayName = file.originalname;
   try {
@@ -651,6 +695,15 @@ wss.on('connection', (ws) => {
         if (msg.patch.aspectRatio) {
           project.aspectRatio = msg.patch.aspectRatio;
         }
+        if (typeof msg.patch.backgroundColor === 'string') {
+          project.backgroundColor = msg.patch.backgroundColor.slice(0, 32);
+        }
+        if (typeof msg.patch.hostName === 'string') {
+          project.hostName = msg.patch.hostName.slice(0, 28);
+        }
+        if (Array.isArray(msg.patch.customFonts)) {
+          project.customFonts = msg.patch.customFonts;
+        }
         if (typeof msg.patch.isPublicLan === 'boolean') {
           project.isPublicLan = msg.patch.isPublicLan;
         }
@@ -676,6 +729,12 @@ wss.on('connection', (ws) => {
         if (msg.tracks) project.tracks = msg.tracks;
         if (msg.aspectRatio) project.aspectRatio = msg.aspectRatio;
         if (typeof msg.title === 'string') project.title = msg.title.slice(0, 60);
+        if (typeof msg.backgroundColor === 'string') {
+          project.backgroundColor = msg.backgroundColor.slice(0, 32);
+        }
+        if (Array.isArray(msg.customFonts)) {
+          project.customFonts = msg.customFonts;
+        }
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -687,6 +746,8 @@ wss.on('connection', (ws) => {
             tracks: project.tracks,
             aspectRatio: project.aspectRatio,
             title: project.title,
+            backgroundColor: project.backgroundColor,
+            customFonts: project.customFonts,
             revision: project.revision,
             senderId: session.user.id,
           },

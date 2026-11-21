@@ -1,19 +1,36 @@
 import React, {useEffect, useState} from 'react';
 import {
+  AlignCenter,
+  AlignLeft,
+  AlignRight,
   Check,
   Copy,
+  Diamond,
   Film,
+  FlipHorizontal,
   Layers,
   Music,
   Plus,
   Send,
   Sparkles,
+  Trash2,
   Type,
   Upload,
   Users,
   Wifi,
   X,
 } from 'lucide-react';
+import {
+  BUILTIN_FONTS,
+  loadCustomFont,
+  sanitizeFontFamilyName,
+} from '../lib/fontLoader.ts';
+import {
+  EASING_OPTIONS,
+  evaluateClipTransform,
+  generateKeyframePreset,
+  upsertKeyframeAtTime,
+} from '../lib/keyframeEngine.ts';
 import {
   getApiUrl,
   getSavedServerUrl,
@@ -27,9 +44,12 @@ import type {
   BlendMode,
   ChatMessage,
   Clip,
+  ClipKeyframe,
   Collaborator,
   FilterPreset,
+  KeyframeEasing,
   MotionEffect,
+  ProjectFont,
   RoomSummary,
   TransitionType,
 } from '../shared/types.ts';
@@ -45,8 +65,12 @@ export type ActiveToolTab =
 
 async function uploadOrLocalMedia(
   file: File,
-  fallbackKind: 'video' | 'image' | 'audio'
-): Promise<{name: string; kind: 'video' | 'image' | 'audio'; src: string}> {
+  fallbackKind: 'video' | 'image' | 'audio' | 'font'
+): Promise<{
+  name: string;
+  kind: 'video' | 'image' | 'audio' | 'font';
+  src: string;
+}> {
   const uploadEndpoint = getApiUrl('/api/upload');
   if (uploadEndpoint) {
     try {
@@ -55,7 +79,7 @@ async function uploadOrLocalMedia(
       const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
       const data = (await res.json()) as {
         name?: string;
-        kind?: 'video' | 'image' | 'audio';
+        kind?: 'video' | 'image' | 'audio' | 'font';
         src?: string;
       };
       if (res.ok && data.src) {
@@ -66,7 +90,7 @@ async function uploadOrLocalMedia(
         };
       }
     } catch {
-      // Fall back to local object URL
+      // Fall back to local URL
     }
   }
   return {
@@ -92,6 +116,246 @@ function probeMediaDuration(
     el.src = url;
   });
 }
+
+/* =========================================================================
+   KEYFRAME & CURVE EDITOR (for Overlays & Text)
+   ========================================================================= */
+
+interface KeyframeControlsProps {
+  clip: Clip;
+  currentTime: number;
+  onSeek: (time: number) => void;
+  onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+}
+
+export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
+  clip,
+  currentTime,
+  onSeek,
+  onUpdateClip,
+}) => {
+  const keyframes = [...(clip.keyframes ?? [])].sort(
+    (a, b) => a.timeOffset - b.timeOffset
+  );
+  const localTime = Math.max(
+    0,
+    Math.min(clip.duration, currentTime - clip.start)
+  );
+  const activeKf = keyframes.find(
+    (k) => Math.abs(k.timeOffset - localTime) <= 0.12
+  );
+  const currentEval = evaluateClipTransform(clip, currentTime);
+
+  const handleToggleOrAddKeyframe = () => {
+    if (activeKf) {
+      const remaining = keyframes.filter((k) => k.id !== activeKf.id);
+      onUpdateClip(clip.id, {keyframes: remaining});
+      return;
+    }
+    const {keyframes: next} = upsertKeyframeAtTime(clip, currentTime);
+    onUpdateClip(clip.id, {keyframes: next});
+  };
+
+  const handleEasingChange = (easing: KeyframeEasing) => {
+    if (activeKf) {
+      const next = keyframes.map((k) =>
+        k.id === activeKf.id ? {...k, easing} : k
+      );
+      onUpdateClip(clip.id, {keyframes: next});
+      return;
+    }
+    const {keyframes: next} = upsertKeyframeAtTime(clip, currentTime, {easing});
+    onUpdateClip(clip.id, {keyframes: next});
+  };
+
+  const handleUpdateActiveKfField = (patch: Partial<ClipKeyframe>) => {
+    const {keyframes: next} = upsertKeyframeAtTime(clip, currentTime, patch);
+    onUpdateClip(clip.id, {keyframes: next});
+  };
+
+  return (
+    <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1.5">
+          <Diamond className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
+          <span className="text-xs font-semibold text-amber-200">
+            Ключи движения ({keyframes.length})
+          </span>
+        </div>
+        <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
+          {localTime.toFixed(1)}с / {clip.duration.toFixed(1)}с
+        </span>
+      </div>
+
+      {/* Add / Remove Keyframe + Clear */}
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={handleToggleOrAddKeyframe}
+          className={`flex h-9 flex-1 items-center justify-center gap-1.5 rounded-lg text-xs font-semibold transition ${
+            activeKf
+              ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
+              : 'bg-amber-400 text-zinc-950 hover:bg-amber-300'
+          }`}
+        >
+          <Diamond className="h-3.5 w-3.5" />
+          {activeKf ? 'Удалить ключ здесь' : '+ Ключ в этой точке'}
+        </button>
+        {keyframes.length > 0 && (
+          <button
+            type="button"
+            onClick={() => onUpdateClip(clip.id, {keyframes: []})}
+            aria-label="Очистить все ключи"
+            className="flex h-9 w-9 items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-zinc-400 hover:text-rose-400"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+
+      {/* Keyframe Timeline Chips */}
+      {keyframes.length > 0 && (
+        <div className="flex flex-wrap gap-1.5">
+          {keyframes.map((kf, idx) => {
+            const isAtPlayhead = activeKf?.id === kf.id;
+            return (
+              <button
+                key={kf.id}
+                type="button"
+                onClick={() => onSeek(clip.start + kf.timeOffset)}
+                className={`flex items-center gap-1 rounded-lg border px-2 py-1 font-mono text-[11px] transition ${
+                  isAtPlayhead
+                    ? 'border-amber-400 bg-amber-400/20 text-amber-200'
+                    : 'border-white/10 bg-zinc-900 text-zinc-300 hover:border-white/25'
+                }`}
+              >
+                <span className="h-1.5 w-1.5 rotate-45 bg-amber-300" />
+                #{idx + 1} · {kf.timeOffset.toFixed(1)}с
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Easing Curve Selector */}
+      <div>
+        <p className="mb-1.5 text-[11px] font-medium text-zinc-300">
+          Кривая скорости {activeKf ? '(для выбранного ключа)' : '(при добавлении)'}
+        </p>
+        <div className="grid grid-cols-5 gap-1">
+          {EASING_OPTIONS.map((opt) => {
+            const selected = (activeKf?.easing ?? 'ease-in-out') === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => handleEasingChange(opt.id)}
+                className={`flex flex-col items-center justify-center gap-1 rounded-lg border py-1.5 px-1 text-[10px] transition ${
+                  selected
+                    ? 'border-amber-400 bg-amber-400/20 text-amber-200'
+                    : 'border-white/10 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                <svg viewBox="0 0 20 20" className="h-4 w-4">
+                  <path
+                    d={opt.path}
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                  />
+                </svg>
+                <span className="truncate max-w-full">{opt.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Live Keyframed Values at Playhead */}
+      {keyframes.length > 0 && (
+        <div className="grid grid-cols-2 gap-2 border-t border-white/10 pt-2 text-[11px] text-zinc-300">
+          <label className="space-y-1">
+            <div className="flex justify-between">
+              <span>Масштаб (ключ)</span>
+              <span className="font-mono">
+                {Math.round(currentEval.scale * 100)}%
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0.15}
+              max={1.4}
+              step={0.05}
+              value={currentEval.scale}
+              onChange={(e) =>
+                handleUpdateActiveKfField({scale: Number(e.target.value)})
+              }
+              className="w-full accent-amber-400"
+            />
+          </label>
+          <label className="space-y-1">
+            <div className="flex justify-between">
+              <span>Поворот (ключ)</span>
+              <span className="font-mono">
+                {Math.round(currentEval.rotation)}°
+              </span>
+            </div>
+            <input
+              type="range"
+              min={-180}
+              max={180}
+              step={2}
+              value={currentEval.rotation}
+              onChange={(e) =>
+                handleUpdateActiveKfField({rotation: Number(e.target.value)})
+              }
+              className="w-full accent-amber-400"
+            />
+          </label>
+        </div>
+      )}
+
+      {/* Quick Motion Presets */}
+      <div>
+        <p className="mb-1.5 text-[11px] font-medium text-zinc-400">
+          Готовая анимация по ключам:
+        </p>
+        <div className="grid grid-cols-2 gap-1.5">
+          {(
+            [
+              {id: 'slide-in', label: 'Вылет слева'},
+              {id: 'spin-zoom', label: 'Зум + поворот'},
+              {id: 'float', label: 'Плавное парение'},
+              {id: 'bounce-in', label: 'Прыжок (Пружина)'},
+            ] as const
+          ).map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              onClick={() =>
+                onUpdateClip(clip.id, {
+                  keyframes: generateKeyframePreset(clip, preset.id),
+                })
+              }
+              className="rounded-lg border border-white/10 bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-zinc-200 hover:border-amber-400/50"
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <p className="text-[10px] text-zinc-400">
+        Подсказка: переместите линию времени и перетащите объект пальцем по экрану — ключ сохранит новую позицию.
+      </p>
+    </div>
+  );
+};
+
+/* =========================================================================
+   MEDIA PANEL
+   ========================================================================= */
 
 interface MediaPanelProps {
   defaultTrack?: 'video' | 'overlay';
@@ -266,8 +530,14 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
   );
 };
 
+/* =========================================================================
+   OVERLAY PANEL (PIP + Keyframes + Border + Flip + Blend)
+   ========================================================================= */
+
 interface OverlayPanelProps {
   selectedClip: Clip | null;
+  currentTime: number;
+  onSeek: (time: number) => void;
   onAddMediaClip: MediaPanelProps['onAddMediaClip'];
   onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
   onClose?: () => void;
@@ -283,6 +553,8 @@ const BLEND_MODES: Array<{id: BlendMode; label: string}> = [
 
 export const OverlayPanel: React.FC<OverlayPanelProps> = ({
   selectedClip,
+  currentTime,
+  onSeek,
   onAddMediaClip,
   onUpdateClip,
   onClose,
@@ -292,105 +564,191 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
   return (
     <div className="space-y-4">
       {isOverlay && (
-        <div className="space-y-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3">
-          <p className="text-xs font-semibold text-indigo-200">
-            Настройка наложения: {selectedClip.name}
-          </p>
-
-          <label className="block space-y-1 text-xs text-zinc-300">
-            <div className="flex justify-between">
-              <span>Размер (PIP)</span>
-              <span className="font-mono tabular-nums">
-                {Math.round((selectedClip.mediaScale ?? 0.42) * 100)}%
-              </span>
+        <>
+          <div className="space-y-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3">
+            <div className="flex items-center justify-between">
+              <p className="truncate text-xs font-semibold text-indigo-200">
+                Наложение: {selectedClip.name}
+              </p>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateClip(selectedClip.id, {
+                    flipHorizontal: !selectedClip.flipHorizontal,
+                  })
+                }
+                className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium ${
+                  selectedClip.flipHorizontal
+                    ? 'border-indigo-400 bg-indigo-500 text-white'
+                    : 'border-white/10 bg-zinc-900 text-zinc-300'
+                }`}
+              >
+                <FlipHorizontal className="h-3.5 w-3.5" />
+                Зеркало
+              </button>
             </div>
-            <input
-              type="range"
-              min={0.15}
-              max={0.95}
-              step={0.05}
-              value={selectedClip.mediaScale ?? 0.42}
-              onChange={(e) =>
-                onUpdateClip(selectedClip.id, {
-                  mediaScale: Number(e.target.value),
-                })
-              }
-              className="w-full accent-indigo-400"
-            />
-          </label>
 
-          <div className="grid grid-cols-2 gap-3">
+            {/* Quick PIP Corner Positions */}
+            <div>
+              <p className="mb-1 text-[11px] text-zinc-400">Позиция PIP</p>
+              <div className="grid grid-cols-5 gap-1">
+                {[
+                  {label: '↖', x: 0.25, y: 0.22},
+                  {label: '↗', x: 0.75, y: 0.22},
+                  {label: '●', x: 0.5, y: 0.5},
+                  {label: '↙', x: 0.25, y: 0.78},
+                  {label: '↘', x: 0.75, y: 0.78},
+                ].map((pos) => (
+                  <button
+                    key={pos.label}
+                    type="button"
+                    onClick={() =>
+                      onUpdateClip(selectedClip.id, {
+                        mediaX: pos.x,
+                        mediaY: pos.y,
+                      })
+                    }
+                    className="h-8 rounded-lg border border-white/10 bg-zinc-900 text-xs font-bold text-zinc-200 hover:border-indigo-400"
+                  >
+                    {pos.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <label className="block space-y-1 text-xs text-zinc-300">
               <div className="flex justify-between">
-                <span>Поворот</span>
+                <span>Размер (PIP)</span>
                 <span className="font-mono tabular-nums">
-                  {selectedClip.rotation ?? 0}°
+                  {Math.round((selectedClip.mediaScale ?? 0.42) * 100)}%
                 </span>
               </div>
               <input
                 type="range"
-                min={-180}
-                max={180}
-                step={2}
-                value={selectedClip.rotation ?? 0}
+                min={0.15}
+                max={0.95}
+                step={0.05}
+                value={selectedClip.mediaScale ?? 0.42}
                 onChange={(e) =>
                   onUpdateClip(selectedClip.id, {
-                    rotation: Number(e.target.value),
+                    mediaScale: Number(e.target.value),
                   })
                 }
                 className="w-full accent-indigo-400"
               />
             </label>
 
-            <label className="block space-y-1 text-xs text-zinc-300">
-              <div className="flex justify-between">
-                <span>Скругление</span>
-                <span className="font-mono tabular-nums">
-                  {selectedClip.borderRadius ?? 20}px
-                </span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={80}
-                step={4}
-                value={selectedClip.borderRadius ?? 20}
-                onChange={(e) =>
-                  onUpdateClip(selectedClip.id, {
-                    borderRadius: Number(e.target.value),
-                  })
-                }
-                className="w-full accent-indigo-400"
-              />
-            </label>
-          </div>
-
-          <div>
-            <p className="mb-1.5 text-xs text-zinc-300">Режим смешивания</p>
-            <div className="flex flex-wrap gap-1.5">
-              {BLEND_MODES.map((bm) => (
-                <button
-                  key={bm.id}
-                  type="button"
-                  onClick={() =>
-                    onUpdateClip(selectedClip.id, {blendMode: bm.id})
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block space-y-1 text-xs text-zinc-300">
+                <div className="flex justify-between">
+                  <span>Поворот</span>
+                  <span className="font-mono tabular-nums">
+                    {selectedClip.rotation ?? 0}°
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={-180}
+                  max={180}
+                  step={2}
+                  value={selectedClip.rotation ?? 0}
+                  onChange={(e) =>
+                    onUpdateClip(selectedClip.id, {
+                      rotation: Number(e.target.value),
+                    })
                   }
-                  className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium ${
-                    (selectedClip.blendMode ?? 'source-over') === bm.id
-                      ? 'bg-indigo-500 text-white'
-                      : 'bg-zinc-900 text-zinc-300 border border-white/10'
-                  }`}
-                >
-                  {bm.label}
-                </button>
-              ))}
+                  className="w-full accent-indigo-400"
+                />
+              </label>
+
+              <label className="block space-y-1 text-xs text-zinc-300">
+                <div className="flex justify-between">
+                  <span>Скругление</span>
+                  <span className="font-mono tabular-nums">
+                    {selectedClip.borderRadius ?? 20}px
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={120}
+                  step={4}
+                  value={selectedClip.borderRadius ?? 20}
+                  onChange={(e) =>
+                    onUpdateClip(selectedClip.id, {
+                      borderRadius: Number(e.target.value),
+                    })
+                  }
+                  className="w-full accent-indigo-400"
+                />
+              </label>
+
+              <label className="block space-y-1 text-xs text-zinc-300">
+                <div className="flex justify-between">
+                  <span>Рамка</span>
+                  <span className="font-mono tabular-nums">
+                    {selectedClip.borderWidth ?? 0}px
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={14}
+                  step={1}
+                  value={selectedClip.borderWidth ?? 0}
+                  onChange={(e) =>
+                    onUpdateClip(selectedClip.id, {
+                      borderWidth: Number(e.target.value),
+                    })
+                  }
+                  className="w-full accent-indigo-400"
+                />
+              </label>
+
+              <div className="flex items-end justify-between gap-2 pb-0.5">
+                <span className="text-xs text-zinc-300">Цвет рамки</span>
+                <input
+                  type="color"
+                  value={selectedClip.borderColor || '#ffffff'}
+                  onChange={(e) =>
+                    onUpdateClip(selectedClip.id, {borderColor: e.target.value})
+                  }
+                  className="h-7 w-10 cursor-pointer rounded border border-white/20 bg-transparent"
+                />
+              </div>
+            </div>
+
+            <div>
+              <p className="mb-1.5 text-xs text-zinc-300">Режим смешивания</p>
+              <div className="flex flex-wrap gap-1.5">
+                {BLEND_MODES.map((bm) => (
+                  <button
+                    key={bm.id}
+                    type="button"
+                    onClick={() =>
+                      onUpdateClip(selectedClip.id, {blendMode: bm.id})
+                    }
+                    className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium ${
+                      (selectedClip.blendMode ?? 'source-over') === bm.id
+                        ? 'bg-indigo-500 text-white'
+                        : 'bg-zinc-900 text-zinc-300 border border-white/10'
+                    }`}
+                  >
+                    {bm.label}
+                  </button>
+                ))}
+              </div>
             </div>
           </div>
 
-          <p className="text-[11px] text-zinc-400">
-            Перетаскивайте наложение пальцем прямо по экрану предпросмотра.
-          </p>
-        </div>
+          {/* Keyframe & Curve Editor */}
+          <KeyframeControls
+            clip={selectedClip}
+            currentTime={currentTime}
+            onSeek={onSeek}
+            onUpdateClip={onUpdateClip}
+          />
+        </>
       )}
 
       <MediaPanel
@@ -402,10 +760,18 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
   );
 };
 
+/* =========================================================================
+   TEXT PANEL (Custom Fonts Upload + Styling + Keyframes)
+   ========================================================================= */
+
 interface TextPanelProps {
   selectedClip: Clip | null;
+  customFonts: ProjectFont[];
+  currentTime: number;
+  onSeek: (time: number) => void;
   onAddText: (text: string, forceNewTrack: boolean) => void;
   onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+  onAddCustomFont: (font: ProjectFont) => void;
 }
 
 const TEXT_COLORS = [
@@ -427,11 +793,17 @@ const TEXT_BG_COLORS = [
 
 export const TextPanel: React.FC<TextPanelProps> = ({
   selectedClip,
+  customFonts,
+  currentTime,
+  onSeek,
   onAddText,
   onUpdateClip,
+  onAddCustomFont,
 }) => {
   const [draftText, setDraftText] = useState('НОВЫЙ ТИТР');
   const [forceNewTrack, setForceNewTrack] = useState(true);
+  const [uploadingFont, setUploadingFont] = useState(false);
+  const [fontError, setFontError] = useState<string | null>(null);
   const isTextSelected = selectedClip?.track === 'text';
 
   const style = selectedClip?.textStyle ?? {
@@ -439,9 +811,43 @@ export const TextPanel: React.FC<TextPanelProps> = ({
     color: '#ffffff',
     bgColor: 'rgba(9, 9, 11, 0.72)',
     fontWeight: 'bold' as const,
+    fontFamily: 'Plus Jakarta Sans',
+    shadow: true,
+    outline: false,
     x: 0.5,
     y: 0.78,
     align: 'center' as const,
+  };
+
+  const handleFontUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingFont(true);
+    setFontError(null);
+    try {
+      const uploaded = await uploadOrLocalMedia(file, 'font');
+      const family = sanitizeFontFamilyName(uploaded.name);
+      await loadCustomFont(family, uploaded.src);
+      const newFont: ProjectFont = {
+        id: `font-${Math.random().toString(36).slice(2, 8)}`,
+        name: family,
+        fontFamily: family,
+        src: uploaded.src,
+      };
+      onAddCustomFont(newFont);
+      if (isTextSelected) {
+        onUpdateClip(selectedClip.id, {
+          textStyle: {...style, fontFamily: family, fontSrc: uploaded.src},
+        });
+      }
+    } catch (err) {
+      setFontError(
+        err instanceof Error ? err.message : 'Не удалось загрузить шрифт'
+      );
+    } finally {
+      setUploadingFont(false);
+      e.target.value = '';
+    }
   };
 
   return (
@@ -480,8 +886,158 @@ export const TextPanel: React.FC<TextPanelProps> = ({
         />
       </label>
 
+      {/* Custom Font Upload Button */}
+      <div className="space-y-2 rounded-xl border border-white/10 bg-zinc-900/50 p-3">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium text-zinc-300">
+            Шрифты и загрузка своего
+          </span>
+          <label className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/15 px-2.5 py-1.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/25">
+            <Upload className="h-3.5 w-3.5" />
+            <span>
+              {uploadingFont ? 'Загрузка...' : 'Загрузить (.ttf / .otf)'}
+            </span>
+            <input
+              type="file"
+              accept=".ttf,.otf,.woff,.woff2,font/*"
+              disabled={uploadingFont}
+              onChange={handleFontUpload}
+              className="hidden"
+            />
+          </label>
+        </div>
+
+        {fontError && <p className="text-[11px] text-rose-400">{fontError}</p>}
+
+        {isTextSelected && (
+          <div className="flex flex-wrap gap-1.5 pt-1">
+            {BUILTIN_FONTS.map((f) => {
+              const active =
+                (style.fontFamily || 'Plus Jakarta Sans') === f.family;
+              return (
+                <button
+                  key={f.family}
+                  type="button"
+                  onClick={() =>
+                    onUpdateClip(selectedClip.id, {
+                      textStyle: {
+                        ...style,
+                        fontFamily: f.family,
+                        fontSrc: undefined,
+                      },
+                    })
+                  }
+                  style={{fontFamily: f.css}}
+                  className={`rounded-lg border px-2.5 py-1.5 text-xs transition ${
+                    active
+                      ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                      : 'border-white/10 bg-zinc-900 text-zinc-300 hover:border-white/25'
+                  }`}
+                >
+                  {f.name}
+                </button>
+              );
+            })}
+            {customFonts.map((cf) => {
+              const active = style.fontFamily === cf.fontFamily;
+              return (
+                <button
+                  key={cf.id}
+                  type="button"
+                  onClick={() =>
+                    onUpdateClip(selectedClip.id, {
+                      textStyle: {
+                        ...style,
+                        fontFamily: cf.fontFamily,
+                        fontSrc: cf.src,
+                      },
+                    })
+                  }
+                  style={{fontFamily: `"${cf.fontFamily}", sans-serif`}}
+                  className={`rounded-lg border px-2.5 py-1.5 text-xs transition ${
+                    active
+                      ? 'border-amber-400 bg-amber-500/20 text-amber-200'
+                      : 'border-amber-500/30 bg-zinc-900 text-amber-200/90'
+                  }`}
+                >
+                  ★ {cf.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
       {isTextSelected ? (
         <div className="space-y-3 border-t border-white/10 pt-3">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex gap-1">
+              {(
+                [
+                  {id: 'left', icon: AlignLeft},
+                  {id: 'center', icon: AlignCenter},
+                  {id: 'right', icon: AlignRight},
+                ] as const
+              ).map((al) => {
+                const Icon = al.icon;
+                return (
+                  <button
+                    key={al.id}
+                    type="button"
+                    onClick={() =>
+                      onUpdateClip(selectedClip.id, {
+                        textStyle: {...style, align: al.id},
+                      })
+                    }
+                    className={`flex h-9 w-9 items-center justify-center rounded-lg border ${
+                      style.align === al.id
+                        ? 'border-cyan-400 bg-cyan-500/20 text-cyan-300'
+                        : 'border-white/10 bg-zinc-900 text-zinc-400'
+                    }`}
+                  >
+                    <Icon className="h-4 w-4" />
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex gap-1.5">
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateClip(selectedClip.id, {
+                    textStyle: {
+                      ...style,
+                      fontWeight: style.fontWeight === 'bold' ? 'normal' : 'bold',
+                    },
+                  })
+                }
+                className={`h-9 rounded-lg border px-2.5 text-xs font-bold ${
+                  style.fontWeight === 'bold'
+                    ? 'border-cyan-400 bg-cyan-500/20 text-cyan-300'
+                    : 'border-white/10 bg-zinc-900 text-zinc-400'
+                }`}
+              >
+                B
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  onUpdateClip(selectedClip.id, {
+                    textStyle: {...style, outline: !style.outline},
+                  })
+                }
+                className={`h-9 rounded-lg border px-2.5 text-xs font-semibold ${
+                  style.outline
+                    ? 'border-cyan-400 bg-cyan-500/20 text-cyan-300'
+                    : 'border-white/10 bg-zinc-900 text-zinc-400'
+                }`}
+              >
+                Обводка
+              </button>
+            </div>
+          </div>
+
           <div>
             <div className="mb-1.5 flex justify-between text-xs text-zinc-400">
               <span>Размер шрифта</span>
@@ -553,9 +1109,13 @@ export const TextPanel: React.FC<TextPanelProps> = ({
               ))}
             </div>
           </div>
-          <p className="text-[11px] text-zinc-500">
-            Перетаскивайте текст пальцем или мышью прямо на экране предпросмотра.
-          </p>
+
+          <KeyframeControls
+            clip={selectedClip}
+            currentTime={currentTime}
+            onSeek={onSeek}
+            onUpdateClip={onUpdateClip}
+          />
         </div>
       ) : (
         <p className="text-xs text-zinc-400">
@@ -565,6 +1125,10 @@ export const TextPanel: React.FC<TextPanelProps> = ({
     </div>
   );
 };
+
+/* =========================================================================
+   EFFECTS PANEL
+   ========================================================================= */
 
 interface EffectsPanelProps {
   selectedClip: Clip | null;
@@ -778,10 +1342,54 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             className="w-full accent-cyan-400"
           />
         </label>
+
+        <label className="space-y-1 text-xs text-zinc-400">
+          <div className="flex justify-between">
+            <span>Размытие</span>
+            <span className="font-mono tabular-nums text-zinc-200">
+              {selectedClip.blur ?? 0}px
+            </span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={16}
+            step={1}
+            value={selectedClip.blur ?? 0}
+            onChange={(e) =>
+              onUpdateClip(selectedClip.id, {blur: Number(e.target.value)})
+            }
+            className="w-full accent-cyan-400"
+          />
+        </label>
+
+        <label className="space-y-1 text-xs text-zinc-400">
+          <div className="flex justify-between">
+            <span>Виньетка</span>
+            <span className="font-mono tabular-nums text-zinc-200">
+              {Math.round((selectedClip.vignette ?? 0) * 100)}%
+            </span>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={0.85}
+            step={0.05}
+            value={selectedClip.vignette ?? 0}
+            onChange={(e) =>
+              onUpdateClip(selectedClip.id, {vignette: Number(e.target.value)})
+            }
+            className="w-full accent-cyan-400"
+          />
+        </label>
       </div>
     </div>
   );
 };
+
+/* =========================================================================
+   AUDIO PANEL
+   ========================================================================= */
 
 interface AudioPanelProps {
   selectedClip: Clip | null;
@@ -909,6 +1517,10 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
   );
 };
 
+/* =========================================================================
+   TEAM & CHAT PANEL
+   ========================================================================= */
+
 interface TeamPanelProps {
   roomId: string;
   serverUrl: string;
@@ -990,27 +1602,73 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
 
   return (
     <div className="space-y-4">
-      {/* Minecraft-style LAN Room Browser Button */}
       <button
         type="button"
         onClick={onOpenLobby}
-        className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-cyan-500/40 bg-cyan-500/15 px-3.5 py-2.5 text-left hover:bg-cyan-500/20 active:scale-[0.99]"
+        className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-3.5 py-2.5 text-left hover:bg-emerald-500/20 active:scale-[0.99]"
       >
         <div className="flex items-center gap-2.5">
-          <Wifi className="h-4 w-4 text-cyan-400" />
+          <Wifi className="h-4 w-4 text-emerald-400" />
           <div>
             <p className="text-xs font-semibold text-white">
               Список комнат в сети ({availableRooms.length})
             </p>
-            <p className="text-[11px] text-cyan-200/80">
+            <p className="text-[11px] text-emerald-200/80">
               Войти, создать или найти сервер в Wi-Fi
             </p>
           </div>
         </div>
-        <span className="rounded-lg bg-cyan-500 px-2.5 py-1 text-[11px] font-semibold text-zinc-950">
+        <span className="rounded-lg bg-emerald-500 px-2.5 py-1 text-[11px] font-bold text-zinc-950">
           Открыть
         </span>
       </button>
+
+      {/* Live Studio Chat (Right at top for easy access in team rooms!) */}
+      <div className="space-y-2 rounded-xl border border-white/10 bg-zinc-900/70 p-3">
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-semibold text-white">Чат команды</p>
+          <span className="text-[11px] font-medium text-emerald-400">
+            • {allCollaborators.length} в комнате
+          </span>
+        </div>
+        <div className="studio-scrollbar max-h-40 space-y-1.5 overflow-y-auto rounded-lg border border-white/5 bg-zinc-950/90 p-2.5">
+          {chat.map((m) => (
+            <div key={m.id} className="text-xs leading-relaxed">
+              <span
+                style={{color: m.userColor}}
+                className="mr-1.5 font-semibold"
+              >
+                {m.userName}:
+              </span>
+              <span className="text-zinc-200">{m.text}</span>
+            </div>
+          ))}
+        </div>
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!chatInput.trim()) return;
+            onSendChat(chatInput);
+            setChatInput('');
+          }}
+          className="flex gap-2"
+        >
+          <input
+            type="text"
+            value={chatInput}
+            onChange={(e) => setChatInput(e.target.value)}
+            placeholder="Написать команде..."
+            className="h-10 flex-1 rounded-lg border border-white/10 bg-zinc-950 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+          />
+          <button
+            type="submit"
+            aria-label="Отправить сообщение"
+            className="flex h-10 w-10 items-center justify-center rounded-lg bg-cyan-500 text-zinc-950 hover:bg-cyan-400"
+          >
+            <Send className="h-4 w-4" />
+          </button>
+        </form>
+      </div>
 
       {isNative && (
         <form
@@ -1094,7 +1752,6 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
           </div>
         )}
 
-        {/* Quick 1-tap switch between open rooms */}
         {availableRooms.length > 1 && (
           <div className="space-y-1 pt-1">
             <p className="text-[11px] text-zinc-400">Быстрый вход в комнату:</p>
@@ -1107,7 +1764,7 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
                   className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium border ${
                     r.roomId === roomId
                       ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300'
-                      : 'border-white/10 bg-zinc-950 text-zinc-300 hover:border-white/25'
+                      : 'border-emerald-500/50 bg-emerald-950/30 text-emerald-200'
                   }`}
                 >
                   {r.title} ({r.collaboratorsCount})
@@ -1174,48 +1831,6 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
           ))}
         </div>
       </div>
-
-      {/* Live Studio Chat */}
-      <div className="space-y-2 border-t border-white/10 pt-3">
-        <p className="text-xs font-medium text-zinc-400">Чат монтажёров</p>
-        <div className="studio-scrollbar max-h-36 space-y-1.5 overflow-y-auto rounded-xl border border-white/5 bg-zinc-950/80 p-2.5">
-          {chat.map((m) => (
-            <div key={m.id} className="text-xs leading-relaxed">
-              <span
-                style={{color: m.userColor}}
-                className="mr-1.5 font-semibold"
-              >
-                {m.userName}:
-              </span>
-              <span className="text-zinc-200">{m.text}</span>
-            </div>
-          ))}
-        </div>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (!chatInput.trim()) return;
-            onSendChat(chatInput);
-            setChatInput('');
-          }}
-          className="flex gap-2"
-        >
-          <input
-            type="text"
-            value={chatInput}
-            onChange={(e) => setChatInput(e.target.value)}
-            placeholder="Написать команде..."
-            className="h-10 flex-1 rounded-lg border border-white/10 bg-zinc-900 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
-          />
-          <button
-            type="submit"
-            aria-label="Отправить сообщение"
-            className="flex h-10 w-10 items-center justify-center rounded-lg bg-cyan-500 text-zinc-950 hover:bg-cyan-400"
-          >
-            <Send className="h-4 w-4" />
-          </button>
-        </form>
-      </div>
     </div>
   );
 };
@@ -1233,7 +1848,7 @@ export const BottomSheet: React.FC<BottomSheetProps> = ({
 }) => {
   return (
     <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-xs lg:hidden">
-      <div className="max-h-[80dvh] w-full overflow-y-auto rounded-t-3xl border-t border-white/15 bg-[#141418] px-4 pt-2 pb-6 shadow-2xl">
+      <div className="max-h-[82dvh] w-full overflow-y-auto rounded-t-3xl border-t border-white/15 bg-[#141418] px-4 pt-2 pb-6 shadow-2xl">
         <div className="mx-auto mb-3 h-1.5 w-10 rounded-full bg-zinc-700" />
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold text-white">{title}</h2>
@@ -1263,5 +1878,5 @@ export const TOOL_TABS: Array<{
   {id: 'text', label: 'Текст', icon: Type},
   {id: 'effects', label: 'Эффекты', icon: Sparkles},
   {id: 'audio', label: 'Аудио', icon: Music},
-  {id: 'team', label: 'Сеть', icon: Users},
+  {id: 'team', label: 'Чат/Сеть', icon: Users},
 ];

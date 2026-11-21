@@ -1,7 +1,7 @@
 import React, {useEffect, useState} from 'react';
 import {
   Check,
-  Globe,
+  Crown,
   Plus,
   Radio,
   RefreshCw,
@@ -17,6 +17,7 @@ import {
   scanLocalLanServers,
 } from '../lib/serverConfig.ts';
 import type {DiscoveredServer} from '../lib/serverConfig.ts';
+import {BACKGROUND_PRESETS} from './HomeScreen.tsx';
 
 interface RoomsLobbyModalProps {
   currentRoomId: string;
@@ -27,6 +28,7 @@ interface RoomsLobbyModalProps {
   onCreateRoom: (opts: {
     title: string;
     aspectRatio: AspectRatio;
+    backgroundColor: string;
     blank: boolean;
     isPublicLan: boolean;
   }) => Promise<void>;
@@ -48,7 +50,8 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
 }) => {
   const [newTitle, setNewTitle] = useState('');
   const [newAspect, setNewAspect] = useState<AspectRatio>('9:16');
-  const [newBlank, setNewBlank] = useState(false);
+  const [newBg, setNewBg] = useState('#09090b');
+  const [newBlank, setNewBlank] = useState(true);
   const [creating, setCreating] = useState(false);
   const [showCreateForm, setShowCreateForm] = useState(false);
 
@@ -94,8 +97,9 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
     setCreating(true);
     try {
       await onCreateRoom({
-        title: newTitle.trim() || 'Новый монтаж',
+        title: newTitle.trim() || 'Командный монтаж',
         aspectRatio: newAspect,
+        backgroundColor: newBg,
         blank: newBlank,
         isPublicLan: true,
       });
@@ -111,15 +115,15 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
         {/* Header */}
         <div className="flex items-center justify-between border-b border-white/10 px-4 py-3.5">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-cyan-500/15 text-cyan-400">
+            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-emerald-500/15 text-emerald-400">
               <Wifi className="h-5 w-5" />
             </div>
             <div>
               <h2 className="text-sm font-semibold text-white sm:text-base">
-                Комнаты в локальной сети
+                Комнаты команды в сети
               </h2>
               <p className="text-[11px] text-zinc-400">
-                Как в Minecraft — выберите открытую комнату и монтируйте вместе
+                Выберите комнату в зелёной рамке или откройте новую
               </p>
             </div>
           </div>
@@ -135,15 +139,14 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
 
         {/* Body */}
         <div className="studio-scrollbar flex-1 space-y-4 overflow-y-auto p-4">
-          {/* Action bar: Refresh + Create LAN room + Scan Wi-Fi */}
           <div className="flex flex-wrap gap-2">
             <button
               type="button"
               onClick={() => setShowCreateForm((v) => !v)}
-              className="flex min-h-[42px] flex-1 items-center justify-center gap-1.5 rounded-xl bg-cyan-500 px-3 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 active:scale-[0.98]"
+              className="flex min-h-[42px] flex-1 items-center justify-center gap-1.5 rounded-xl bg-emerald-500 px-3 text-xs font-bold text-zinc-950 hover:bg-emerald-400 active:scale-[0.98]"
             >
               <Plus className="h-4 w-4" />
-              Открыть новую комнату
+              Открыть комнату (Глава)
             </button>
             <button
               type="button"
@@ -157,30 +160,29 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
               type="button"
               onClick={handleScanLan}
               disabled={scanningLan}
-              className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50"
+              className="flex min-h-[42px] items-center justify-center gap-1.5 rounded-xl border border-cyan-500/35 bg-cyan-500/10 px-3 text-xs font-medium text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50"
             >
               <Search className="h-3.5 w-3.5" />
               {scanningLan ? 'Поиск в Wi-Fi...' : 'Найти в Wi-Fi'}
             </button>
           </div>
 
-          {/* Create Room Form */}
           {showCreateForm && (
             <form
               onSubmit={handleCreateSubmit}
-              className="space-y-3 rounded-xl border border-cyan-500/30 bg-cyan-500/5 p-3.5"
+              className="space-y-3 rounded-xl border border-emerald-500/35 bg-emerald-500/5 p-3.5"
             >
-              <p className="text-xs font-semibold text-cyan-200">
-                Новая открытая комната в сети
+              <p className="text-xs font-semibold text-emerald-200">
+                Создать командную комнату
               </p>
               <input
                 type="text"
                 value={newTitle}
                 onChange={(e) => setNewTitle(e.target.value)}
                 placeholder="Название проекта (например: Влог за выходные)"
-                className="h-10 w-full rounded-lg border border-white/15 bg-zinc-950 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+                className="h-10 w-full rounded-lg border border-white/15 bg-zinc-950 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-emerald-400 focus:outline-none"
               />
-              <div className="flex items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex gap-1">
                   {(['9:16', '16:9', '1:1', '4:5'] as AspectRatio[]).map(
                     (ar) => (
@@ -190,7 +192,7 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
                         onClick={() => setNewAspect(ar)}
                         className={`rounded-lg px-2.5 py-1.5 font-mono text-[11px] font-medium ${
                           newAspect === ar
-                            ? 'bg-cyan-500 text-zinc-950'
+                            ? 'bg-emerald-500 text-zinc-950'
                             : 'bg-zinc-900 text-zinc-300 border border-white/10'
                         }`}
                       >
@@ -204,29 +206,53 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
                     type="checkbox"
                     checked={newBlank}
                     onChange={(e) => setNewBlank(e.target.checked)}
-                    className="accent-cyan-400"
+                    className="accent-emerald-400"
                   />
                   Пустой
                 </label>
               </div>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[11px] text-zinc-400 mr-1">Фон:</span>
+                {BACKGROUND_PRESETS.slice(0, 6).map((bg) => (
+                  <button
+                    key={bg}
+                    type="button"
+                    onClick={() => setNewBg(bg)}
+                    style={{backgroundColor: bg}}
+                    className={`h-6 w-6 rounded-md border ${
+                      newBg === bg ? 'border-emerald-400 scale-110' : 'border-white/20'
+                    }`}
+                  />
+                ))}
+                <input
+                  type="color"
+                  value={newBg}
+                  onChange={(e) => setNewBg(e.target.value)}
+                  className="h-6 w-6 cursor-pointer rounded bg-transparent p-0"
+                />
+              </div>
               <button
                 type="submit"
                 disabled={creating}
-                className="h-10 w-full rounded-lg bg-cyan-500 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 disabled:opacity-50"
+                className="h-10 w-full rounded-lg bg-emerald-500 text-xs font-bold text-zinc-950 hover:bg-emerald-400 disabled:opacity-50"
               >
-                {creating ? 'Создаётся...' : 'Создать и открыть для всех'}
+                {creating ? 'Создаётся...' : 'Создать и открыть команде'}
               </button>
             </form>
           )}
 
-          {/* Discovered Wi-Fi LAN Hosts (Minecraft LAN Server Scan) */}
-          {(scanningLan || discoveredServers.length > 0 || isNative || status === 'offline') && (
+          {(scanningLan ||
+            discoveredServers.length > 0 ||
+            isNative ||
+            status === 'offline') && (
             <div className="space-y-2 rounded-xl border border-white/10 bg-zinc-900/60 p-3">
               <div className="flex items-center justify-between">
                 <span className="flex items-center gap-1.5 text-xs font-medium text-zinc-200">
                   <Radio
                     className={`h-3.5 w-3.5 ${
-                      scanningLan ? 'text-emerald-400 animate-pulse' : 'text-zinc-400'
+                      scanningLan
+                        ? 'text-emerald-400 animate-pulse'
+                        : 'text-zinc-400'
                     }`}
                   />
                   Серверы в локальной Wi-Fi сети
@@ -243,7 +269,9 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
               {discoveredServers.length > 0 ? (
                 <div className="space-y-1.5">
                   {discoveredServers.map((srv) => {
-                    const active = serverUrl === srv.url || (!isNative && window.location.origin === srv.url);
+                    const active =
+                      serverUrl === srv.url ||
+                      (!isNative && window.location.origin === srv.url);
                     return (
                       <button
                         key={srv.url}
@@ -305,7 +333,6 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
             </div>
           )}
 
-          {/* Available Rooms List (Minecraft LAN World List) */}
           <div className="space-y-2">
             <div className="flex items-center justify-between text-xs text-zinc-400">
               <span>Доступные комнаты ({availableRooms.length})</span>
@@ -320,7 +347,7 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
               <div className="rounded-xl border border-white/10 bg-zinc-900/50 p-5 text-center text-xs text-zinc-400">
                 {status === 'offline'
                   ? 'Вы сейчас в локальном режиме. Подключите сервер выше, чтобы увидеть комнаты в сети.'
-                  : 'Открытых комнат пока нет — нажмите «Открыть новую комнату».'}
+                  : 'Открытых комнат пока нет — нажмите «Открыть комнату».'}
               </div>
             ) : (
               <div className="space-y-2">
@@ -329,49 +356,46 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
                   return (
                     <div
                       key={room.roomId}
-                      className={`flex items-center justify-between gap-3 rounded-xl border p-3 transition ${
+                      className={`flex items-center justify-between gap-3 rounded-xl border-2 p-3 transition ${
                         isCurrent
-                          ? 'border-cyan-400/60 bg-cyan-500/10'
-                          : 'border-white/10 bg-zinc-900/75 hover:border-white/25'
+                          ? 'border-cyan-400 bg-cyan-500/10'
+                          : 'border-emerald-500/80 bg-emerald-950/20 hover:bg-emerald-950/35'
                       }`}
                     >
-                      <div className="min-w-0 flex-1 space-y-1">
-                        <div className="flex items-center gap-2">
-                          <Globe className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
-                          <span className="truncate text-sm font-semibold text-white">
-                            {room.title}
-                          </span>
-                          <span className="rounded bg-white/10 px-1.5 py-0.5 font-mono text-[10px] text-zinc-300">
-                            {room.aspectRatio}
-                          </span>
+                      <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                        <div
+                          style={{
+                            backgroundColor: room.backgroundColor || '#09090b',
+                          }}
+                          className="flex h-11 w-9 shrink-0 items-center justify-center rounded-lg border border-white/15 font-mono text-[10px] font-bold text-zinc-300"
+                        >
+                          {room.aspectRatio}
                         </div>
-                        <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
-                          <span className="font-mono text-zinc-500">
-                            #{room.roomId}
-                          </span>
-                          <span>·</span>
-                          <span>
-                            {room.tracksCount} дор. / {room.clipsCount} клип.
-                          </span>
-                          <span>·</span>
-                          <span className="flex items-center gap-1 text-emerald-400">
-                            <Users className="h-3 w-3" />
-                            {room.collaboratorsCount} онлайн
-                          </span>
-                        </div>
-                        {room.collaborators.length > 0 && (
-                          <div className="flex items-center gap-1 pt-0.5">
-                            {room.collaborators.map((u, idx) => (
-                              <span
-                                key={idx}
-                                style={{backgroundColor: u.color}}
-                                className="rounded px-1.5 py-0.5 text-[10px] font-semibold text-zinc-950"
-                              >
-                                {u.name}
+                        <div className="min-w-0 flex-1 space-y-0.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="truncate text-sm font-semibold text-white">
+                              {room.title}
+                            </span>
+                            {room.hostName && (
+                              <span className="flex shrink-0 items-center gap-0.5 rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300">
+                                <Crown className="h-2.5 w-2.5" />
+                                {room.hostName}
                               </span>
-                            ))}
+                            )}
                           </div>
-                        )}
+                          <div className="flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
+                            <span className="font-semibold text-emerald-400">
+                              • online
+                            </span>
+                            <span>
+                              <Users className="mr-0.5 inline h-3 w-3" />
+                              {room.collaboratorsCount}
+                            </span>
+                            <span>
+                              {room.tracksCount} дор. / {room.clipsCount} клип.
+                            </span>
+                          </div>
+                        </div>
                       </div>
 
                       {isCurrent ? (
@@ -386,7 +410,7 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
                             onSelectRoom(room.roomId);
                             onClose();
                           }}
-                          className="h-10 shrink-0 rounded-xl bg-white px-4 text-xs font-semibold text-zinc-950 hover:bg-zinc-200 active:scale-95"
+                          className="h-10 shrink-0 rounded-xl bg-emerald-500 px-4 text-xs font-bold text-zinc-950 hover:bg-emerald-400 active:scale-95"
                         >
                           Войти
                         </button>
