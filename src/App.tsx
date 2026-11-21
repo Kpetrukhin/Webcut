@@ -22,6 +22,7 @@ import {
 import type {AspectRatio, Clip} from './shared/types.ts';
 import {StudioAudioEngine} from './lib/audioEngine.ts';
 import {exportProjectToVideo, MediaPool} from './lib/renderEngine.ts';
+import {getApiUrl} from './lib/serverConfig.ts';
 import {useCollaborativeRoom} from './hooks/useCollaborativeRoom.ts';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
 import {Timeline} from './components/Timeline.tsx';
@@ -54,6 +55,7 @@ export default function App() {
   const {
     user,
     roomId,
+    serverUrl,
     status,
     project,
     collaborators,
@@ -72,6 +74,7 @@ export default function App() {
     sendChatMessage,
     switchRoom,
     updateUserProfile,
+    updateServerConnection,
   } = useCollaborativeRoom();
 
   const [currentTime, setCurrentTime] = useState(0);
@@ -400,8 +403,15 @@ export default function App() {
   );
 
   const handleCreateNewRoom = async (blank: boolean) => {
+    const endpoint = getApiUrl('/api/rooms');
+    if (!endpoint) {
+      const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
+      if (blank) replaceClips([]);
+      switchRoom(localId);
+      return;
+    }
     try {
-      const res = await fetch('/api/rooms', {
+      const res = await fetch(endpoint, {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({blank}),
@@ -411,7 +421,8 @@ export default function App() {
         switchRoom(data.roomId);
       }
     } catch {
-      // ignore
+      const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
+      switchRoom(localId);
     }
   };
 
@@ -647,6 +658,7 @@ export default function App() {
             {desktopTab === 'team' && (
               <TeamPanel
                 roomId={roomId}
+                serverUrl={serverUrl}
                 user={user}
                 allCollaborators={allCollaborators}
                 chat={project.chat}
@@ -655,6 +667,7 @@ export default function App() {
                 onSwitchRoom={switchRoom}
                 onCreateNewRoom={handleCreateNewRoom}
                 onSendChat={sendChatMessage}
+                onUpdateServerUrl={updateServerConnection}
               />
             )}
           </div>
@@ -1051,6 +1064,7 @@ export default function App() {
         >
           <TeamPanel
             roomId={roomId}
+            serverUrl={serverUrl}
             user={user}
             allCollaborators={allCollaborators}
             chat={project.chat}
@@ -1059,6 +1073,7 @@ export default function App() {
             onSwitchRoom={switchRoom}
             onCreateNewRoom={handleCreateNewRoom}
             onSendChat={sendChatMessage}
+            onUpdateServerUrl={updateServerConnection}
           />
         </BottomSheet>
       )}
@@ -1109,14 +1124,22 @@ export default function App() {
             )}
 
             {exportedUrl && (
-              <a
-                href={exportedUrl.url}
-                download={exportedUrl.filename}
-                className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-cyan-500 text-sm font-semibold text-zinc-950 hover:bg-cyan-400"
-              >
-                <Download className="h-4 w-4" />
-                Скачать {exportedUrl.filename}
-              </a>
+              <div className="space-y-3">
+                <video
+                  src={exportedUrl.url}
+                  controls
+                  playsInline
+                  className="max-h-56 w-full rounded-xl border border-white/10 bg-black"
+                />
+                <a
+                  href={exportedUrl.url}
+                  download={exportedUrl.filename}
+                  className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-cyan-500 text-sm font-semibold text-zinc-950 hover:bg-cyan-400"
+                >
+                  <Download className="h-4 w-4" />
+                  Скачать {exportedUrl.filename}
+                </a>
+              </div>
             )}
           </div>
         </div>

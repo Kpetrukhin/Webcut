@@ -14,6 +14,11 @@ import {
   X,
 } from 'lucide-react';
 import {
+  getApiUrl,
+  getSavedServerUrl,
+  isNativeCapacitorApp,
+} from '../lib/serverConfig.ts';
+import {
   SAMPLE_MEDIA_ASSETS,
   SYNTH_AUDIO_PRESETS,
 } from '../shared/types.ts';
@@ -78,25 +83,45 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
     setErrorMsg(null);
 
     try {
+      const uploadEndpoint = getApiUrl('/api/upload');
       for (const file of Array.from(files)) {
-        const form = new FormData();
-        form.append('file', file);
-        const res = await fetch('/api/upload', {method: 'POST', body: form});
-        const data = (await res.json()) as {
-          name?: string;
-          kind?: 'video' | 'image' | 'audio';
-          src?: string;
-          error?: string;
-        };
-        if (!res.ok || !data.src) {
-          throw new Error(data.error || 'Ошибка загрузки');
+        const isVideo = file.type.startsWith('video/');
+        const mediaKind: 'video' | 'image' = isVideo ? 'video' : 'image';
+
+        if (uploadEndpoint) {
+          try {
+            const form = new FormData();
+            form.append('file', file);
+            const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
+            const data = (await res.json()) as {
+              name?: string;
+              kind?: 'video' | 'image' | 'audio';
+              src?: string;
+              error?: string;
+            };
+            if (res.ok && data.src) {
+              const serverKind = data.kind === 'video' ? 'video' : 'image';
+              const dur = await probeMediaDuration(data.src, serverKind);
+              onAddMediaClip({
+                name: data.name || file.name,
+                kind: serverKind,
+                src: data.src,
+                duration: Math.min(30, dur),
+                track: targetTrack,
+              });
+              continue;
+            }
+          } catch {
+            // Fall back to local device file URL if offline/APK without server
+          }
         }
-        const mediaKind = data.kind === 'video' ? 'video' : 'image';
-        const dur = await probeMediaDuration(data.src, mediaKind);
+
+        const localUrl = URL.createObjectURL(file);
+        const dur = await probeMediaDuration(localUrl, mediaKind);
         onAddMediaClip({
-          name: data.name || file.name,
+          name: file.name,
           kind: mediaKind,
-          src: data.src,
+          src: localUrl,
           duration: Math.min(30, dur),
           track: targetTrack,
         });
@@ -104,7 +129,7 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
       onClose?.();
     } catch (err) {
       setErrorMsg(
-        err instanceof Error ? err.message : 'Не удалось загрузить файл'
+        err instanceof Error ? err.message : 'Не удалось добавить файл'
       );
     } finally {
       setUploading(false);
@@ -584,17 +609,33 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
     if (!file) return;
     setUploading(true);
     try {
-      const form = new FormData();
-      form.append('file', file);
-      const res = await fetch('/api/upload', {method: 'POST', body: form});
-      const data = (await res.json()) as {
-        name?: string;
-        src?: string;
-        error?: string;
-      };
-      if (!res.ok || !data.src) throw new Error(data.error || 'Ошибка загрузки');
+      const uploadEndpoint = getApiUrl('/api/upload');
+      let finalSrc = '';
+      let finalName = file.name;
 
-      const audio = new Audio(data.src);
+      if (uploadEndpoint) {
+        try {
+          const form = new FormData();
+          form.append('file', file);
+          const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
+          const data = (await res.json()) as {
+            name?: string;
+            src?: string;
+          };
+          if (res.ok && data.src) {
+            finalSrc = data.src;
+            finalName = data.name || file.name;
+          }
+        } catch {
+          // fallback to local URL
+        }
+      }
+
+      if (!finalSrc) {
+        finalSrc = URL.createObjectURL(file);
+      }
+
+      const audio = new Audio(finalSrc);
       const dur = await new Promise<number>((resolve) => {
         audio.onloadedmetadata = () =>
           resolve(Number.isFinite(audio.duration) ? audio.duration : 10);
@@ -602,9 +643,9 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
       });
 
       onAddAudioClip({
-        name: data.name || file.name,
+        name: finalName,
         kind: 'audio',
-        src: data.src,
+        src: finalSrc,
         duration: Math.min(60, Math.round(dur * 10) / 10),
       });
       onClose?.();
@@ -699,14 +740,16 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
 
 interface TeamPanelProps {
   roomId: string;
+  serverUrl: string;
   user: {id: string; name: string; color: string};
   allCollaborators: Collaborator[];
   chat: ChatMessage[];
-  status: 'connecting' | 'connected' | 'reconnecting';
+  status: 'connecting' | 'connected' | 'reconnecting' | 'offline';
   onUpdateProfile: (name: string, color: string) => void;
   onSwitchRoom: (nextRoomId: string) => void;
   onCreateNewRoom: (blank: boolean) => void;
   onSendChat: (text: string) => void;
+  onUpdateServerUrl: (url: string) => void;
 }
 
 const PROFILE_COLORS = [
@@ -720,6 +763,7 @@ const PROFILE_COLORS = [
 
 export const TeamPanel: React.FC<TeamPanelProps> = ({
   roomId,
+  serverUrl,
   user,
   allCollaborators,
   chat,
@@ -728,27 +772,39 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
   onSwitchRoom,
   onCreateNewRoom,
   onSendChat,
+  onUpdateServerUrl,
 }) => {
   const [copied, setCopied] = useState(false);
   const [nameInput, setNameInput] = useState(user.name);
   const [roomInput, setRoomInput] = useState('');
   const [chatInput, setChatInput] = useState('');
+  const [serverInput, setServerInput] = useState(serverUrl);
   const [lanUrls, setLanUrls] = useState<string[]>([]);
+  const isNative = isNativeCapacitorApp();
 
   useEffect(() => {
     setNameInput(user.name);
   }, [user.name]);
 
   useEffect(() => {
-    fetch('/api/network-info')
+    setServerInput(serverUrl);
+  }, [serverUrl]);
+
+  useEffect(() => {
+    const endpoint = getApiUrl('/api/network-info');
+    if (!endpoint) return;
+    fetch(endpoint)
       .then((r) => r.json())
       .then((d: {lanUrls?: string[]}) => {
         if (Array.isArray(d.lanUrls)) setLanUrls(d.lanUrls);
       })
       .catch(() => {});
-  }, []);
+  }, [serverUrl]);
 
-  const shareUrl = `${window.location.origin}/?room=${encodeURIComponent(roomId)}`;
+  const baseShareOrigin = isNative
+    ? getSavedServerUrl() || 'https://your-server-url'
+    : window.location.origin;
+  const shareUrl = `${baseShareOrigin}/?room=${encodeURIComponent(roomId)}`;
 
   const handleCopy = async () => {
     try {
@@ -762,6 +818,38 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
 
   return (
     <div className="space-y-4">
+      {isNative && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            onUpdateServerUrl(serverInput);
+          }}
+          className="rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-3 space-y-2"
+        >
+          <p className="text-xs font-medium text-cyan-200">
+            Сервер для совместного монтажа
+          </p>
+          <div className="flex gap-2">
+            <input
+              type="url"
+              value={serverInput}
+              onChange={(e) => setServerInput(e.target.value)}
+              placeholder="http://192.168.1.10:3000 или https://..."
+              className="h-10 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+            />
+            <button
+              type="submit"
+              className="h-10 rounded-lg bg-cyan-500 px-3 text-xs font-semibold text-zinc-950"
+            >
+              OK
+            </button>
+          </div>
+          <p className="text-[11px] text-zinc-400">
+            Без сервера редактор работает локально на телефоне; укажите адрес сервера для синхронизации с командой.
+          </p>
+        </form>
+      )}
+
       {/* Room Link & Status */}
       <div className="rounded-xl border border-white/10 bg-zinc-900/80 p-3 space-y-2.5">
         <div className="flex items-center justify-between text-xs">
@@ -771,10 +859,18 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
           <span className="flex items-center gap-1.5 text-[11px] text-zinc-400">
             <span
               className={`h-2 w-2 rounded-full ${
-                status === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'
+                status === 'connected'
+                  ? 'bg-emerald-400'
+                  : status === 'offline'
+                    ? 'bg-zinc-500'
+                    : 'bg-amber-400'
               }`}
             />
-            {status === 'connected' ? 'Онлайн' : 'Подключение...'}
+            {status === 'connected'
+              ? 'Онлайн'
+              : status === 'offline'
+                ? 'Локально'
+                : 'Подключение...'}
           </span>
         </div>
 

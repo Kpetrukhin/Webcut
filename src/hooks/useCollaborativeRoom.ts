@@ -12,6 +12,11 @@ import type {
   ProjectState,
   ServerWsMessage,
 } from '../shared/types.ts';
+import {
+  getSavedServerUrl,
+  getWebSocketUrl,
+  saveServerUrl,
+} from '../lib/serverConfig.ts';
 
 const USER_COLORS = [
   '#22d3ee',
@@ -63,9 +68,10 @@ export function getRoomIdFromUrl(): string {
 export function useCollaborativeRoom() {
   const [user, setUser] = useState(getInitialUser);
   const [roomId, setRoomId] = useState<string>(getRoomIdFromUrl);
-  const [status, setStatus] = useState<'connecting' | 'connected' | 'reconnecting'>(
-    'connecting'
-  );
+  const [serverUrl, setServerUrl] = useState<string>(getSavedServerUrl);
+  const [status, setStatus] = useState<
+    'connecting' | 'connected' | 'reconnecting' | 'offline'
+  >('connecting');
   const [project, setProject] = useState<ProjectState>(() => ({
     roomId: getRoomIdFromUrl(),
     title: 'Ночной ролик',
@@ -101,11 +107,16 @@ export function useCollaborativeRoom() {
     let closedByEffect = false;
     let attempt = 0;
 
+    const wsEndpoint = getWebSocketUrl();
+    if (!wsEndpoint) {
+      setStatus('offline');
+      return;
+    }
+
     const connect = () => {
       if (closedByEffect) return;
       setStatus(attempt === 0 ? 'connecting' : 'reconnecting');
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+      const ws = new WebSocket(wsEndpoint);
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -232,7 +243,7 @@ export function useCollaborativeRoom() {
         clearTimeout(pendingPresenceTimerRef.current);
       wsRef.current?.close();
     };
-  }, [roomId, user]);
+  }, [roomId, user, serverUrl]);
 
   const pushUndo = useCallback(() => {
     const snapshot = structuredClone(projectRef.current.clips);
@@ -431,9 +442,15 @@ export function useCollaborativeRoom() {
     [user]
   );
 
+  const updateServerConnection = useCallback((rawUrl: string) => {
+    const saved = saveServerUrl(rawUrl);
+    setServerUrl(saved);
+  }, []);
+
   return {
     user,
     roomId,
+    serverUrl,
     status,
     project,
     collaborators: collaborators.filter((c) => c.id !== user.id),
@@ -452,5 +469,6 @@ export function useCollaborativeRoom() {
     sendChatMessage,
     switchRoom,
     updateUserProfile,
+    updateServerConnection,
   };
 }

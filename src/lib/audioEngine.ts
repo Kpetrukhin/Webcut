@@ -1,4 +1,5 @@
 import type {Clip} from '../shared/types.ts';
+import {resolveMediaSrc} from './serverConfig.ts';
 
 /**
  * Web Audio engine supporting uploaded audio files AND procedural backing tracks
@@ -43,12 +44,13 @@ export class StudioAudioEngine {
   }
 
   private getOrCreateAudioEl(src: string): HTMLAudioElement {
-    let el = this.audioElements.get(src);
+    const resolved = resolveMediaSrc(src) || src;
+    let el = this.audioElements.get(resolved);
     if (!el) {
-      el = new Audio(src);
+      el = new Audio(resolved);
       el.crossOrigin = 'anonymous';
       el.preload = 'auto';
-      this.audioElements.set(src, el);
+      this.audioElements.set(resolved, el);
     }
     return el;
   }

@@ -5,6 +5,7 @@ import type {
   FilterPreset,
 } from '../shared/types.ts';
 import type {StudioAudioEngine} from './audioEngine.ts';
+import {resolveMediaSrc} from './serverConfig.ts';
 
 export function getCanvasDimensions(aspect: AspectRatio): {
   width: number;
@@ -28,26 +29,28 @@ export class MediaPool {
   private videos = new Map<string, HTMLVideoElement>();
 
   public getImage(src: string): HTMLImageElement | null {
-    let img = this.images.get(src);
+    const resolved = resolveMediaSrc(src) || src;
+    let img = this.images.get(resolved);
     if (!img) {
       img = new Image();
       img.crossOrigin = 'anonymous';
-      img.src = src;
-      this.images.set(src, img);
+      img.src = resolved;
+      this.images.set(resolved, img);
     }
     return img.complete && img.naturalWidth > 0 ? img : null;
   }
 
   public getVideo(src: string): HTMLVideoElement {
-    let vid = this.videos.get(src);
+    const resolved = resolveMediaSrc(src) || src;
+    let vid = this.videos.get(resolved);
     if (!vid) {
       vid = document.createElement('video');
       vid.crossOrigin = 'anonymous';
       vid.playsInline = true;
       vid.muted = true; // Video preview playback synced separately
       vid.preload = 'auto';
-      vid.src = src;
-      this.videos.set(src, vid);
+      vid.src = resolved;
+      this.videos.set(resolved, vid);
     }
     return vid;
   }

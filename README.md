@@ -41,6 +41,23 @@ npm run build
 npm start
 ```
 
+## Сборка и скачивание Android APK (через GitHub Actions)
+
+При каждом пуше в `main` / `master` GitHub Actions автоматически собирает готовый **`.apk`** файл через Capacitor:
+
+1. Откройте вкладку **Actions** в репозитории GitHub.
+2. Зайдите в последний успешный запуск **Build Web & Android APK**.
+3. В самом низу в разделе **Artifacts** скачайте **`CutSync-APK`** (внутри архива файл `CutSync-debug.apk`) и установите на Android.
+4. Для совместного редактирования с друзьями откройте вкладку **Команда** в приложении и укажите адрес вашего запущенного сервера (`https://...` или `http://192.168.x.x:3000`).
+
+Для локальной сборки APK (если установлен Android SDK и JDK 21):
+
+```bash
+npm run build
+node scripts/prepare-android.mjs
+cd android && ./gradlew assembleDebug
+```
+
 После запуска откройте `http://localhost:3000` на ПК. Чтобы подключиться с телефона в той же Wi-Fi сети, откройте вкладку **Команда** — там автоматически отобразится локальный LAN-адрес вида `http://192.168.x.x:3000/?room=studio-demo`.
 
 ## Стек

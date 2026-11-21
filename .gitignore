@@ -5,6 +5,8 @@ dev-dist/
 coverage/
 uploads/
 data/
+android/
+*.apk
 .DS_Store
 *.log
 .env*
