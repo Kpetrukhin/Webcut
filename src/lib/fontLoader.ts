@@ -3,11 +3,14 @@ import {resolveMediaSrc} from './serverConfig.ts';
 
 export const BUILTIN_FONTS: Array<{name: string; family: string; css: string}> = [
   {name: 'Jakarta (Стандарт)', family: 'Plus Jakarta Sans', css: '"Plus Jakarta Sans", sans-serif'},
-  {name: 'Системный жирный', family: 'system-ui', css: 'system-ui, -apple-system, sans-serif'},
+  {name: 'Montserrat (Модерн)', family: 'Montserrat', css: '"Montserrat", sans-serif'},
+  {name: 'Oswald (Плакат)', family: 'Oswald', css: '"Oswald", sans-serif'},
+  {name: 'Ударный (Impact)', family: 'Impact', css: 'Impact, "Arial Black", sans-serif'},
+  {name: 'Playfair (Журнал)', family: 'Playfair Display', css: '"Playfair Display", Georgia, serif'},
   {name: 'Классика (Serif)', family: 'Georgia', css: 'Georgia, "Times New Roman", serif'},
   {name: 'Моно (Код/Титр)', family: 'JetBrains Mono', css: '"JetBrains Mono", ui-monospace, monospace'},
-  {name: 'Ударный (Impact)', family: 'Impact', css: 'Impact, "Arial Black", sans-serif'},
-  {name: 'Рукописный', family: 'cursive', css: 'cursive, sans-serif'},
+  {name: 'Lobster (Леттеринг)', family: 'Lobster', css: '"Lobster", cursive'},
+  {name: 'Системный (Sans)', family: 'system-ui', css: 'system-ui, -apple-system, sans-serif'},
 ];
 
 const loadedFontKeys = new Set<string>();

@@ -17,6 +17,7 @@ import {
   Pause,
   Pipette,
   Play,
+  Plus,
   Radio,
   Redo2,
   RefreshCw,
@@ -25,7 +26,9 @@ import {
   Shapes,
   Sliders,
   Sparkles,
+  Spline,
   Trash2,
+  Type,
   Undo2,
   Wifi,
 } from 'lucide-react';
@@ -39,6 +42,7 @@ import type {
   Clip,
   ClipMask,
   ColorFilterPreset,
+  TextCurvePoint,
 } from './shared/types.ts';
 import {StudioAudioEngine} from './lib/audioEngine.ts';
 import {getCustomColorPresets} from './lib/colorPresets.ts';
@@ -56,6 +60,12 @@ import {
 import type {LocalProjectRecord} from './lib/localProjects.ts';
 import {exportProjectToVideo, MediaPool} from './lib/renderEngine.ts';
 import {getApiUrl, isNativeCapacitorApp} from './lib/serverConfig.ts';
+import {
+  colorToHex,
+  createDefaultCurvePoints,
+  measureBaseTextHalfWidth,
+  normalizeTextStyle,
+} from './lib/textRenderer.ts';
 import {
   hasExplicitRoomInUrl,
   useCollaborativeRoom,
@@ -86,7 +96,7 @@ import {
   TOOL_TABS,
   TextPanel,
 } from './components/ToolSheets.tsx';
-import type {ActiveToolTab} from './components/ToolSheets.tsx';
+import type {ActiveToolTab, TextColorField} from './components/ToolSheets.tsx';
 import {
   OfflineIndicator,
   PWAInstallButton,
@@ -175,8 +185,24 @@ export default function App() {
     | 'filters'
   >('menu');
   const [mobileEditTool, setMobileEditTool] = useState<
-    'transform' | 'mask' | 'adjust' | 'filters' | 'audio_speed' | 'audio_fx' | null
+    | 'transform'
+    | 'mask'
+    | 'adjust'
+    | 'filters'
+    | 'audio_speed'
+    | 'audio_fx'
+    | 'text'
+    | null
   >(null);
+  const [textFocusTrigger, setTextFocusTrigger] = useState(0);
+  const [textColorPicker, setTextColorPicker] = useState<{
+    clipId: string;
+    field: TextColorField;
+  } | null>(null);
+  const [curveEditActive, setCurveEditActive] = useState(true);
+  const [selectedCurvePointId, setSelectedCurvePointId] = useState<string | null>(
+    null
+  );
   const [showCropModal, setShowCropModal] = useState(false);
   const [customColorPresets, setCustomColorPresets] = useState<
     ColorFilterPreset[]
@@ -234,8 +260,26 @@ export default function App() {
       setShowCropModal(false);
       setTrackpadSnapGuides({x: false, y: false});
       setMobileEditTool(null);
+      setTextColorPicker(null);
+      setSelectedCurvePointId(null);
       setEditSubMode('menu');
       return;
+    }
+
+    setTextColorPicker((cur) =>
+      cur && cur.clipId === selectedClip.id && selectedClip.track === 'text'
+        ? cur
+        : null
+    );
+
+    if (selectedClip.track !== 'text') {
+      setSelectedCurvePointId(null);
+    } else {
+      setSelectedCurvePointId((cur) => {
+        const pts = selectedClip.textStyle?.curvePoints ?? [];
+        if (cur && pts.some((p) => p.id === cur)) return cur;
+        return pts[0]?.id ?? null;
+      });
     }
 
     if (selectedClip.track === 'audio') {
@@ -253,7 +297,10 @@ export default function App() {
       setShowCompressModal(false);
       setShowCropModal(false);
       setMobileEditTool((cur) =>
-        cur === 'transform' || cur === 'audio_speed' || cur === 'audio_fx'
+        cur === 'transform' ||
+        cur === 'audio_speed' ||
+        cur === 'audio_fx' ||
+        (cur === 'text' && selectedClip.track === 'text')
           ? cur
           : null
       );
@@ -601,12 +648,13 @@ export default function App() {
 
   const handleAddText = useCallback(
     (text: string, forceNewTrack = true) => {
+      const cleanText = text.trim() ? text : 'НОВЫЙ ТЕКСТ';
       const {clip} = addClip(
         {
           id: `clip-${Math.random().toString(36).slice(2, 9)}`,
           track: 'text',
           kind: 'text',
-          name: text.slice(0, 18),
+          name: cleanText.replace(/\s+/g, ' ').slice(0, 18),
           start: Math.round(currentTime * 100) / 100,
           duration: 3.5,
           trimStart: 0,
@@ -620,14 +668,31 @@ export default function App() {
           saturate: 1,
           transitionIn: 'none',
           motionEffect: 'none',
-          text,
+          text: cleanText,
           textStyle: {
             fontSize: 48,
             color: '#ffffff',
-            bgColor: 'rgba(9, 9, 11, 0.72)',
+            bgColor: '#09090b',
+            bgMode: 'block',
+            bgOpacity: 0.72,
             fontWeight: 'bold',
+            fontStyle: 'normal',
+            underline: false,
             fontFamily: 'Plus Jakarta Sans',
             shadow: true,
+            shadowColor: '#000000',
+            shadowOffsetX: 0,
+            shadowOffsetY: 4,
+            shadowBlur: 10,
+            outline: false,
+            strokeColor: '#09090b',
+            strokeWidth: 0,
+            letterSpacing: 0,
+            lineHeight: 1.25,
+            spaceWidth: 1,
+            curveMode: 'none',
+            curveAmplitude: 0,
+            curveFrequency: 2,
             x: 0.5,
             y: 0.75,
             align: 'center',
@@ -636,8 +701,76 @@ export default function App() {
         {forceNewTrack}
       );
       setSelectedClipId(clip.id);
+      setMobileSheet(null);
+      setDesktopTab('text');
+      setShowTrackpad(false);
+      setShowOpacitySlider(false);
+      setShowChromaKeyPanel(false);
+      setMobileEditTool('text');
+      setTextFocusTrigger((n) => n + 1);
     },
     [currentTime, addClip]
+  );
+
+  const handleDoubleClickTextClip = useCallback((clipId: string) => {
+    setSelectedClipId(clipId);
+    setDesktopTab('text');
+    setMobileSheet(null);
+    setShowTrackpad(false);
+    setShowOpacitySlider(false);
+    setShowChromaKeyPanel(false);
+    setMobileEditTool('text');
+    setTextFocusTrigger((n) => n + 1);
+  }, []);
+
+  const handlePickTextCanvasColor = useCallback(
+    (hexColor: string, commit: boolean) => {
+      if (!textColorPicker) return;
+      const target = project.clips.find((c) => c.id === textColorPicker.clipId);
+      if (!target || target.track !== 'text') return;
+      const base = normalizeTextStyle(target.textStyle);
+      const nextStyle: NonNullable<Clip['textStyle']> = {
+        ...base,
+        [textColorPicker.field]: hexColor,
+      };
+      if (textColorPicker.field === 'bgColor' && nextStyle.bgMode === 'none') {
+        nextStyle.bgMode = 'block';
+        if ((nextStyle.bgOpacity ?? 0) <= 0.05) nextStyle.bgOpacity = 0.75;
+      } else if (
+        textColorPicker.field === 'strokeColor' &&
+        (nextStyle.strokeWidth ?? 0) <= 0
+      ) {
+        nextStyle.strokeWidth = 4;
+        nextStyle.outline = true;
+      } else if (textColorPicker.field === 'shadowColor') {
+        nextStyle.shadow = true;
+      }
+      updateClip(
+        target.id,
+        {textStyle: nextStyle},
+        {skipUndo: !commit, skipSync: !commit}
+      );
+    },
+    [textColorPicker, project.clips, updateClip]
+  );
+
+  const handleUpdateCurvePoints = useCallback(
+    (clipId: string, points: TextCurvePoint[], commit: boolean) => {
+      const target = project.clips.find((c) => c.id === clipId);
+      if (!target || target.track !== 'text') return;
+      const base = normalizeTextStyle(target.textStyle);
+      const nextStyle: NonNullable<Clip['textStyle']> = {
+        ...base,
+        curveMode: 'custom',
+        curvePoints: points,
+      };
+      updateClip(
+        target.id,
+        {textStyle: nextStyle},
+        {skipUndo: !commit, skipSync: !commit}
+      );
+    },
+    [project.clips, updateClip]
   );
 
   const handleAddAudioClip = useCallback(
@@ -1037,9 +1170,65 @@ export default function App() {
   const isChromaKeyPickerActive = Boolean(
     selectedClip &&
       (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+      !textColorPicker &&
       (showChromaKeyPanel ||
         (desktopTab === 'edit' && editSubMode === 'chromakey'))
   );
+
+  const isTextColorPickerActive = Boolean(
+    textColorPicker &&
+      selectedClip &&
+      selectedClip.id === textColorPicker.clipId &&
+      selectedClip.track === 'text'
+  );
+
+  const isCurveEditOverlayActive = Boolean(
+    curveEditActive &&
+      selectedClip &&
+      selectedClip.track === 'text' &&
+      selectedClip.textStyle?.curveMode === 'custom' &&
+      !isPlaying &&
+      showSelectionOutline &&
+      !isChromaKeyPickerActive &&
+      !isTextColorPickerActive &&
+      currentTime >= selectedClip.start &&
+      currentTime < selectedClip.start + selectedClip.duration
+  );
+
+  const activeCurvePoints = useMemo<TextCurvePoint[]>(() => {
+    if (
+      !selectedClip ||
+      selectedClip.track !== 'text' ||
+      selectedClip.textStyle?.curveMode !== 'custom'
+    ) {
+      return [];
+    }
+    const pts = selectedClip.textStyle.curvePoints;
+    if (pts && pts.length >= 2) return pts;
+    return createDefaultCurvePoints(
+      measureBaseTextHalfWidth(
+        selectedClip.text ?? selectedClip.name ?? '',
+        selectedClip.textStyle
+      )
+    );
+  }, [selectedClip]);
+
+  const textColorPickerHex = useMemo(() => {
+    if (!isTextColorPickerActive || !selectedClip || !textColorPicker) {
+      return '#ffffff';
+    }
+    const norm = normalizeTextStyle(selectedClip.textStyle);
+    return colorToHex(norm[textColorPicker.field], '#ffffff');
+  }, [isTextColorPickerActive, selectedClip, textColorPicker]);
+
+  const textColorPickerFieldLabel =
+    textColorPicker?.field === 'strokeColor'
+      ? 'Цвет обводки'
+      : textColorPicker?.field === 'shadowColor'
+        ? 'Цвет тени'
+        : textColorPicker?.field === 'bgColor'
+          ? 'Цвет фона'
+          : 'Цвет текста';
 
   if (screen === 'home') {
     return (
@@ -1694,12 +1883,37 @@ export default function App() {
             {desktopTab === 'text' && (
               <TextPanel
                 selectedClip={selectedClip}
+                clips={project.clips}
                 customFonts={project.customFonts ?? []}
                 currentTime={currentTime}
-                onSeek={handleSeek}
+                autoFocusTrigger={textFocusTrigger}
+                activeColorPickerField={
+                  isTextColorPickerActive && textColorPicker
+                    ? textColorPicker.field
+                    : null
+                }
+                onRequestColorPicker={(field) => {
+                  if (!selectedClip || selectedClip.track !== 'text' || !field) {
+                    setTextColorPicker(null);
+                    return;
+                  }
+                  setShowChromaKeyPanel(false);
+                  setTextColorPicker({clipId: selectedClip.id, field});
+                }}
+                curveEditActive={curveEditActive}
+                onSetCurveEditActive={setCurveEditActive}
+                selectedCurvePointId={selectedCurvePointId}
+                onSelectCurvePoint={setSelectedCurvePointId}
+                onSelectClip={(id) => {
+                  setSelectedClipId(id);
+                  setTextFocusTrigger((n) => n + 1);
+                }}
                 onAddText={handleAddText}
-                onUpdateClip={(id, patch) => updateClip(id, patch)}
+                onUpdateClip={updateClip}
                 onAddCustomFont={addCustomFont}
+                onOpenTrackpad={() => setShowTrackpad((v) => !v)}
+                onAddKeyframe={handleAddKeyframeAtPlayhead}
+                hasKeyframeAtPlayhead={hasKeyframeAtPlayhead}
               />
             )}
             {desktopTab === 'effects' && (
@@ -1760,6 +1974,96 @@ export default function App() {
               {lockWarning || noticeMsg}
             </div>
           )}
+          {isTextColorPickerActive && (
+            <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border border-cyan-400/60 bg-zinc-950/90 px-3 py-1.5 shadow-xl backdrop-blur-xs">
+              <span
+                className="h-4 w-4 shrink-0 rounded-full border border-white/40"
+                style={{backgroundColor: textColorPickerHex}}
+              />
+              <span className="whitespace-nowrap text-[11px] font-medium text-cyan-200">
+                Пипетка ({textColorPickerFieldLabel}): ведите по холсту
+              </span>
+              <button
+                type="button"
+                onClick={() => setTextColorPicker(null)}
+                className="rounded-full bg-cyan-500 px-2.5 py-0.5 text-[10px] font-bold text-zinc-950 hover:bg-cyan-400"
+              >
+                Готово
+              </button>
+            </div>
+          )}
+          {isCurveEditOverlayActive && selectedClip && (
+            <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-cyan-400/50 bg-zinc-950/90 px-2.5 py-1 shadow-xl backdrop-blur-xs">
+              <Spline className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
+              <span className="hidden whitespace-nowrap text-[11px] font-medium text-zinc-200 sm:inline">
+                Кривая ({activeCurvePoints.length} т.)
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  const pts = activeCurvePoints;
+                  const idx = selectedCurvePointId
+                    ? pts.findIndex((p) => p.id === selectedCurvePointId)
+                    : -1;
+                  const insertAfter =
+                    idx >= 0
+                      ? Math.min(idx, pts.length - 2)
+                      : Math.max(0, Math.floor((pts.length - 1) / 2));
+                  const a = pts[insertAfter];
+                  const b = pts[insertAfter + 1] ?? a;
+                  const newPt: TextCurvePoint = {
+                    id: `pt-${Math.random().toString(36).slice(2, 7)}`,
+                    x: Math.round(((a.x + b.x) / 2) * 10) / 10,
+                    y: Math.round(((a.y + b.y) / 2) * 10) / 10,
+                  };
+                  const nextPts = [
+                    ...pts.slice(0, insertAfter + 1),
+                    newPt,
+                    ...pts.slice(insertAfter + 1),
+                  ];
+                  handleUpdateCurvePoints(selectedClip.id, nextPts, true);
+                  setSelectedCurvePointId(newPt.id);
+                }}
+                className="flex items-center gap-1 rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-semibold text-zinc-100 hover:bg-white/20"
+                title="Добавить точку на кривую"
+              >
+                <Plus className="h-3 w-3 text-cyan-300" />
+                <span>Точка</span>
+              </button>
+              <button
+                type="button"
+                disabled={!selectedCurvePointId || activeCurvePoints.length <= 2}
+                onClick={() => {
+                  if (!selectedCurvePointId || activeCurvePoints.length <= 2) {
+                    return;
+                  }
+                  const idx = activeCurvePoints.findIndex(
+                    (p) => p.id === selectedCurvePointId
+                  );
+                  const nextPts = activeCurvePoints.filter(
+                    (p) => p.id !== selectedCurvePointId
+                  );
+                  handleUpdateCurvePoints(selectedClip.id, nextPts, true);
+                  setSelectedCurvePointId(
+                    nextPts[Math.min(Math.max(0, idx), nextPts.length - 1)]?.id ??
+                      null
+                  );
+                }}
+                className="flex items-center gap-1 rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-semibold text-rose-200 hover:bg-rose-500/20 disabled:opacity-40"
+                title="Удалить выбранную точку"
+              >
+                <Trash2 className="h-3 w-3" />
+                <span className="hidden sm:inline">Удалить</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setCurveEditActive(false)}
+                className="rounded-full bg-cyan-500 px-2.5 py-0.5 text-[10px] font-bold text-zinc-950 hover:bg-cyan-400"
+              >
+                Готово
+              </button>
+            </div>
+          )}
           <div className="flex-1 min-h-0">
             <PreviewCanvas
               tracks={project.tracks}
@@ -1783,10 +2087,18 @@ export default function App() {
               externalSnapGuides={trackpadSnapGuides}
               chromaKeyPickerActive={isChromaKeyPickerActive}
               onPickChromaKeyColor={handlePickChromaKeyColor}
+              colorPickerActive={isTextColorPickerActive}
+              colorPickerPreviewHex={textColorPickerHex}
+              onPickCanvasColor={handlePickTextCanvasColor}
               maskEditActive={isMaskEditActive}
               onTransformMask={handleTransformMaskOnCanvas}
+              curveEditActive={isCurveEditOverlayActive}
+              selectedCurvePointId={selectedCurvePointId}
+              onSelectCurvePoint={setSelectedCurvePointId}
+              onUpdateCurvePoints={handleUpdateCurvePoints}
               onLockLayer={sendLayerLock}
               onSelectClip={setSelectedClipId}
+              onDoubleClickTextClip={handleDoubleClickTextClip}
               onTransformClip={handleTransformClipOnCanvas}
             />
           </div>
@@ -2142,7 +2454,15 @@ export default function App() {
       </div>
 
       {/* Multi-Track Dynamic Timeline OR Alight Motion Trackpad / Mobile Tool Overlays */}
-      <div className="relative h-[220px] shrink-0 sm:h-[245px] lg:h-[260px]">
+      <div
+        className={`relative shrink-0 ${
+          selectedClip?.track === 'text' &&
+          mobileEditTool === 'text' &&
+          !isTextColorPickerActive
+            ? 'h-[310px] sm:h-[330px] lg:h-[260px]'
+            : 'h-[220px] sm:h-[245px] lg:h-[260px]'
+        }`}
+      >
         {showTrackpad && selectedClip && selectedClip.track !== 'audio' ? (
           <TransformTrackpad
             clip={selectedClip}
@@ -2272,6 +2592,72 @@ export default function App() {
                     setShowVoiceRecorder(true);
                   }}
                   onNotify={showTransientNotice}
+                />
+              </div>
+            </div>
+          )}
+
+        {selectedClip &&
+          selectedClip.track === 'text' &&
+          mobileEditTool === 'text' &&
+          !isTextColorPickerActive && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <Type className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
+                  <span className="truncate text-xs font-semibold text-white">
+                    Текст и стилизация
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTextColorPicker(null);
+                    setMobileEditTool(null);
+                  }}
+                  className="rounded-md bg-cyan-500 px-2.5 py-1 text-[11px] font-bold text-zinc-950 hover:bg-cyan-400 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <TextPanel
+                  compactLayout
+                  selectedClip={selectedClip}
+                  clips={project.clips}
+                  customFonts={project.customFonts ?? []}
+                  currentTime={currentTime}
+                  autoFocusTrigger={textFocusTrigger}
+                  activeColorPickerField={
+                    isTextColorPickerActive && textColorPicker
+                      ? textColorPicker.field
+                      : null
+                  }
+                  onRequestColorPicker={(field) => {
+                    if (!field) {
+                      setTextColorPicker(null);
+                      return;
+                    }
+                    setShowChromaKeyPanel(false);
+                    setTextColorPicker({clipId: selectedClip.id, field});
+                  }}
+                  curveEditActive={curveEditActive}
+                  onSetCurveEditActive={setCurveEditActive}
+                  selectedCurvePointId={selectedCurvePointId}
+                  onSelectCurvePoint={setSelectedCurvePointId}
+                  onSelectClip={(id) => {
+                    setSelectedClipId(id);
+                    setTextFocusTrigger((n) => n + 1);
+                  }}
+                  onAddText={handleAddText}
+                  onUpdateClip={updateClip}
+                  onAddCustomFont={addCustomFont}
+                  onOpenTrackpad={() => {
+                    setMobileEditTool(null);
+                    setShowTrackpad(true);
+                  }}
+                  onAddKeyframe={handleAddKeyframeAtPlayhead}
+                  hasKeyframeAtPlayhead={hasKeyframeAtPlayhead}
                 />
               </div>
             </div>
@@ -2726,25 +3112,40 @@ export default function App() {
             )}
             <button
               type="button"
-              onClick={() =>
-                setMobileSheet(
-                  selectedClip.track === 'text'
-                    ? 'text'
-                    : selectedClip.track === 'audio'
-                      ? 'audio'
-                      : 'effects'
-                )
-              }
-              className="flex h-11 min-w-[62px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
+              onClick={() => {
+                if (selectedClip.track === 'text') {
+                  setShowOpacitySlider(false);
+                  setShowChromaKeyPanel(false);
+                  setShowTrackpad(false);
+                  setMobileEditTool((cur) => {
+                    const next = cur === 'text' ? null : 'text';
+                    if (next === 'text') {
+                      setTextFocusTrigger((n) => n + 1);
+                    }
+                    return next;
+                  });
+                } else {
+                  setMobileSheet(
+                    selectedClip.track === 'audio' ? 'audio' : 'effects'
+                  );
+                }
+              }}
+              className={`flex h-11 min-w-[66px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                selectedClip.track === 'text' && mobileEditTool === 'text'
+                  ? 'bg-cyan-500/20 text-cyan-300'
+                  : 'text-zinc-200 hover:bg-white/5'
+              }`}
             >
               {selectedClip.track === 'audio' ? (
                 <Music className="h-4 w-4 text-emerald-400" />
+              ) : selectedClip.track === 'text' ? (
+                <Type className="h-4 w-4 text-cyan-400" />
               ) : (
                 <Sparkles className="h-4 w-4 text-cyan-400" />
               )}
               <span>
                 {selectedClip.track === 'text'
-                  ? 'Шрифт'
+                  ? 'Текст/Стиль'
                   : selectedClip.track === 'audio'
                     ? 'Звук'
                     : 'Эффекты'}
@@ -2834,15 +3235,46 @@ export default function App() {
         </BottomSheet>
       )}
       {mobileSheet === 'text' && (
-        <BottomSheet title="Текст и шрифты" onClose={() => setMobileSheet(null)}>
+        <BottomSheet title="Текст и стилизация" onClose={() => setMobileSheet(null)}>
           <TextPanel
             selectedClip={selectedClip}
+            clips={project.clips}
             customFonts={project.customFonts ?? []}
             currentTime={currentTime}
-            onSeek={handleSeek}
+            autoFocusTrigger={textFocusTrigger}
+            activeColorPickerField={
+              isTextColorPickerActive && textColorPicker
+                ? textColorPicker.field
+                : null
+            }
+            onRequestColorPicker={(field) => {
+              if (!selectedClip || selectedClip.track !== 'text' || !field) {
+                setTextColorPicker(null);
+                return;
+              }
+              setMobileSheet(null);
+              setMobileEditTool('text');
+              setTextColorPicker({clipId: selectedClip.id, field});
+            }}
+            curveEditActive={curveEditActive}
+            onSetCurveEditActive={setCurveEditActive}
+            selectedCurvePointId={selectedCurvePointId}
+            onSelectCurvePoint={setSelectedCurvePointId}
+            onSelectClip={(id) => {
+              setSelectedClipId(id);
+              setMobileSheet(null);
+              setMobileEditTool('text');
+              setTextFocusTrigger((n) => n + 1);
+            }}
             onAddText={handleAddText}
-            onUpdateClip={(id, patch) => updateClip(id, patch)}
+            onUpdateClip={updateClip}
             onAddCustomFont={addCustomFont}
+            onOpenTrackpad={() => {
+              setMobileSheet(null);
+              setShowTrackpad(true);
+            }}
+            onAddKeyframe={handleAddKeyframeAtPlayhead}
+            hasKeyframeAtPlayhead={hasKeyframeAtPlayhead}
           />
         </BottomSheet>
       )}

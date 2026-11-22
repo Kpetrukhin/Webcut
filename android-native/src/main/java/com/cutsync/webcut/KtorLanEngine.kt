@@ -224,11 +224,35 @@ class KtorLanEngine(private val context: Context) {
             "gif" -> ContentType.Image.GIF
             "mp3" -> ContentType.Audio.MPEG
             "wav" -> ContentType("audio", "wav")
+            "ttf" -> ContentType("font", "ttf")
+            "otf" -> ContentType("font", "otf")
+            "woff" -> ContentType("font", "woff")
+            "woff2" -> ContentType("font", "woff2")
             else -> {
                 val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
                 if (mime != null) ContentType.parse(mime) else ContentType.Application.OctetStream
             }
         }
+    }
+
+    fun resolveCachedMediaFile(sourceUrl: String?, fileName: String? = null): File? {
+        if (!fileName.isNullOrEmpty()) {
+            val safe = File(fileName).name
+            registeredFiles[safe]?.takeIf { it.exists() }?.let { return it }
+            File(mediaDir, safe).takeIf { it.exists() }?.let { return it }
+        }
+        if (!sourceUrl.isNullOrEmpty() && sourceUrl.contains("/media/")) {
+            val rawPart = sourceUrl.substringAfterLast("/media/").substringBefore("?")
+            val decoded = try {
+                java.net.URLDecoder.decode(rawPart, "UTF-8")
+            } catch (_: Throwable) {
+                rawPart
+            }
+            val safe = File(decoded).name
+            registeredFiles[safe]?.takeIf { it.exists() }?.let { return it }
+            File(mediaDir, safe).takeIf { it.exists() }?.let { return it }
+        }
+        return null
     }
 
     fun ensureMediaServerStarted(): Int {

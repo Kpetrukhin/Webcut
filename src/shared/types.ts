@@ -126,16 +126,57 @@ export interface Track {
   hidden?: boolean;
 }
 
+export type TextBgMode = 'none' | 'chars' | 'lines' | 'block';
+
+export type TextCurveMode = 'none' | 'arc' | 'wave' | 'zigzag' | 'custom';
+
+export interface TextCurvePoint {
+  id: string;
+  x: number; // text-local coordinates at 720w reference (0 = text center)
+  y: number; // text-local coordinates at 720w reference (0 = baseline center)
+}
+
+export type TextAnimationType =
+  | 'none'
+  | 'fade'
+  | 'slide-up'
+  | 'slide-left'
+  | 'slide-right'
+  | 'scale-pop'
+  | 'typewriter'
+  | 'blur-spin';
+
 export interface TextStyle {
   fontSize: number;
   color: string;
   bgColor: string;
+  bgMode?: TextBgMode;
+  bgOpacity?: number; // 0..1
   fontWeight: 'normal' | 'bold';
+  fontStyle?: 'normal' | 'italic';
+  underline?: boolean;
   fontFamily?: string;
   fontSrc?: string;
   shadow?: boolean;
+  shadowColor?: string;
+  shadowOffsetX?: number;
+  shadowOffsetY?: number;
+  shadowBlur?: number;
   outline?: boolean;
+  strokeColor?: string;
+  strokeWidth?: number;
   letterSpacing?: number;
+  lineHeight?: number;
+  spaceWidth?: number;
+  curveMode?: TextCurveMode;
+  curveAmplitude?: number; // -100..100
+  curveFrequency?: number; // 0.5..8
+  curvePoints?: TextCurvePoint[];
+  curveSmoothness?: number; // 0..100 (0 = sharp segments, 100 = smooth Catmull-Rom)
+  animIn?: TextAnimationType;
+  animInDuration?: number; // seconds 0.1..3.0
+  animOut?: TextAnimationType;
+  animOutDuration?: number; // seconds 0.1..3.0
   x: number; // normalized 0..1
   y: number; // normalized 0..1
   align: 'left' | 'center' | 'right';
@@ -196,6 +237,7 @@ export interface Clip {
   chromaKeyColor?: string;
   chromaKeyIntensity?: number;
   chromaKeySmoothness?: number;
+  isSticker?: boolean;
   mediaStatus?: 'READY' | 'DOWNLOADING' | 'ERROR';
   mediaFileName?: string;
   mediaRemoteUrl?: string;

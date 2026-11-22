@@ -261,4 +261,31 @@ class LanSyncPlugin : Plugin() {
             }
         }
     }
+
+    @PluginMethod
+    fun renderTextBitmap(call: PluginCall) {
+        val text = call.getString("text") ?: ""
+        val styleJson = call.getObject("style")
+        val scaleFactor = (call.getDouble("scaleFactor", 1.0) ?: 1.0).toFloat()
+        CoroutineScope(Dispatchers.Default).launch {
+            try {
+                val (width, height, base64) = TextBitmapRenderer.renderToPngBase64(
+                    context = context,
+                    text = text,
+                    styleJson = styleJson,
+                    scaleFactor = scaleFactor,
+                    engine = engine
+                )
+                call.resolve(
+                    JSObject().apply {
+                        put("width", width)
+                        put("height", height)
+                        put("base64", base64)
+                    }
+                )
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Failed to render text bitmap")
+            }
+        }
+    }
 }

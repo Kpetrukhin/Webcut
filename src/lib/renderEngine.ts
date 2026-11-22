@@ -14,6 +14,7 @@ import {loadCustomFont, preloadProjectFonts} from './fontLoader.ts';
 import {evaluateClipTransform} from './keyframeEngine.ts';
 import {applyMaskToCanvas, drawMaskInteractiveGuide} from './maskEngine.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
+import {drawTextClipCanvas} from './textRenderer.ts';
 
 let clipScratchCanvas: HTMLCanvasElement | null = null;
 function getClipScratchCtx(cw: number, ch: number): {
@@ -768,156 +769,17 @@ function drawTextClip(
   collaborators: Collaborator[],
   currentUserId?: string
 ) {
-  const style = clip.textStyle ?? {
-    fontSize: 48,
-    color: '#ffffff',
-    bgColor: 'rgba(9,9,11,0.72)',
-    fontWeight: 'bold',
-    x: 0.5,
-    y: 0.78,
-    align: 'center',
-  };
-
-  if (style.fontFamily && style.fontSrc) {
-    void loadCustomFont(style.fontFamily, style.fontSrc);
-  }
-
-  const kf = evaluateClipTransform(clip, time);
-  const textVal = clip.text ?? clip.name;
-  const elapsed = time - clip.start;
-  const remaining = clip.start + clip.duration - time;
-  const transDur = Math.min(0.35, clip.duration * 0.3);
-  let alpha = kf.opacity;
-  if (clip.transitionIn === 'fade' && elapsed < transDur) {
-    alpha *= Math.max(0, elapsed / transDur);
-  }
-  if (clip.transitionOut === 'fade' && remaining < transDur) {
-    alpha *= Math.max(0, remaining / transDur);
-  }
-
-  const scaleFactor = cw / 720;
-  const fontSize = Math.round(style.fontSize * scaleFactor * kf.scale);
-  const fontFamily = style.fontFamily
-    ? `"${style.fontFamily}", "Plus Jakarta Sans", sans-serif`
-    : '"Plus Jakarta Sans", sans-serif';
-
-  ctx.save();
-  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-  ctx.font = `${style.fontWeight === 'bold' ? '700' : '500'} ${fontSize}px ${fontFamily}`;
-  ctx.textAlign = style.align;
-  ctx.textBaseline = 'middle';
-
-  const lines = textVal.split('\n');
-  const lineHeight = fontSize * 1.25;
-  let maxLineW = 0;
-  for (const line of lines) {
-    const m = ctx.measureText(line);
-    if (m.width > maxLineW) maxLineW = m.width;
-  }
-
-  const padX = fontSize * 0.45;
-  const padY = fontSize * 0.28;
-  const boxW = maxLineW + padX * 2;
-  const boxH = lines.length * lineHeight + padY * 2;
-  const anchorX = cw * kf.x;
-  const anchorY = ch * kf.y;
-
-  let localBoxX = -boxW / 2;
-  if (style.align === 'left') localBoxX = -padX;
-  if (style.align === 'right') localBoxX = -boxW + padX;
-  const localBoxY = -boxH / 2;
-
-  const sxFactor = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
-  const syFactor = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
-
-  const drawTextBody = (targetCtx: CanvasRenderingContext2D, layerAlpha: number) => {
-    targetCtx.save();
-    targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
-    targetCtx.font = `${style.fontWeight === 'bold' ? '700' : '500'} ${fontSize}px ${fontFamily}`;
-    targetCtx.textAlign = style.align;
-    targetCtx.textBaseline = 'middle';
-
-    targetCtx.translate(anchorX, anchorY);
-    if (kf.rotation !== 0) {
-      targetCtx.rotate((kf.rotation * Math.PI) / 180);
-    }
-    if (sxFactor !== 1 || syFactor !== 1) {
-      targetCtx.scale(sxFactor, syFactor);
-    }
-
-    if (style.bgColor && style.bgColor !== 'transparent') {
-      targetCtx.fillStyle = style.bgColor;
-      targetCtx.beginPath();
-      targetCtx.roundRect(localBoxX, localBoxY, boxW, boxH, 16 * scaleFactor);
-      targetCtx.fill();
-    }
-
-    targetCtx.fillStyle = style.color;
-    if (style.shadow !== false) {
-      targetCtx.shadowColor = 'rgba(0,0,0,0.65)';
-      targetCtx.shadowBlur = 10 * scaleFactor;
-    }
-
-    lines.forEach((line, i) => {
-      const ly = -((lines.length - 1) * lineHeight) / 2 + i * lineHeight;
-      if (style.outline) {
-        targetCtx.lineWidth = Math.max(2, fontSize * 0.08);
-        targetCtx.strokeStyle = '#09090b';
-        targetCtx.strokeText(line, 0, ly);
-      }
-      targetCtx.fillText(line, 0, ly);
-    });
-    targetCtx.restore();
-  };
-
-  if (clip.mask) {
-    const scratch = getClipScratchCtx(cw, ch);
-    if (scratch) {
-      drawTextBody(scratch.ctx, 1);
-      applyMaskToCanvas(scratch.canvas, cw, ch, clip.mask);
-      ctx.save();
-      ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-      ctx.drawImage(scratch.canvas, 0, 0);
-      ctx.restore();
-    } else {
-      drawTextBody(ctx, alpha);
-    }
-  } else {
-    drawTextBody(ctx, alpha);
-  }
-
-  const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
-  if (clip.id === selectedClipId || peerLock) {
-    ctx.save();
-    ctx.translate(anchorX, anchorY);
-    if (kf.rotation !== 0) {
-      ctx.rotate((kf.rotation * Math.PI) / 180);
-    }
-    if (sxFactor !== 1 || syFactor !== 1) {
-      ctx.scale(sxFactor, syFactor);
-    }
-    ctx.strokeStyle = peerLock ? peerLock.color : '#22d3ee';
-    ctx.lineWidth = (peerLock ? 3 : 2.5) * scaleFactor;
-    ctx.strokeRect(
-      localBoxX - 6 * scaleFactor,
-      localBoxY - 6 * scaleFactor,
-      boxW + 12 * scaleFactor,
-      boxH + 12 * scaleFactor
-    );
-    if (peerLock) {
-      drawLockBadge(
-        ctx,
-        localBoxX - 6 * scaleFactor,
-        localBoxY - 6 * scaleFactor,
-        peerLock.name,
-        peerLock.color,
-        scaleFactor
-      );
-    }
-    ctx.restore();
-  }
-
-  ctx.restore();
+  drawTextClipCanvas(
+    ctx,
+    cw,
+    ch,
+    clip,
+    time,
+    selectedClipId,
+    collaborators,
+    currentUserId,
+    getClipScratchCtx
+  );
 }
 
 let sampleCanvas: HTMLCanvasElement | null = null;
@@ -999,6 +861,58 @@ export function sampleClipColorAtNormalizedPoint(
   try {
     const pixel = sctx.getImageData(0, 0, 1, 1).data;
     if (pixel[3] < 10) return null;
+    return rgbToHex(pixel[0], pixel[1], pixel[2]);
+  } catch {
+    return null;
+  }
+}
+
+let compositeSampleCanvas: HTMLCanvasElement | null = null;
+export function sampleCompositeColorAtNormalizedPoint(
+  nx: number,
+  ny: number,
+  cw: number,
+  ch: number,
+  clips: Clip[],
+  time: number,
+  pool: MediaPool,
+  tracks?: Track[],
+  backgroundColor?: string
+): string | null {
+  const sw = Math.max(180, Math.round(cw / 2));
+  const sh = Math.max(180, Math.round(ch / 2));
+  if (!compositeSampleCanvas) {
+    compositeSampleCanvas = document.createElement('canvas');
+  }
+  if (
+    compositeSampleCanvas.width !== sw ||
+    compositeSampleCanvas.height !== sh
+  ) {
+    compositeSampleCanvas.width = sw;
+    compositeSampleCanvas.height = sh;
+  }
+  const sctx = compositeSampleCanvas.getContext('2d', {
+    willReadFrequently: true,
+  });
+  if (!sctx) return null;
+
+  renderCompositeFrame(
+    sctx,
+    sw,
+    sh,
+    clips,
+    time,
+    pool,
+    null,
+    [],
+    tracks,
+    backgroundColor
+  );
+
+  const px = Math.max(0, Math.min(sw - 1, Math.floor(nx * sw)));
+  const py = Math.max(0, Math.min(sh - 1, Math.floor(ny * sh)));
+  try {
+    const pixel = sctx.getImageData(px, py, 1, 1).data;
     return rgbToHex(pixel[0], pixel[1], pixel[2]);
   } catch {
     return null;

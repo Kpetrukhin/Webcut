@@ -14,6 +14,7 @@ import {
   VolumeX,
 } from 'lucide-react';
 import type {Clip, Collaborator, Track, TrackType} from '../shared/types.ts';
+import {getTextAnimationSpec} from '../lib/textRenderer.ts';
 import {ScrubNumberField} from './ScrubNumberField.tsx';
 
 const BASE_PX_PER_SEC = 64;
@@ -806,11 +807,60 @@ export const Timeline: React.FC<TimelineProps> = ({
                             className="pointer-events-none absolute inset-0 opacity-45"
                             style={{
                               backgroundImage: `url(${clip.src})`,
-                              backgroundSize: 'auto 100%',
-                              backgroundRepeat: 'repeat-x',
+                              backgroundSize: clip.isSticker ? 'contain' : 'auto 100%',
+                              backgroundRepeat: clip.isSticker ? 'space' : 'repeat-x',
                             }}
                           />
                         )}
+
+                        {clip.track === 'text' &&
+                          (() => {
+                            const animSpec = getTextAnimationSpec(clip);
+                            const inW =
+                              animSpec.inType !== 'none'
+                                ? Math.min(
+                                    widthPx,
+                                    Math.max(4, animSpec.inDuration * pxPerSec)
+                                  )
+                                : 0;
+                            const outW =
+                              animSpec.outType !== 'none'
+                                ? Math.min(
+                                    widthPx,
+                                    Math.max(4, animSpec.outDuration * pxPerSec)
+                                  )
+                                : 0;
+                            return (
+                              <>
+                                {inW > 0 && (
+                                  <div
+                                    style={{width: `${inW}px`}}
+                                    title={`Ввод: ${animSpec.inDuration.toFixed(1)}с`}
+                                    className="pointer-events-none absolute top-0 bottom-0 left-0 z-10 border-r border-cyan-300/75 bg-gradient-to-r from-cyan-400/45 via-cyan-400/20 to-cyan-400/5"
+                                  >
+                                    {inW >= 24 && (
+                                      <span className="absolute top-0.5 left-1 rounded bg-cyan-400/80 px-1 font-mono text-[8px] font-bold leading-tight text-zinc-950">
+                                        IN {animSpec.inDuration.toFixed(1)}с
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                                {outW > 0 && (
+                                  <div
+                                    style={{width: `${outW}px`}}
+                                    title={`Вывод: ${animSpec.outDuration.toFixed(1)}с`}
+                                    className="pointer-events-none absolute top-0 right-0 bottom-0 z-10 border-l border-violet-300/75 bg-gradient-to-l from-violet-400/45 via-violet-400/20 to-violet-400/5"
+                                  >
+                                    {outW >= 26 && (
+                                      <span className="absolute top-0.5 right-1 rounded bg-violet-400/85 px-1 font-mono text-[8px] font-bold leading-tight text-zinc-950">
+                                        OUT {animSpec.outDuration.toFixed(1)}с
+                                      </span>
+                                    )}
+                                  </div>
+                                )}
+                              </>
+                            );
+                          })()}
 
                         {isDownloading && (
                           <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1 bg-zinc-900/90">

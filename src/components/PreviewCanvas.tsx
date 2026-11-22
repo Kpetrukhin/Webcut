@@ -11,6 +11,7 @@ import type {
   ClipMask,
   Collaborator,
   ProjectFont,
+  TextCurvePoint,
   Track,
 } from '../shared/types.ts';
 import {preloadProjectFonts, subscribeFontLoads} from '../lib/fontLoader.ts';
@@ -21,7 +22,14 @@ import {
   MediaPool,
   renderCompositeFrame,
   sampleClipColorAtNormalizedPoint,
+  sampleCompositeColorAtNormalizedPoint,
 } from '../lib/renderEngine.ts';
+import {
+  canvasNormToTextLocal,
+  getTextCurveOverlayData,
+  hitTestTextClip,
+  normalizeTextStyle,
+} from '../lib/textRenderer.ts';
 
 export interface CanvasTransformPatch {
   x: number;
@@ -54,14 +62,26 @@ interface PreviewCanvasProps {
     hexColor: string,
     commit: boolean
   ) => void;
+  colorPickerActive?: boolean;
+  colorPickerPreviewHex?: string;
+  onPickCanvasColor?: (hexColor: string, commit: boolean) => void;
   maskEditActive?: boolean;
   onTransformMask?: (
     clipId: string,
     patch: Partial<ClipMask>,
     commit: boolean
   ) => void;
+  curveEditActive?: boolean;
+  selectedCurvePointId?: string | null;
+  onSelectCurvePoint?: (pointId: string | null) => void;
+  onUpdateCurvePoints?: (
+    clipId: string,
+    points: TextCurvePoint[],
+    commit: boolean
+  ) => void;
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onSelectClip: (clipId: string | null) => void;
+  onDoubleClickTextClip?: (clipId: string) => void;
   onTransformClip: (
     clipId: string,
     patch: CanvasTransformPatch,
@@ -111,10 +131,18 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   externalSnapGuides,
   chromaKeyPickerActive = false,
   onPickChromaKeyColor,
+  colorPickerActive = false,
+  colorPickerPreviewHex,
+  onPickCanvasColor,
   maskEditActive = false,
   onTransformMask,
+  curveEditActive = false,
+  selectedCurvePointId = null,
+  onSelectCurvePoint,
+  onUpdateCurvePoints,
   onLockLayer,
   onSelectClip,
+  onDoubleClickTextClip,
   onTransformClip,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -132,6 +160,10 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   const [pickerOffsetPx, setPickerOffsetPx] = useState<number>(() =>
     loadSavedNumber(PICKER_OFFSET_STORAGE_KEY, 52)
   );
+  const [hoverLinePos, setHoverLinePos] = useState<{
+    cx: number;
+    cy: number;
+  } | null>(null);
 
   const updatePickerOffset = (next: number) => {
     setPickerOffsetPx(next);
@@ -161,6 +193,15 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     origRotation: number;
     lastCommitted: CanvasTransformPatch;
   } | null>(null);
+  const curveDragRef = useRef<{
+    clipId: string;
+    pointId: string;
+    points: TextCurvePoint[];
+  } | null>(null);
+  const lastTextTapRef = useRef<{clipId: string; ts: number} | null>(null);
+  const lastCurvePointTapRef = useRef<{pointId: string; ts: number} | null>(
+    null
+  );
 
   const {width, height} = getCanvasDimensions(aspectRatio);
 
@@ -192,18 +233,22 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     : {x: false, y: false};
 
   useEffect(() => {
-    if (!chromaKeyPickerActive || !selectedClipId) {
+    if (!chromaKeyPickerActive && !colorPickerActive) {
       setDraggingPicker(false);
       return;
     }
-    const target = clips.find((c) => c.id === selectedClipId);
-    if (!target) return;
-    const tr = evaluateClipTransform(target, currentTime);
-    setPickerPos({
-      x: Math.max(0.08, Math.min(0.92, tr.x)),
-      y: Math.max(0.08, Math.min(0.92, tr.y)),
-    });
-  }, [chromaKeyPickerActive, selectedClipId]);
+    if (chromaKeyPickerActive && selectedClipId) {
+      const target = clips.find((c) => c.id === selectedClipId);
+      if (!target) return;
+      const tr = evaluateClipTransform(target, currentTime);
+      setPickerPos({
+        x: Math.max(0.08, Math.min(0.92, tr.x)),
+        y: Math.max(0.08, Math.min(0.92, tr.y)),
+      });
+    } else if (colorPickerActive) {
+      setPickerPos({x: 0.5, y: 0.45});
+    }
+  }, [chromaKeyPickerActive, colorPickerActive, selectedClipId]);
 
   useEffect(() => {
     if (!snapEnabled) {
@@ -322,8 +367,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     for (let i = activeVisual.length - 1; i >= 0; i--) {
       const c = activeVisual[i];
       if (c.track === 'text') {
-        const tr = evaluateClipTransform(c, currentTime);
-        if (Math.abs(nx - tr.x) < 0.28 && Math.abs(ny - tr.y) < 0.12) {
+        if (hitTestTextClip(c, nx, ny, width, height, currentTime)) {
           return c;
         }
       } else if (c.track === 'overlay') {
@@ -444,6 +488,63 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     return {x, y, snappedX, snappedY};
   };
 
+  const findClosestPolylinePoint = (
+    cx: number,
+    cy: number,
+    polyline: Array<{cx: number; cy: number; segIdx: number}>
+  ) => {
+    let bestDist = Infinity;
+    let bestCx = cx;
+    let bestCy = cy;
+    let bestSegIdx = 0;
+
+    for (let i = 0; i < polyline.length - 1; i++) {
+      const a = polyline[i];
+      const b = polyline[i + 1];
+      const abx = b.cx - a.cx;
+      const aby = b.cy - a.cy;
+      const lenSq = abx * abx + aby * aby;
+      let t = 0;
+      if (lenSq > 1e-6) {
+        t = Math.max(
+          0,
+          Math.min(1, ((cx - a.cx) * abx + (cy - a.cy) * aby) / lenSq)
+        );
+      }
+      const px = a.cx + abx * t;
+      const py = a.cy + aby * t;
+      const d = Math.hypot(cx - px, cy - py);
+      if (d < bestDist) {
+        bestDist = d;
+        bestCx = px;
+        bestCy = py;
+        bestSegIdx = a.segIdx;
+      }
+    }
+    return {distPx: bestDist, cx: bestCx, cy: bestCy, segIdx: bestSegIdx};
+  };
+
+  const activeCurveClip = selectedClipId
+    ? clips.find(
+        (c) =>
+          c.id === selectedClipId &&
+          c.track === 'text' &&
+          currentTime >= c.start &&
+          currentTime < c.start + c.duration &&
+          c.textStyle?.curveMode === 'custom'
+      ) ?? null
+    : null;
+
+  const curveOverlay =
+    curveEditActive &&
+    activeCurveClip &&
+    !isPlaying &&
+    showSelectionOutline &&
+    !chromaKeyPickerActive &&
+    !colorPickerActive
+      ? getTextCurveOverlayData(activeCurveClip, width, height, currentTime)
+      : null;
+
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -464,18 +565,131 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         ) ?? null
       : null;
 
+    if (activePointersRef.current.size >= 2) {
+      curveDragRef.current = null;
+      if (existingSelected) {
+        beginGestureForClip(existingSelected, maskEditActive && existingSelected.mask ? 'mask' : 'clip');
+      }
+      return;
+    }
+
+    if (curveOverlay && activeCurveClip && onUpdateCurvePoints) {
+      const pxPerCss = width / Math.max(1, rect.width);
+      const canvasX = nx * width;
+      const canvasY = ny * height;
+      const ptHitRadius = 22 * pxPerCss;
+      const lineHitRadius = 16 * pxPerCss;
+
+      let bestPt: (typeof curveOverlay.points)[number] | null = null;
+      let bestPtDist = Infinity;
+      for (const pt of curveOverlay.points) {
+        const d = Math.hypot(canvasX - pt.cx, canvasY - pt.cy);
+        if (d <= ptHitRadius && d < bestPtDist) {
+          bestPtDist = d;
+          bestPt = pt;
+        }
+      }
+
+      const rawPoints = normalizeTextStyle(activeCurveClip.textStyle).curvePoints;
+
+      if (bestPt) {
+        const now = Date.now();
+        if (
+          lastCurvePointTapRef.current &&
+          lastCurvePointTapRef.current.pointId === bestPt.id &&
+          now - lastCurvePointTapRef.current.ts < 320 &&
+          rawPoints.length > 2
+        ) {
+          lastCurvePointTapRef.current = null;
+          const idx = rawPoints.findIndex((p) => p.id === bestPt!.id);
+          const nextPts = rawPoints.filter((p) => p.id !== bestPt!.id);
+          const fallbackIdx = Math.max(0, Math.min(nextPts.length - 1, idx));
+          onSelectCurvePoint?.(nextPts[fallbackIdx]?.id ?? null);
+          onUpdateCurvePoints(activeCurveClip.id, nextPts, true);
+          return;
+        }
+        lastCurvePointTapRef.current = {pointId: bestPt.id, ts: now};
+        onSelectCurvePoint?.(bestPt.id);
+        if (
+          activeCurveClip.lockedByUserId &&
+          activeCurveClip.lockedByUserId !== currentUserId
+        ) {
+          onLockLayer?.(activeCurveClip.id, true);
+          return;
+        }
+        onLockLayer?.(activeCurveClip.id, true);
+        curveDragRef.current = {
+          clipId: activeCurveClip.id,
+          pointId: bestPt.id,
+          points: rawPoints,
+        };
+        setHoverLinePos(null);
+        return;
+      }
+
+      const closest = findClosestPolylinePoint(
+        canvasX,
+        canvasY,
+        curveOverlay.polyline
+      );
+      if (closest.distPx <= lineHitRadius) {
+        const {localX, localY} = canvasNormToTextLocal(
+          activeCurveClip,
+          closest.cx / width,
+          closest.cy / height,
+          width,
+          height,
+          currentTime
+        );
+        const newPt: TextCurvePoint = {
+          id: `pt-${Math.random().toString(36).slice(2, 7)}`,
+          x: Math.round(localX * 10) / 10,
+          y: Math.round(localY * 10) / 10,
+        };
+        const insertAt = Math.max(
+          1,
+          Math.min(rawPoints.length, closest.segIdx + 1)
+        );
+        const nextPts = [
+          ...rawPoints.slice(0, insertAt),
+          newPt,
+          ...rawPoints.slice(insertAt),
+        ];
+        onLockLayer?.(activeCurveClip.id, true);
+        onSelectCurvePoint?.(newPt.id);
+        onUpdateCurvePoints(activeCurveClip.id, nextPts, false);
+        curveDragRef.current = {
+          clipId: activeCurveClip.id,
+          pointId: newPt.id,
+          points: nextPts,
+        };
+        setHoverLinePos(null);
+        return;
+      }
+    }
+
     if (maskEditActive && existingSelected?.mask && onTransformMask) {
       beginGestureForClip(existingSelected, 'mask');
       return;
     }
 
-    if (activePointersRef.current.size >= 2 && existingSelected) {
-      beginGestureForClip(existingSelected, 'clip');
-      return;
-    }
-
     const hit = findHitClip(nx, ny);
     if (hit) {
+      if (hit.track === 'text' && activePointersRef.current.size === 1) {
+        const now = Date.now();
+        if (
+          lastTextTapRef.current &&
+          lastTextTapRef.current.clipId === hit.id &&
+          now - lastTextTapRef.current.ts < 340
+        ) {
+          lastTextTapRef.current = null;
+          onSelectClip(hit.id);
+          onDoubleClickTextClip?.(hit.id);
+          gestureRef.current = null;
+          return;
+        }
+        lastTextTapRef.current = {clipId: hit.id, ts: now};
+      }
       onSelectClip(hit.id);
       beginGestureForClip(hit, 'clip');
     } else if (existingSelected && activePointersRef.current.size === 1) {
@@ -509,14 +723,75 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   };
 
   const handlePointerMove = (e: React.PointerEvent<HTMLCanvasElement>) => {
-    if (!activePointersRef.current.has(e.pointerId)) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+
+    if (curveDragRef.current && activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, {x: e.clientX, y: e.clientY});
+      const pointers = Array.from(activePointersRef.current.values());
+      if (pointers.length >= 2) {
+        curveDragRef.current = null;
+      } else if (activeCurveClip && onUpdateCurvePoints) {
+        const nx = (e.clientX - rect.left) / rect.width;
+        const ny = (e.clientY - rect.top) / rect.height;
+        const {localX, localY} = canvasNormToTextLocal(
+          activeCurveClip,
+          nx,
+          ny,
+          width,
+          height,
+          currentTime
+        );
+        const drag = curveDragRef.current;
+        const nextPts = drag.points.map((pt) =>
+          pt.id === drag.pointId
+            ? {
+                ...pt,
+                x: Math.round(localX * 10) / 10,
+                y: Math.round(localY * 10) / 10,
+              }
+            : pt
+        );
+        drag.points = nextPts;
+        onUpdateCurvePoints(drag.clipId, nextPts, false);
+        return;
+      }
+    }
+
+    if (!activePointersRef.current.has(e.pointerId)) {
+      if (curveOverlay && e.pointerType === 'mouse' && rect.width > 0) {
+        const pxPerCss = width / Math.max(1, rect.width);
+        const canvasX = ((e.clientX - rect.left) / rect.width) * width;
+        const canvasY = ((e.clientY - rect.top) / rect.height) * height;
+        const nearExistingPt = curveOverlay.points.some(
+          (p) => Math.hypot(canvasX - p.cx, canvasY - p.cy) <= 18 * pxPerCss
+        );
+        if (nearExistingPt) {
+          setHoverLinePos(null);
+        } else {
+          const closest = findClosestPolylinePoint(
+            canvasX,
+            canvasY,
+            curveOverlay.polyline
+          );
+          if (closest.distPx <= 14 * pxPerCss) {
+            setHoverLinePos({cx: closest.cx, cy: closest.cy});
+          } else {
+            setHoverLinePos(null);
+          }
+        }
+      } else if (hoverLinePos) {
+        setHoverLinePos(null);
+      }
+      return;
+    }
+
     activePointersRef.current.set(e.pointerId, {x: e.clientX, y: e.clientY});
 
     const gesture = gestureRef.current;
-    const canvas = canvasRef.current;
-    if (!gesture || !canvas) return;
+    if (!gesture) return;
 
-    const rect = canvas.getBoundingClientRect();
     const pointers = Array.from(activePointersRef.current.values());
 
     if (pointers.length >= 2) {
@@ -584,6 +859,14 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       // ignore
     }
 
+    if (curveDragRef.current) {
+      const drag = curveDragRef.current;
+      curveDragRef.current = null;
+      onUpdateCurvePoints?.(drag.clipId, drag.points, true);
+      onLockLayer?.(drag.clipId, false);
+      return;
+    }
+
     const gesture = gestureRef.current;
     if (!gesture) return;
 
@@ -634,7 +917,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     commit: boolean
   ) => {
     const canvas = canvasRef.current;
-    if (!canvas || !selectedClipId || !onPickChromaKeyColor) return;
+    if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     if (rect.width <= 0 || rect.height <= 0) return;
 
@@ -649,6 +932,25 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     );
     setPickerPos({x: nx, y: ny});
 
+    if (colorPickerActive && onPickCanvasColor) {
+      const hex = sampleCompositeColorAtNormalizedPoint(
+        nx,
+        ny,
+        width,
+        height,
+        clips,
+        currentTime,
+        mediaPool,
+        tracks,
+        backgroundColor
+      );
+      if (hex) {
+        onPickCanvasColor(hex, commit);
+      }
+      return;
+    }
+
+    if (!selectedClipId || !onPickChromaKeyColor) return;
     const target = clips.find((c) => c.id === selectedClipId);
     if (!target) return;
     const hex = sampleClipColorAtNormalizedPoint(
@@ -817,77 +1119,163 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
+          onPointerLeave={() => setHoverLinePos(null)}
           onWheel={handleWheel}
           className="h-full w-full touch-none object-contain cursor-grab active:cursor-grabbing"
         />
 
-        {chromaKeyPickerActive &&
+        {curveOverlay && (
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            className="pointer-events-none absolute inset-0 z-10 h-full w-full"
+          >
+            {/* Dark contrast halo for visibility over bright or dark videos */}
+            <path
+              d={curveOverlay.pathD}
+              fill="none"
+              stroke="rgba(9, 9, 11, 0.78)"
+              strokeWidth={Math.max(4.5, width * 0.0075)}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+            {/* Interactive cyan spline line over text */}
+            <path
+              d={curveOverlay.pathD}
+              fill="none"
+              stroke="#22d3ee"
+              strokeWidth={Math.max(2.2, width * 0.0038)}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeDasharray={`${Math.max(6, width * 0.01)} ${Math.max(4, width * 0.0065)}`}
+            />
+
+            {/* Hover '+' hint on spline line */}
+            {hoverLinePos && (
+              <g>
+                <circle
+                  cx={hoverLinePos.cx}
+                  cy={hoverLinePos.cy}
+                  r={Math.max(7, width * 0.011)}
+                  fill="rgba(34, 211, 238, 0.35)"
+                  stroke="#ffffff"
+                  strokeWidth={Math.max(1.5, width * 0.0025)}
+                />
+              </g>
+            )}
+
+            {/* Draggable control points */}
+            {curveOverlay.points.map((pt, idx) => {
+              const isSelected = pt.id === selectedCurvePointId;
+              const baseR = Math.max(8, width * 0.0145);
+              const r = isSelected ? baseR * 1.25 : baseR;
+              return (
+                <g key={pt.id}>
+                  <circle
+                    cx={pt.cx}
+                    cy={pt.cy}
+                    r={r + Math.max(3, width * 0.005)}
+                    fill="rgba(9, 9, 11, 0.45)"
+                  />
+                  <circle
+                    cx={pt.cx}
+                    cy={pt.cy}
+                    r={r}
+                    fill={isSelected ? '#facc15' : '#22d3ee'}
+                    stroke="#ffffff"
+                    strokeWidth={Math.max(2, width * 0.0035)}
+                  />
+                  <text
+                    x={pt.cx}
+                    y={pt.cy - r - Math.max(6, width * 0.009)}
+                    textAnchor="middle"
+                    fill="#ffffff"
+                    stroke="rgba(9,9,11,0.85)"
+                    strokeWidth={Math.max(2.5, width * 0.004)}
+                    paintOrder="stroke"
+                    fontSize={Math.max(11, Math.round(width * 0.02))}
+                    fontWeight="700"
+                  >
+                    {idx + 1}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        )}
+
+        {((chromaKeyPickerActive &&
           activeSelectedClip &&
           (activeSelectedClip.kind === 'image' ||
-            activeSelectedClip.kind === 'video') && (
+            activeSelectedClip.kind === 'video')) ||
+          colorPickerActive) && (
+          <div
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              e.currentTarget.setPointerCapture(e.pointerId);
+              setDraggingPicker(true);
+              samplePickerAtClientCoords(e.clientX, e.clientY, false);
+            }}
+            onPointerMove={(e) => {
+              if (!draggingPicker) return;
+              e.stopPropagation();
+              samplePickerAtClientCoords(e.clientX, e.clientY, false);
+            }}
+            onPointerUp={(e) => {
+              if (!draggingPicker) return;
+              e.stopPropagation();
+              try {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+              } catch {
+                // ignore
+              }
+              setDraggingPicker(false);
+              samplePickerAtClientCoords(e.clientX, e.clientY, true);
+            }}
+            onPointerCancel={(e) => {
+              if (!draggingPicker) return;
+              setDraggingPicker(false);
+              samplePickerAtClientCoords(e.clientX, e.clientY, true);
+            }}
+            className="absolute inset-0 z-10 touch-none cursor-crosshair"
+          >
             <div
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                e.currentTarget.setPointerCapture(e.pointerId);
-                setDraggingPicker(true);
-                samplePickerAtClientCoords(e.clientX, e.clientY, false);
+              className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2"
+              style={{
+                left: `${pickerPos.x * 100}%`,
+                top: `${pickerPos.y * 100}%`,
               }}
-              onPointerMove={(e) => {
-                if (!draggingPicker) return;
-                e.stopPropagation();
-                samplePickerAtClientCoords(e.clientX, e.clientY, false);
-              }}
-              onPointerUp={(e) => {
-                if (!draggingPicker) return;
-                e.stopPropagation();
-                try {
-                  e.currentTarget.releasePointerCapture(e.pointerId);
-                } catch {
-                  // ignore
-                }
-                setDraggingPicker(false);
-                samplePickerAtClientCoords(e.clientX, e.clientY, true);
-              }}
-              onPointerCancel={(e) => {
-                if (!draggingPicker) return;
-                setDraggingPicker(false);
-                samplePickerAtClientCoords(e.clientX, e.clientY, true);
-              }}
-              className="absolute inset-0 z-10 touch-none cursor-crosshair"
             >
+              {/* Floating color loupe badge above crosshair while dragging */}
+              {draggingPicker && (
+                <div className="pointer-events-none absolute left-1/2 bottom-full mb-2 flex -translate-x-1/2 -translate-y-full justify-center">
+                  <div
+                    className="h-8 w-8 rounded-full border-2 border-white shadow-lg ring-2 ring-black/60"
+                    style={{
+                      backgroundColor: colorPickerActive
+                        ? colorPickerPreviewHex || '#ffffff'
+                        : activeSelectedClip?.chromaKeyColor || '#00ff00',
+                    }}
+                  />
+                </div>
+              )}
+
+              {/* Eyedropper Crosshair Ring */}
               <div
-                className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2"
+                className="relative flex h-11 w-11 items-center justify-center rounded-full border-2 border-white shadow-[0_0_0_2px_rgba(0,0,0,0.75)]"
                 style={{
-                  left: `${pickerPos.x * 100}%`,
-                  top: `${pickerPos.y * 100}%`,
+                  boxShadow: `0 0 0 2px rgba(0,0,0,0.75), inset 0 0 0 3px ${
+                    colorPickerActive
+                      ? colorPickerPreviewHex || '#ffffff'
+                      : activeSelectedClip?.chromaKeyColor || '#00ff00'
+                  }`,
                 }}
               >
-                {/* Floating color loupe badge above crosshair while dragging */}
-                {draggingPicker && (
-                  <div className="pointer-events-none absolute left-1/2 bottom-full mb-2 flex -translate-x-1/2 -translate-y-full justify-center">
-                    <div
-                      className="h-8 w-8 rounded-full border-2 border-white shadow-lg ring-2 ring-black/60"
-                      style={{
-                        backgroundColor:
-                          activeSelectedClip.chromaKeyColor || '#00ff00',
-                      }}
-                    />
-                  </div>
-                )}
-
-                {/* Eyedropper Crosshair Ring */}
-                <div
-                  className="relative flex h-11 w-11 items-center justify-center rounded-full border-2 border-white shadow-[0_0_0_2px_rgba(0,0,0,0.75)]"
-                  style={{
-                    boxShadow: `0 0 0 2px rgba(0,0,0,0.75), inset 0 0 0 3px ${activeSelectedClip.chromaKeyColor || '#00ff00'}`,
-                  }}
-                >
-                  <div className="h-3.5 w-[1.5px] bg-white shadow-[0_0_2px_#000]" />
-                  <div className="absolute h-[1.5px] w-3.5 bg-white shadow-[0_0_2px_#000]" />
-                </div>
+                <div className="h-3.5 w-[1.5px] bg-white shadow-[0_0_2px_#000]" />
+                <div className="absolute h-[1.5px] w-3.5 bg-white shadow-[0_0_2px_#000]" />
               </div>
             </div>
-          )}
+          </div>
+        )}
 
         {clips.length === 0 && (
           <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center p-4 text-center">
