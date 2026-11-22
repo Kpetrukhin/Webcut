@@ -106,7 +106,8 @@ export class MediaPool {
     clips: Clip[],
     time: number,
     isPlaying: boolean,
-    tracks?: Track[]
+    tracks?: Track[],
+    audioEngine?: StudioAudioEngine
   ) {
     const hiddenIds = new Set(
       (tracks ?? []).filter((t) => t.hidden).map((t) => t.id)
@@ -132,17 +133,29 @@ export class MediaPool {
       const activeClip = activeVideos.get(src);
       if (!activeClip) {
         if (!vid.paused) vid.pause();
+        audioEngine?.syncVideoElementAudio(vid, undefined, false, true);
         continue;
       }
 
       const targetTime =
         activeClip.trimStart +
         (time - activeClip.start) * (activeClip.speed || 1);
-      vid.playbackRate = activeClip.speed || 1;
-      const isMuted =
-        mutedIds.has(activeClip.trackId) || activeClip.volume <= 0.01;
-      vid.muted = isMuted;
-      vid.volume = isMuted ? 0 : Math.max(0, Math.min(1, activeClip.volume));
+      try {
+        vid.playbackRate = Math.max(
+          0.0625,
+          Math.min(16, activeClip.speed || 1)
+        );
+      } catch {
+        // Ignore unsupported browser playbackRate extremes
+      }
+      const trackMuted = mutedIds.has(activeClip.trackId);
+      const isMuted = trackMuted || activeClip.volume <= 0.01;
+      if (audioEngine) {
+        audioEngine.syncVideoElementAudio(vid, activeClip, isPlaying, trackMuted);
+      } else {
+        vid.muted = isMuted;
+        vid.volume = isMuted ? 0 : Math.max(0, Math.min(1, activeClip.volume));
+      }
 
       if (vid.readyState >= 1) {
         const clampedTarget = Math.min(
@@ -1219,7 +1232,13 @@ export async function exportProjectToVideo(opts: {
     const tick = () => {
       const elapsedSec = (performance.now() - startWall) / 1000;
       const t = Math.min(totalDuration, elapsedSec);
-      opts.pool.syncVideos(opts.clips, t, true, opts.tracks);
+      opts.pool.syncVideos(
+        opts.clips,
+        t,
+        true,
+        opts.tracks,
+        opts.audioEngine
+      );
       opts.audioEngine.sync(opts.clips, t, true, opts.tracks);
       renderCompositeFrame(
         ctx,
@@ -1238,7 +1257,13 @@ export async function exportProjectToVideo(opts: {
       if (t >= totalDuration) {
         opts.audioEngine.stopAll();
         opts.audioEngine.clearExportDestination();
-        opts.pool.syncVideos(opts.clips, 0, false, opts.tracks);
+        opts.pool.syncVideos(
+          opts.clips,
+          0,
+          false,
+          opts.tracks,
+          opts.audioEngine
+        );
         resolve();
         return;
       }

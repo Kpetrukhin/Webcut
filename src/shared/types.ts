@@ -141,6 +141,14 @@ export interface TextStyle {
   align: 'left' | 'center' | 'right';
 }
 
+export type VoiceEffectPreset =
+  | 'original'
+  | 'chipmunk'
+  | 'monster'
+  | 'robot'
+  | 'hall'
+  | 'radio';
+
 export interface Clip {
   id: string;
   track: TrackType;
@@ -153,6 +161,9 @@ export interface Clip {
   trimStart: number;
   sourceDuration: number;
   speed: number;
+  pitch?: number; // 0.5..2.0 (default 1.0)
+  linkSpeedPitch?: boolean;
+  voiceEffect?: VoiceEffectPreset;
   volume: number;
   opacity: number;
   filter: FilterPreset;
@@ -497,6 +508,19 @@ export const SYNTH_AUDIO_PRESETS: Array<{
     duration: 14,
     bpm: 72,
   },
+];
+
+export const VOICE_EFFECT_PRESETS: Array<{
+  id: VoiceEffectPreset;
+  label: string;
+  hint: string;
+}> = [
+  {id: 'original', label: 'Оригинал', hint: 'Чистый звук'},
+  {id: 'chipmunk', label: 'Бурундук', hint: 'Высокий + форманты'},
+  {id: 'monster', label: 'Бас / Монстр', hint: 'Глубокий бас'},
+  {id: 'robot', label: 'Робот', hint: 'Модуляция'},
+  {id: 'hall', label: 'Эхо / Зал', hint: 'Реверберация'},
+  {id: 'radio', label: 'Радио', hint: 'Телефонный фильтр'},
 ];
 
 export function createDefaultTracks(): Track[] {

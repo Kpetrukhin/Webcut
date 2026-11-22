@@ -15,6 +15,7 @@ import type {
 } from '../shared/types.ts';
 import {preloadProjectFonts, subscribeFontLoads} from '../lib/fontLoader.ts';
 import {evaluateClipTransform} from '../lib/keyframeEngine.ts';
+import type {StudioAudioEngine} from '../lib/audioEngine.ts';
 import {
   getCanvasDimensions,
   MediaPool,
@@ -41,6 +42,7 @@ interface PreviewCanvasProps {
   currentUserId?: string;
   collaborators: Collaborator[];
   mediaPool: MediaPool;
+  audioEngine?: StudioAudioEngine;
   snapEnabled?: boolean;
   onToggleSnap?: () => void;
   showSelectionOutline?: boolean;
@@ -101,6 +103,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   currentUserId,
   collaborators,
   mediaPool,
+  audioEngine,
   snapEnabled = true,
   onToggleSnap,
   showSelectionOutline = true,
@@ -217,7 +220,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    mediaPool.syncVideos(clips, currentTime, isPlaying, tracks);
+    mediaPool.syncVideos(clips, currentTime, isPlaying, tracks, audioEngine);
     renderCompositeFrame(
       ctx,
       width,

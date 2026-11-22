@@ -45,6 +45,18 @@ interface LanSyncPluginInterface {
     targetBitrate: number;
   }): Promise<{started: boolean}>;
   cancelCompressVideo(options: {layerId: string}): Promise<void>;
+  requestAudioPermission(): Promise<{granted: boolean}>;
+  extractAudio(options: {
+    sourceUrl: string;
+    fileName: string;
+    trimStartMs?: number;
+    durationMs?: number;
+  }): Promise<{
+    fileName: string;
+    localUrl: string;
+    shareUrl: string;
+    durationSec: number;
+  }>;
   addListener(
     eventName: 'udpRoomsUpdate',
     listenerFunc: (data: {rooms: DiscoveredUdpRoom[]}) => void
@@ -466,6 +478,42 @@ export async function cancelNativeVideoCompression(
   } catch {
     // ignore
   }
+}
+
+export async function requestNativeAudioPermission(): Promise<boolean> {
+  if (!hasNativeLanPlugin()) return true;
+  try {
+    const res = await LanSync.requestAudioPermission();
+    return Boolean(res.granted);
+  } catch {
+    return true;
+  }
+}
+
+export async function extractAudioNative(opts: {
+  sourceUrl: string;
+  fileName: string;
+  trimStartSec?: number;
+  durationSec?: number;
+}): Promise<{
+  fileName: string;
+  localSrc: string;
+  shareUrl: string;
+  durationSec: number;
+} | null> {
+  if (!hasNativeLanPlugin()) return null;
+  const res = await LanSync.extractAudio({
+    sourceUrl: opts.sourceUrl,
+    fileName: opts.fileName,
+    trimStartMs: Math.round((opts.trimStartSec ?? 0) * 1000),
+    durationMs: opts.durationSec ? Math.round(opts.durationSec * 1000) : -1,
+  });
+  return {
+    fileName: res.fileName,
+    localSrc: res.localUrl,
+    shareUrl: res.shareUrl,
+    durationSec: res.durationSec,
+  };
 }
 
 export async function compressClipMedia(opts: {

@@ -45,10 +45,7 @@ import {
   applyFilterPresetToClipPatch,
   findBuiltinPreset,
 } from '../lib/colorPresets.ts';
-import {
-  SAMPLE_MEDIA_ASSETS,
-  SYNTH_AUDIO_PRESETS,
-} from '../shared/types.ts';
+import {SAMPLE_MEDIA_ASSETS} from '../shared/types.ts';
 import type {
   BlendMode,
   ChatMessage,
@@ -1520,145 +1517,6 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
   );
 };
 
-/* =========================================================================
-   AUDIO PANEL
-   ========================================================================= */
-
-interface AudioPanelProps {
-  selectedClip: Clip | null;
-  onAddAudioClip: (opts: {
-    name: string;
-    kind: 'audio' | 'synth';
-    src: string;
-    duration: number;
-    forceNewTrack?: boolean;
-  }) => void;
-  onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
-  onClose?: () => void;
-}
-
-export const AudioPanel: React.FC<AudioPanelProps> = ({
-  selectedClip,
-  onAddAudioClip,
-  onUpdateClip,
-  onClose,
-}) => {
-  const [uploading, setUploading] = useState(false);
-
-  const handleAudioUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setUploading(true);
-    try {
-      const uploaded = await uploadOrLocalMedia(file, 'audio');
-      const dur = await probeMediaDuration(uploaded.src, 'audio');
-      onAddAudioClip({
-        name: uploaded.name,
-        kind: 'audio',
-        src: uploaded.src,
-        duration: Math.min(60, dur),
-        forceNewTrack: false,
-      });
-      onClose?.();
-    } catch {
-      // keep open
-    } finally {
-      setUploading(false);
-      e.target.value = '';
-    }
-  };
-
-  return (
-    <div className="space-y-4">
-      <label className="flex min-h-[52px] cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-emerald-500/40 bg-emerald-500/10 px-4 py-3 text-sm font-medium text-emerald-200 hover:bg-emerald-500/15">
-        <Upload className="h-4 w-4 text-emerald-400" />
-        <span>
-          {uploading ? 'Загрузка аудио...' : 'Загрузить музыку (MP3 / WAV)'}
-        </span>
-        <input
-          type="file"
-          accept="audio/*"
-          disabled={uploading}
-          onChange={handleAudioUpload}
-          className="hidden"
-        />
-      </label>
-
-      {selectedClip &&
-        (selectedClip.track === 'audio' || selectedClip.kind === 'video') && (
-          <div className="rounded-xl border border-white/10 bg-zinc-900/70 p-3">
-            <div className="mb-1 flex items-center justify-between gap-2 text-xs text-zinc-300">
-              <span className="truncate">Громкость: {selectedClip.name}</span>
-              <ScrubNumberField
-                compact
-                accent="emerald"
-                value={Math.round(selectedClip.volume * 100)}
-                min={0}
-                max={100}
-                step={1}
-                suffix="%"
-                ariaLabel="Громкость клипа"
-                onChange={(pct) =>
-                  onUpdateClip(selectedClip.id, {volume: pct / 100})
-                }
-              />
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={selectedClip.volume}
-              onChange={(e) =>
-                onUpdateClip(selectedClip.id, {volume: Number(e.target.value)})
-              }
-              className="w-full accent-emerald-400"
-            />
-          </div>
-        )}
-
-      <div>
-        <p className="mb-2 text-xs font-medium text-zinc-400">
-          Встроенные саундтреки (Web Audio)
-        </p>
-        <div className="space-y-2">
-          {SYNTH_AUDIO_PRESETS.map((preset) => (
-            <button
-              key={preset.id}
-              type="button"
-              onClick={() => {
-                onAddAudioClip({
-                  name: preset.name,
-                  kind: 'synth',
-                  src: preset.src,
-                  duration: preset.duration,
-                  forceNewTrack: false,
-                });
-                onClose?.();
-              }}
-              className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-white/10 bg-zinc-900 px-3.5 py-2 text-left hover:border-emerald-400/60 active:scale-[0.99]"
-            >
-              <div className="flex items-center gap-3 min-w-0">
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-400">
-                  <Music className="h-4 w-4" />
-                </div>
-                <div className="min-w-0">
-                  <p className="truncate text-xs font-medium text-white">
-                    {preset.name}
-                  </p>
-                  <p className="text-[11px] text-zinc-500">
-                    {preset.bpm} BPM · {preset.duration}с
-                  </p>
-                </div>
-              </div>
-              <Plus className="h-4 w-4 shrink-0 text-emerald-400" />
-            </button>
-          ))}
-        </div>
-      </div>
-    </div>
-  );
-};
 
 /* =========================================================================
    TEAM & CHAT PANEL
@@ -2388,10 +2246,10 @@ export const TOOL_TABS: Array<{
   icon: React.FC<{className?: string}>;
 }> = [
   {id: 'edit', label: 'Изменить', icon: Scissors},
+  {id: 'audio', label: 'Звук', icon: Music},
   {id: 'media', label: 'Медиа', icon: Plus},
   {id: 'overlay', label: 'Наложение', icon: Layers},
   {id: 'text', label: 'Текст', icon: Type},
   {id: 'effects', label: 'Эффекты', icon: Sparkles},
-  {id: 'audio', label: 'Аудио', icon: Music},
   {id: 'team', label: 'Чат/Сеть', icon: Users},
 ];

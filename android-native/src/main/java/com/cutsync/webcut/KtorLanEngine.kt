@@ -1,6 +1,10 @@
 package com.cutsync.webcut
 
 import android.content.Context
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Handler
@@ -1123,6 +1127,142 @@ class KtorLanEngine(private val context: Context) {
     fun cancelCompressVideo(layerId: String) {
         mainHandler.post {
             activeTransformers.remove(layerId)?.cancel()
+        }
+    }
+
+    /**
+     * Extracts the audio track from a video file into an M4A/AAC file inside mediaDir
+     * using MediaExtractor + MediaMuxer and returns local/share URLs plus durationSec.
+     */
+    suspend fun extractAudioFromVideo(
+        sourceUrl: String,
+        fileName: String,
+        trimStartMs: Long = 0L,
+        durationMs: Long = -1L
+    ): Triple<String, String, Double> = withContext(Dispatchers.IO) {
+        var inputFile: File? = null
+        val candidate = File(fileName).name
+        if (candidate.isNotEmpty()) {
+            val reg = registeredFiles[candidate]
+            val cached = File(mediaDir, candidate)
+            if (reg != null && reg.exists()) inputFile = reg
+            else if (cached.exists()) inputFile = cached
+        }
+        if (inputFile == null && sourceUrl.contains("/media/")) {
+            val rawPart = sourceUrl.substringAfterLast("/media/").substringBefore("?")
+            val decoded = java.net.URLDecoder.decode(rawPart, "UTF-8")
+            val safe = File(decoded).name
+            val reg = registeredFiles[safe]
+            val cached = File(mediaDir, safe)
+            if (reg != null && reg.exists()) inputFile = reg
+            else if (cached.exists()) inputFile = cached
+        }
+        if (inputFile == null && (sourceUrl.startsWith("http://") || sourceUrl.startsWith("https://"))) {
+            val tmpSrc = File(mediaDir, "ext-src-${System.currentTimeMillis()}.mp4")
+            httpClient.prepareGet(sourceUrl).execute { response ->
+                val channel = response.bodyAsChannel()
+                FileOutputStream(tmpSrc).use { fos ->
+                    while (!channel.isClosedForRead) {
+                        val packet = channel.readRemaining(32 * 1024)
+                        while (!packet.isEmpty) {
+                            fos.write(packet.readBytes())
+                        }
+                    }
+                }
+            }
+            inputFile = tmpSrc
+        }
+
+        val extractor = MediaExtractor()
+        try {
+            if (inputFile != null && inputFile.exists()) {
+                extractor.setDataSource(inputFile.absolutePath)
+            } else {
+                extractor.setDataSource(context, Uri.parse(sourceUrl), null)
+            }
+
+            var audioTrackIdx = -1
+            var audioFormat: MediaFormat? = null
+            for (i in 0 until extractor.trackCount) {
+                val fmt = extractor.getTrackFormat(i)
+                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("audio/")) {
+                    audioTrackIdx = i
+                    audioFormat = fmt
+                    break
+                }
+            }
+            if (audioTrackIdx < 0 || audioFormat == null) {
+                throw IllegalStateException("В этом видео нет звуковой дорожки")
+            }
+
+            val base = File(fileName.ifEmpty { "audio" }).nameWithoutExtension
+                .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                .ifEmpty { "audio" }
+            val outName = "ext-${System.currentTimeMillis()}-$base.m4a"
+            val outFile = File(mediaDir, outName)
+            if (outFile.exists()) outFile.delete()
+
+            extractor.selectTrack(audioTrackIdx)
+            val startUs = (trimStartMs * 1000L).coerceAtLeast(0L)
+            if (startUs > 0L) {
+                extractor.seekTo(startUs, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+            }
+            val endUs = if (durationMs > 0L) startUs + durationMs * 1000L else Long.MAX_VALUE
+
+            val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val muxTrackIdx = muxer.addTrack(audioFormat)
+            muxer.start()
+
+            val buf = java.nio.ByteBuffer.allocate(256 * 1024)
+            val info = android.media.MediaCodec.BufferInfo()
+            try {
+                while (true) {
+                    val sampleSize = extractor.readSampleData(buf, 0)
+                    if (sampleSize < 0) break
+                    val sampleTime = extractor.sampleTime
+                    if (sampleTime > endUs) break
+                    if (sampleTime >= startUs) {
+                        info.offset = 0
+                        info.size = sampleSize
+                        info.presentationTimeUs = (sampleTime - startUs).coerceAtLeast(0L)
+                        info.flags = extractor.sampleFlags
+                        muxer.writeSampleData(muxTrackIdx, buf, info)
+                    }
+                    extractor.advance()
+                }
+            } finally {
+                try {
+                    muxer.stop()
+                    muxer.release()
+                } catch (_: Throwable) {
+                }
+            }
+
+            val retriever = MediaMetadataRetriever()
+            var measuredDurSec = 0.0
+            try {
+                retriever.setDataSource(outFile.absolutePath)
+                val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                measuredDurSec = (durStr?.toLongOrNull() ?: 0L) / 1000.0
+            } catch (_: Throwable) {
+            } finally {
+                try {
+                    retriever.release()
+                } catch (_: Throwable) {
+                }
+            }
+
+            registeredFiles[outName] = outFile
+            ensureMediaServerStarted()
+            val localUrl = "http://127.0.0.1:$serverPort/media/$outName"
+            val shareUrl = "http://${getPrimaryIp()}:$serverPort/media/$outName"
+            Triple(outName, localUrl, if (measuredDurSec > 0) measuredDurSec else 5.0)
+        } finally {
+            try {
+                extractor.release()
+            } catch (_: Throwable) {
+            }
         }
     }
 

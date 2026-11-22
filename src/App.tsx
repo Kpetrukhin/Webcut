@@ -12,10 +12,12 @@ import {
   MessageSquare,
   Minimize2,
   Move,
+  Music,
   Palette,
   Pause,
   Pipette,
   Play,
+  Radio,
   Redo2,
   RefreshCw,
   RotateCcw,
@@ -58,6 +60,7 @@ import {
   hasExplicitRoomInUrl,
   useCollaborativeRoom,
 } from './hooks/useCollaborativeRoom.ts';
+import {AudioPanel} from './components/AudioPanel.tsx';
 import {ChromaKeyPanel} from './components/ChromaKeyPanel.tsx';
 import {ColorAdjustPanel} from './components/ColorAdjustPanel.tsx';
 import {CropEditorModal} from './components/CropEditorModal.tsx';
@@ -70,9 +73,9 @@ import {ScrubNumberField} from './components/ScrubNumberField.tsx';
 import {Timeline} from './components/Timeline.tsx';
 import {TransformPanel} from './components/TransformPanel.tsx';
 import {TransformTrackpad} from './components/TransformTrackpad.tsx';
+import {VoiceRecorderOverlay} from './components/VoiceRecorderOverlay.tsx';
 import {RoomsLobbyModal} from './components/RoomsLobbyModal.tsx';
 import {
-  AudioPanel,
   BottomSheet,
   CompressMediaModal,
   EffectsPanel,
@@ -160,6 +163,7 @@ export default function App() {
   const [showOpacitySlider, setShowOpacitySlider] = useState(false);
   const [showChromaKeyPanel, setShowChromaKeyPanel] = useState(false);
   const [showTrackpad, setShowTrackpad] = useState(false);
+  const [showVoiceRecorder, setShowVoiceRecorder] = useState(false);
   const [showCompressModal, setShowCompressModal] = useState(false);
   const [editSubMode, setEditSubMode] = useState<
     | 'menu'
@@ -171,7 +175,7 @@ export default function App() {
     | 'filters'
   >('menu');
   const [mobileEditTool, setMobileEditTool] = useState<
-    'transform' | 'mask' | 'adjust' | 'filters' | null
+    'transform' | 'mask' | 'adjust' | 'filters' | 'audio_speed' | 'audio_fx' | null
   >(null);
   const [showCropModal, setShowCropModal] = useState(false);
   const [customColorPresets, setCustomColorPresets] = useState<
@@ -222,22 +226,36 @@ export default function App() {
   }, [project.clips, selectedClipId]);
 
   useEffect(() => {
-    if (!selectedClip || selectedClip.track === 'audio') {
+    if (!selectedClip) {
       setShowOpacitySlider(false);
+      setShowChromaKeyPanel(false);
       setShowTrackpad(false);
+      setShowCompressModal(false);
+      setShowCropModal(false);
       setTrackpadSnapGuides({x: false, y: false});
       setMobileEditTool(null);
       setEditSubMode('menu');
+      return;
     }
-    if (
-      !selectedClip ||
-      (selectedClip.kind !== 'image' && selectedClip.kind !== 'video')
-    ) {
+
+    if (selectedClip.track === 'audio') {
+      setShowOpacitySlider(false);
+      setShowTrackpad(false);
+      setTrackpadSnapGuides({x: false, y: false});
+      setMobileEditTool((cur) =>
+        cur === 'audio_speed' || cur === 'audio_fx' ? cur : null
+      );
+      setEditSubMode('menu');
+    }
+
+    if (selectedClip.kind !== 'image' && selectedClip.kind !== 'video') {
       setShowChromaKeyPanel(false);
       setShowCompressModal(false);
       setShowCropModal(false);
       setMobileEditTool((cur) =>
-        cur === 'transform' ? cur : null
+        cur === 'transform' || cur === 'audio_speed' || cur === 'audio_fx'
+          ? cur
+          : null
       );
       setEditSubMode((cur) =>
         cur === 'transform' || cur === 'opacity' ? cur : 'menu'
@@ -627,22 +645,37 @@ export default function App() {
       name: string;
       kind: 'audio' | 'synth';
       src: string;
+      fileName?: string;
+      remoteUrl?: string;
       duration: number;
+      startTime?: number;
       forceNewTrack?: boolean;
     }) => {
-      const {clip} = addClip(
+      const start = Math.max(
+        0,
+        Math.round((opts.startTime ?? currentTime) * 100) / 100
+      );
+      const hasRemote = Boolean(opts.remoteUrl);
+      const {clip, newTrack} = addClip(
         {
           id: `clip-${Math.random().toString(36).slice(2, 9)}`,
           track: 'audio',
           kind: opts.kind,
           name: opts.name,
           src: opts.src,
-          start: Math.round(currentTime * 100) / 100,
+          mediaFileName: opts.fileName,
+          mediaRemoteUrl: opts.remoteUrl,
+          mediaStatus: 'READY',
+          downloadProgress: 100,
+          start,
           duration: opts.duration,
           trimStart: 0,
           sourceDuration: opts.kind === 'synth' ? 60 : opts.duration,
           speed: 1,
-          volume: 0.8,
+          pitch: 1,
+          linkSpeedPitch: false,
+          voiceEffect: 'original',
+          volume: 0.85,
           opacity: 1,
           filter: 'none',
           brightness: 1,
@@ -651,11 +684,23 @@ export default function App() {
           transitionIn: 'none',
           motionEffect: 'none',
         },
-        {forceNewTrack: opts.forceNewTrack}
+        {forceNewTrack: opts.forceNewTrack, skipWs: hasRemote}
       );
+
+      if (hasRemote && opts.remoteUrl) {
+        sendLayerMediaUpdated({
+          layerId: clip.id,
+          fileName: opts.fileName || opts.name,
+          mediaUrl: opts.remoteUrl,
+          localSrc: opts.src,
+          clip,
+          newTrack,
+        });
+      }
+
       setSelectedClipId(clip.id);
     },
-    [currentTime, addClip]
+    [currentTime, addClip, sendLayerMediaUpdated]
   );
 
   const handleTransformClipOnCanvas = useCallback(
@@ -1666,8 +1711,17 @@ export default function App() {
             {desktopTab === 'audio' && (
               <AudioPanel
                 selectedClip={selectedClip}
+                allClips={project.clips}
+                tracks={project.tracks}
+                duration={duration}
                 onAddAudioClip={handleAddAudioClip}
-                onUpdateClip={(id, patch) => updateClip(id, patch)}
+                onUpdateClip={updateClip}
+                onOpenRecorder={() => {
+                  setShowTrackpad(false);
+                  setMobileEditTool(null);
+                  setShowVoiceRecorder(true);
+                }}
+                onNotify={showTransientNotice}
               />
             )}
             {desktopTab === 'team' && (
@@ -1719,6 +1773,7 @@ export default function App() {
               currentUserId={user.id}
               collaborators={collaborators}
               mediaPool={mediaPoolRef.current}
+              audioEngine={audioEngineRef.current!}
               snapEnabled={snapEnabled}
               onToggleSnap={() => setSnapEnabled((v) => !v)}
               showSelectionOutline={showSelectionOutline}
@@ -2181,6 +2236,75 @@ export default function App() {
               </div>
             </div>
           )}
+
+        {selectedClip &&
+          (selectedClip.track === 'audio' || selectedClip.kind === 'video') &&
+          (mobileEditTool === 'audio_speed' ||
+            mobileEditTool === 'audio_fx') && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <span className="truncate text-xs font-semibold text-white">
+                  {mobileEditTool === 'audio_speed'
+                    ? `Скорость и Тон · ${selectedClip.name}`
+                    : `Голосовые эффекты · ${selectedClip.name}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/15 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <AudioPanel
+                  selectedClip={selectedClip}
+                  allClips={project.clips}
+                  tracks={project.tracks}
+                  duration={duration}
+                  initialSection={
+                    mobileEditTool === 'audio_speed' ? 'speed' : 'fx'
+                  }
+                  onAddAudioClip={handleAddAudioClip}
+                  onUpdateClip={updateClip}
+                  onOpenRecorder={() => {
+                    setMobileEditTool(null);
+                    setShowVoiceRecorder(true);
+                  }}
+                  onNotify={showTransientNotice}
+                />
+              </div>
+            </div>
+          )}
+
+        {showVoiceRecorder && (
+          <VoiceRecorderOverlay
+            currentTime={currentTime}
+            onStartPlayback={() => setIsPlaying(true)}
+            onStopPlayback={() => setIsPlaying(false)}
+            onMutePlaybackChange={(muted) => {
+              audioEngineRef.current?.setPlaybackMuted(muted);
+            }}
+            onRecordingSaved={(rec) => {
+              handleAddAudioClip({
+                name: rec.name,
+                kind: 'audio',
+                src: rec.src,
+                fileName: rec.fileName,
+                remoteUrl: rec.remoteUrl,
+                duration: rec.duration,
+                startTime: rec.startTime,
+                forceNewTrack: false,
+              });
+              showTransientNotice('Запись голоса добавлена на аудиодорожку');
+            }}
+            onClose={() => {
+              audioEngineRef.current?.setPlaybackMuted(false);
+              setIsPlaying(false);
+              setShowVoiceRecorder(false);
+            }}
+          />
+        )}
       </div>
 
       {/* Mobile Bottom Thumb Toolbar */}
@@ -2550,14 +2674,56 @@ export default function App() {
                 <span>PIP/Ключи</span>
               </button>
             )}
-            <button
-              type="button"
-              onClick={handleCycleSpeed}
-              className="flex h-11 min-w-[54px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
-            >
-              <Gauge className="h-4 w-4 text-cyan-400" />
-              <span>{selectedClip.speed}x</span>
-            </button>
+            {(selectedClip.track === 'audio' ||
+              selectedClip.kind === 'video') && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setShowChromaKeyPanel(false);
+                    setShowTrackpad(false);
+                    setShowVoiceRecorder(false);
+                    setMobileEditTool((cur) =>
+                      cur === 'audio_speed' ? null : 'audio_speed'
+                    );
+                  }}
+                  className={`flex h-11 min-w-[78px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    mobileEditTool === 'audio_speed'
+                      ? 'bg-emerald-500/20 text-emerald-300'
+                      : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Gauge className="h-4 w-4 text-emerald-400" />
+                  <span>
+                    {selectedClip.speed}x · {(selectedClip.pitch ?? 1).toFixed(2)}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setShowChromaKeyPanel(false);
+                    setShowTrackpad(false);
+                    setShowVoiceRecorder(false);
+                    setMobileEditTool((cur) =>
+                      cur === 'audio_fx' ? null : 'audio_fx'
+                    );
+                  }}
+                  className={`flex h-11 min-w-[72px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    mobileEditTool === 'audio_fx'
+                      ? 'bg-cyan-500/20 text-cyan-300'
+                      : selectedClip.voiceEffect &&
+                          selectedClip.voiceEffect !== 'original'
+                        ? 'text-cyan-300 hover:bg-white/5'
+                        : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Radio className="h-4 w-4 text-cyan-400" />
+                  <span>Голос FX</span>
+                </button>
+              </>
+            )}
             <button
               type="button"
               onClick={() =>
@@ -2571,7 +2737,11 @@ export default function App() {
               }
               className="flex h-11 min-w-[62px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
             >
-              <Sparkles className="h-4 w-4 text-cyan-400" />
+              {selectedClip.track === 'audio' ? (
+                <Music className="h-4 w-4 text-emerald-400" />
+              ) : (
+                <Sparkles className="h-4 w-4 text-cyan-400" />
+              )}
               <span>
                 {selectedClip.track === 'text'
                   ? 'Шрифт'
@@ -2580,6 +2750,19 @@ export default function App() {
                     : 'Эффекты'}
               </span>
             </button>
+            {selectedClip.kind === 'video' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileEditTool(null);
+                  setMobileSheet('audio');
+                }}
+                className="flex h-11 min-w-[58px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-emerald-300 hover:bg-white/5"
+              >
+                <Music className="h-4 w-4 text-emerald-400" />
+                <span>Звук</span>
+              </button>
+            )}
             <button
               type="button"
               onClick={() => {
@@ -2676,13 +2859,23 @@ export default function App() {
       )}
       {mobileSheet === 'audio' && (
         <BottomSheet
-          title="Музыка и звуковые дорожки"
+          title="Звук, голос и эффекты"
           onClose={() => setMobileSheet(null)}
         >
           <AudioPanel
             selectedClip={selectedClip}
+            allClips={project.clips}
+            tracks={project.tracks}
+            duration={duration}
             onAddAudioClip={handleAddAudioClip}
-            onUpdateClip={(id, patch) => updateClip(id, patch)}
+            onUpdateClip={updateClip}
+            onOpenRecorder={() => {
+              setMobileSheet(null);
+              setMobileEditTool(null);
+              setShowTrackpad(false);
+              setShowVoiceRecorder(true);
+            }}
+            onNotify={showTransientNotice}
             onClose={() => setMobileSheet(null)}
           />
         </BottomSheet>

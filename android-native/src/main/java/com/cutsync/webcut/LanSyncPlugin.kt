@@ -1,14 +1,29 @@
 package com.cutsync.webcut
 
+import android.Manifest
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
+import com.getcapacitor.PermissionState
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
 import com.getcapacitor.annotation.CapacitorPlugin
+import com.getcapacitor.annotation.Permission
+import com.getcapacitor.annotation.PermissionCallback
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 
-@CapacitorPlugin(name = "LanSync")
+@CapacitorPlugin(
+    name = "LanSync",
+    permissions = [
+        Permission(
+            strings = [Manifest.permission.RECORD_AUDIO],
+            alias = "microphone"
+        )
+    ]
+)
 class LanSyncPlugin : Plugin() {
     private lateinit var engine: KtorLanEngine
 
@@ -198,5 +213,52 @@ class LanSyncPlugin : Plugin() {
             engine.cancelCompressVideo(layerId)
         }
         call.resolve()
+    }
+
+    @PluginMethod
+    fun requestAudioPermission(call: PluginCall) {
+        if (getPermissionState("microphone") == PermissionState.GRANTED) {
+            call.resolve(JSObject().apply { put("granted", true) })
+            return
+        }
+        requestPermissionForAlias("microphone", call, "microphonePermsCallback")
+    }
+
+    @PermissionCallback
+    private fun microphonePermsCallback(call: PluginCall) {
+        val granted = getPermissionState("microphone") == PermissionState.GRANTED
+        call.resolve(JSObject().apply { put("granted", granted) })
+    }
+
+    @PluginMethod
+    fun extractAudio(call: PluginCall) {
+        val sourceUrl = call.getString("sourceUrl") ?: run {
+            call.reject("Missing sourceUrl")
+            return
+        }
+        val fileName = call.getString("fileName") ?: "video.mp4"
+        val trimStartMs = call.getDouble("trimStartMs", 0.0)?.toLong() ?: 0L
+        val durationMs = call.getDouble("durationMs", -1.0)?.toLong() ?: -1L
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val (outName, localUrl, durSec) = engine.extractAudioFromVideo(
+                    sourceUrl = sourceUrl,
+                    fileName = fileName,
+                    trimStartMs = trimStartMs,
+                    durationMs = durationMs
+                )
+                val shareUrl = "http://${engine.getPrimaryIp()}:${engine.getBoundPort()}/media/$outName"
+                call.resolve(
+                    JSObject().apply {
+                        put("fileName", outName)
+                        put("localUrl", localUrl)
+                        put("shareUrl", shareUrl)
+                        put("durationSec", durSec)
+                    }
+                )
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Failed to extract audio")
+            }
+        }
     }
 }
