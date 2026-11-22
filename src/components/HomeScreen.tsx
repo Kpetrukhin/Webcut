@@ -1,5 +1,6 @@
 import React, {useEffect, useState} from 'react';
 import {
+  Copy,
   Crown,
   Film,
   FolderOpen,
@@ -12,7 +13,12 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
-import type {AspectRatio, RoomSummary} from '../shared/types.ts';
+import type {
+  AspectRatio,
+  DiscoveredUdpRoom,
+  NetworkInterfaceInfo,
+  RoomSummary,
+} from '../shared/types.ts';
 import type {LocalProjectRecord} from '../lib/localProjects.ts';
 import {
   isNativeCapacitorApp,
@@ -31,6 +37,15 @@ export const BACKGROUND_PRESETS = [
   '#f4f4f5',
 ];
 
+const PROFILE_COLOR_PRESETS = [
+  '#22d3ee',
+  '#f97316',
+  '#a78bfa',
+  '#34d399',
+  '#fb7185',
+  '#facc15',
+];
+
 const ASPECT_OPTIONS: Array<{id: AspectRatio; label: string; hint: string}> = [
   {id: '9:16', label: '9:16', hint: 'Reels / Shorts'},
   {id: '16:9', label: '16:9', hint: 'YouTube / Горизонт'},
@@ -41,6 +56,10 @@ const ASPECT_OPTIONS: Array<{id: AspectRatio; label: string; hint: string}> = [
 interface HomeScreenProps {
   user: {id: string; name: string; color: string};
   serverUrl: string;
+  p2pMode: 'idle' | 'host' | 'client';
+  networkInterfaces: NetworkInterfaceInfo[];
+  hostPort: number;
+  udpRooms: DiscoveredUdpRoom[];
   status: 'connecting' | 'connected' | 'reconnecting' | 'offline';
   availableRooms: RoomSummary[];
   localProjects: LocalProjectRecord[];
@@ -56,12 +75,20 @@ interface HomeScreenProps {
   onDeleteLocalProject: (roomId: string) => void;
   onUpdateProfile: (name: string, color: string) => void;
   onConnectServer: (url: string) => void;
+  onStartHost: () => Promise<unknown>;
+  onStopHost: () => Promise<void>;
+  onConnectToHostIp: (ipOrUrl: string, targetRoomId?: string) => void;
+  onRefreshNetwork: () => void;
   onRefreshRooms: () => void;
 }
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
   user,
   serverUrl,
+  p2pMode,
+  networkInterfaces,
+  hostPort,
+  udpRooms,
   status,
   availableRooms,
   localProjects,
@@ -71,6 +98,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onDeleteLocalProject,
   onUpdateProfile,
   onConnectServer,
+  onStartHost,
+  onStopHost,
+  onConnectToHostIp,
+  onRefreshNetwork,
   onRefreshRooms,
 }) => {
   const [activeTab, setActiveTab] = useState<'projects' | 'team'>('projects');
@@ -84,12 +115,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [creating, setCreating] = useState(false);
 
   const [nameInput, setNameInput] = useState(user.name);
-  const [serverInput, setServerInput] = useState(serverUrl);
+  const [serverInput, setServerInput] = useState(
+    serverUrl ? serverUrl.replace(/^https?:\/\//, '') : ''
+  );
   const [scanningLan, setScanningLan] = useState(false);
   const [discoveredServers, setDiscoveredServers] = useState<DiscoveredServer[]>(
     []
   );
   const [subnetHint, setSubnetHint] = useState('');
+  const [copiedIp, setCopiedIp] = useState<string | null>(null);
+  const [startingHost, setStartingHost] = useState(false);
   const isNative = isNativeCapacitorApp();
 
   useEffect(() => {
@@ -97,12 +132,24 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   }, [user.name]);
 
   useEffect(() => {
-    setServerInput(serverUrl);
+    if (serverUrl) {
+      setServerInput(serverUrl.replace(/^https?:\/\//, ''));
+    }
   }, [serverUrl]);
 
   useEffect(() => {
     onRefreshRooms();
   }, [onRefreshRooms]);
+
+  const handleCopyIp = async (ipWithPort: string) => {
+    try {
+      await navigator.clipboard.writeText(ipWithPort);
+      setCopiedIp(ipWithPort);
+      setTimeout(() => setCopiedIp(null), 1500);
+    } catch {
+      // ignore clipboard errors
+    }
+  };
 
   const handleOpenCreateModal = (asTeamHost: boolean) => {
     setIsTeamHost(asTeamHost);
@@ -145,6 +192,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   };
 
+  const totalOnlineCount = availableRooms.length + udpRooms.length;
+
   return (
     <div className="flex h-[100dvh] w-full flex-col overflow-hidden bg-[#09090b] text-zinc-100">
       {/* Top Studio Home Header */}
@@ -160,30 +209,52 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             <div className="flex items-center gap-1.5 text-[11px] text-zinc-400">
               <span
                 className={`h-2 w-2 rounded-full ${
-                  status === 'connected'
-                    ? 'bg-emerald-400'
-                    : status === 'offline'
-                      ? 'bg-zinc-500'
-                      : 'bg-amber-400 animate-pulse'
+                  p2pMode === 'host'
+                    ? 'bg-emerald-400 animate-pulse'
+                    : status === 'connected'
+                      ? 'bg-emerald-400'
+                      : status === 'offline'
+                        ? 'bg-zinc-500'
+                        : 'bg-amber-400 animate-pulse'
                 }`}
               />
               <span>
-                {status === 'connected'
-                  ? 'Сервер подключён'
-                  : status === 'offline'
-                    ? 'Локальный режим'
-                    : 'Подключение...'}
+                {p2pMode === 'host'
+                  ? `Хост активен (:${hostPort})`
+                  : status === 'connected'
+                    ? 'P2P подключён'
+                    : status === 'offline'
+                      ? 'Локальный режим'
+                      : 'Подключение...'}
               </span>
             </div>
           </div>
         </div>
 
         {/* User Name & Color Quick Edit */}
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-2.5 py-1.5">
-            <span
-              style={{backgroundColor: user.color}}
-              className="h-2.5 w-2.5 shrink-0 rounded-full"
+        <div className="flex items-center gap-1.5 sm:gap-2">
+          <div className="hidden items-center gap-1 sm:flex">
+            {PROFILE_COLOR_PRESETS.slice(0, 4).map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => onUpdateProfile(nameInput, c)}
+                style={{backgroundColor: c}}
+                aria-label={`Цвет ${c}`}
+                className={`h-5 w-5 rounded-full border-2 transition ${
+                  user.color === c ? 'border-white scale-110' : 'border-transparent'
+                }`}
+              />
+            ))}
+          </div>
+          <div className="flex items-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-2 py-1">
+            <input
+              type="color"
+              value={user.color}
+              onChange={(e) => onUpdateProfile(nameInput, e.target.value)}
+              title="Ваш цвет блокировки и курсора"
+              aria-label="Ваш цвет участника"
+              className="h-5 w-5 shrink-0 cursor-pointer rounded-full border border-white/20 bg-transparent p-0"
             />
             <input
               type="text"
@@ -191,7 +262,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               onChange={(e) => setNameInput(e.target.value)}
               onBlur={() => onUpdateProfile(nameInput, user.color)}
               aria-label="Ваше имя"
-              className="w-24 bg-transparent text-xs font-medium text-white focus:outline-none sm:w-32"
+              className="w-20 bg-transparent text-xs font-medium text-white focus:outline-none sm:w-28"
             />
           </div>
         </div>
@@ -223,7 +294,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           >
             <Users className="h-4 w-4" />
             <span>Команда</span>
-            {availableRooms.length > 0 && (
+            {totalOnlineCount > 0 && (
               <span
                 className={`rounded-full px-1.5 py-0.5 text-[10px] font-bold ${
                   activeTab === 'team'
@@ -231,7 +302,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     : 'bg-emerald-500/20 text-emerald-400'
                 }`}
               >
-                {availableRooms.length}
+                {totalOnlineCount}
               </span>
             )}
           </button>
@@ -269,7 +340,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   <div className="flex items-center gap-2">
                     <span className="h-2.5 w-2.5 rounded-full bg-emerald-400 animate-pulse" />
                     <h2 className="text-xs font-semibold uppercase tracking-wider text-emerald-300">
-                      Проекты команды в сети ({availableRooms.length})
+                      Проекты команды в сети ({totalOnlineCount})
                     </h2>
                   </div>
                   <button
@@ -282,14 +353,53 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   </button>
                 </div>
 
-                {availableRooms.length === 0 ? (
+                {totalOnlineCount === 0 ? (
                   <div className="rounded-2xl border border-dashed border-white/10 bg-zinc-900/40 p-4 text-xs text-zinc-400">
                     {status === 'offline'
-                      ? 'Нет подключения к серверу команды. Перейдите во вкладку «Команда», чтобы найти сервер в Wi-Fi.'
+                      ? 'Нет подключения к хосту. Перейдите во вкладку «Команда», чтобы создать комнату (Хост) или подключиться по IP / UDP 8081.'
                       : 'Пока нет активных командных комнат. Глава команды может создать проект и он сразу появится здесь в зелёной рамке.'}
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                    {udpRooms.map((ur) => (
+                      <button
+                        key={`udp-${ur.ip}-${ur.roomId}`}
+                        type="button"
+                        onClick={() =>
+                          onConnectToHostIp(`${ur.ip}:${ur.port}`, ur.roomId)
+                        }
+                        className="group flex items-stretch gap-3 rounded-2xl border-2 border-emerald-500 bg-emerald-950/25 p-3.5 text-left shadow-[0_0_24px_rgba(16,185,129,0.16)] transition hover:bg-emerald-950/40 active:scale-[0.99]"
+                      >
+                        <div className="flex h-16 w-12 shrink-0 items-center justify-center rounded-xl border border-emerald-400/40 bg-zinc-950 font-mono text-[10px] font-bold text-emerald-300">
+                          {ur.aspectRatio}
+                        </div>
+                        <div className="flex min-w-0 flex-1 flex-col justify-between">
+                          <div>
+                            <div className="flex items-center justify-between gap-2">
+                              <h3 className="truncate text-sm font-bold text-white group-hover:text-emerald-200">
+                                {ur.title}
+                              </h3>
+                              <span className="flex shrink-0 items-center gap-1 rounded-md bg-emerald-500/20 px-1.5 py-0.5 text-[10px] font-medium text-emerald-300">
+                                <Crown className="h-2.5 w-2.5" />
+                                {ur.hostName}
+                              </span>
+                            </div>
+                            <p className="mt-0.5 font-mono text-[10px] text-zinc-400">
+                              UDP 8081 · {ur.ip}:{ur.port}
+                            </p>
+                          </div>
+                          <div className="mt-2 flex items-center justify-between">
+                            <span className="flex items-center gap-1.5 text-xs font-bold text-emerald-400">
+                              <span className="h-2 w-2 rounded-full bg-emerald-400" />
+                              • online ({ur.participants})
+                            </span>
+                            <span className="rounded-lg bg-emerald-500 px-2.5 py-1 text-[11px] font-bold text-zinc-950">
+                              Войти
+                            </span>
+                          </div>
+                        </div>
+                      </button>
+                    ))}
                     {availableRooms.map((room) => (
                       <button
                         key={room.roomId}
@@ -506,11 +616,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 </form>
               </div>
 
-              {/* Active Team Projects List */}
+              {/* Active Team Projects & UDP 8081 Rooms List */}
               <div className="space-y-2.5">
                 <div className="flex items-center justify-between">
                   <h3 className="text-xs font-semibold uppercase tracking-wider text-emerald-300">
-                    Доступные комнаты команды ({availableRooms.length})
+                    Доступные комнаты команды ({totalOnlineCount})
                   </h3>
                   <button
                     type="button"
@@ -521,6 +631,44 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     Обновить
                   </button>
                 </div>
+
+                {udpRooms.map((ur) => (
+                  <div
+                    key={`team-udp-${ur.ip}-${ur.roomId}`}
+                    className="flex items-center justify-between gap-3 rounded-2xl border-2 border-emerald-500 bg-emerald-950/25 p-3.5 shadow-[0_0_20px_rgba(16,185,129,0.14)]"
+                  >
+                    <div className="flex min-w-0 items-center gap-3">
+                      <div className="flex h-12 w-10 shrink-0 items-center justify-center rounded-lg border border-emerald-400/40 bg-zinc-950 font-mono text-[10px] font-bold text-emerald-300">
+                        {ur.aspectRatio}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <p className="truncate text-sm font-bold text-white">
+                            {ur.title}
+                          </p>
+                          <span className="rounded bg-emerald-500/20 px-1.5 py-0.5 text-[10px] text-emerald-300">
+                            Глава: {ur.hostName}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 flex items-center gap-2 text-xs font-semibold text-emerald-400">
+                          <span>• online</span>
+                          <span className="font-mono text-[11px] font-normal text-zinc-400">
+                            UDP 8081 · {ur.ip}:{ur.port}
+                          </span>
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        onConnectToHostIp(`${ur.ip}:${ur.port}`, ur.roomId)
+                      }
+                      className="h-10 shrink-0 rounded-xl bg-emerald-500 px-4 text-xs font-bold text-zinc-950 hover:bg-emerald-400"
+                    >
+                      Подключиться
+                    </button>
+                  </div>
+                ))}
 
                 {availableRooms.map((room) => (
                   <div
@@ -567,25 +715,111 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                 ))}
               </div>
 
-              {/* Wi-Fi / LAN Server Connection */}
+              {/* P2P Ktor Host & LAN / ZeroTier One Connection */}
               <div className="rounded-2xl border border-white/10 bg-[#141418] p-4 space-y-3">
-                <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2">
                     <Wifi className="h-4 w-4 text-cyan-400" />
-                    <h3 className="text-xs font-semibold text-white">
-                      Подключение к серверу (Wi-Fi / LAN)
-                    </h3>
+                    <div>
+                      <h3 className="text-xs font-semibold text-white">
+                        Локальный мультиплеер P2P (LAN / ZeroTier One)
+                      </h3>
+                      <p className="text-[10px] text-zinc-400">
+                        Ktor порт {hostPort} (WebSocket /sync + HTTP /media) · UDP 8081 маячок
+                      </p>
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={handleScanLan}
-                    disabled={scanningLan}
-                    className="flex items-center gap-1.5 rounded-lg border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1.5 text-[11px] font-medium text-cyan-300 hover:bg-cyan-500/20"
-                  >
-                    <Search className="h-3 w-3" />
-                    {scanningLan ? 'Поиск...' : 'Найти в Wi-Fi'}
-                  </button>
+                  <div className="flex items-center gap-1.5">
+                    {p2pMode === 'host' ? (
+                      <button
+                        type="button"
+                        onClick={() => void onStopHost()}
+                        className="rounded-lg border border-rose-500/40 bg-rose-500/15 px-2.5 py-1.5 text-[11px] font-semibold text-rose-300 hover:bg-rose-500/25"
+                      >
+                        Стоп хоста
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={startingHost}
+                        onClick={async () => {
+                          setStartingHost(true);
+                          try {
+                            await onStartHost();
+                          } finally {
+                            setStartingHost(false);
+                          }
+                        }}
+                        className="rounded-lg bg-emerald-500 px-3 py-1.5 text-[11px] font-bold text-zinc-950 hover:bg-emerald-400 disabled:opacity-50"
+                      >
+                        {startingHost ? 'Запуск...' : 'Создать комнату (Хост)'}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={onRefreshNetwork}
+                      className="rounded-lg border border-white/10 bg-zinc-900 px-2.5 py-1.5 text-[11px] text-zinc-200"
+                    >
+                      IP
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleScanLan}
+                      disabled={scanningLan}
+                      className="flex items-center gap-1 rounded-lg border border-cyan-500/35 bg-cyan-500/10 px-2.5 py-1.5 text-[11px] font-medium text-cyan-300 hover:bg-cyan-500/20"
+                    >
+                      <Search className="h-3 w-3" />
+                      {scanningLan ? 'Поиск...' : 'Скан'}
+                    </button>
+                  </div>
                 </div>
+
+                {/* Local & ZeroTier interfaces */}
+                {networkInterfaces.length > 0 && (
+                  <div className="space-y-1.5 rounded-xl border border-white/10 bg-zinc-950/75 p-2.5">
+                    <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+                      Ваши локальные IP (Wi-Fi / ZeroTier zt*):
+                    </p>
+                    <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                      {networkInterfaces.map((iface) => {
+                        const full = `${iface.ip}:${hostPort}`;
+                        return (
+                          <button
+                            key={`${iface.name}-${iface.ip}`}
+                            type="button"
+                            onClick={() => void handleCopyIp(full)}
+                            className="flex items-center justify-between rounded-lg border border-white/5 bg-zinc-900 px-2.5 py-1.5 text-left hover:border-cyan-400/50"
+                          >
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span
+                                className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${
+                                  iface.type === 'zerotier'
+                                    ? 'bg-violet-500/25 text-violet-300'
+                                    : iface.type === 'wifi'
+                                      ? 'bg-emerald-500/20 text-emerald-300'
+                                      : 'bg-zinc-800 text-zinc-300'
+                                }`}
+                              >
+                                {iface.type === 'zerotier'
+                                  ? 'ZeroTier'
+                                  : iface.type === 'wifi'
+                                    ? 'Wi-Fi'
+                                    : 'LAN'}
+                              </span>
+                              <span className="truncate font-mono text-xs text-white">
+                                {full}
+                              </span>
+                            </div>
+                            <span className="flex items-center gap-1 text-[10px] text-cyan-400">
+                              <Copy className="h-3 w-3" />
+                              {copiedIp === full ? 'OK' : ''}
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
 
                 {discoveredServers.length > 0 && (
                   <div className="space-y-1.5">
@@ -599,7 +833,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                           type="button"
                           onClick={() => {
                             onConnectServer(srv.url);
-                            setServerInput(srv.url);
+                            setServerInput(srv.url.replace(/^https?:\/\//, ''));
                           }}
                           className={`flex w-full items-center justify-between rounded-xl border px-3 py-2 text-left text-xs ${
                             active
@@ -638,7 +872,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   <form
                     onSubmit={(e) => {
                       e.preventDefault();
-                      onConnectServer(serverInput);
+                      if (!serverInput.trim()) return;
+                      onConnectToHostIp(serverInput.trim());
                     }}
                     className="flex flex-1 gap-2"
                   >
@@ -646,14 +881,14 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       type="text"
                       value={serverInput}
                       onChange={(e) => setServerInput(e.target.value)}
-                      placeholder="IP сервера (192.168.1.15) или https://..."
+                      placeholder="IP хоста (10.147.x.x ZeroTier или 192.168.x.x)"
                       className="h-10 flex-1 rounded-xl border border-white/10 bg-zinc-950 px-3 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
                     />
                     <button
                       type="submit"
-                      className="h-10 rounded-xl bg-zinc-800 px-3.5 text-xs font-semibold text-white hover:bg-zinc-700"
+                      className="h-10 rounded-xl bg-cyan-500 px-3.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400"
                     >
-                      OK
+                      Подкл.
                     </button>
                   </form>
                 </div>

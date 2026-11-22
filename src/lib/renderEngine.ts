@@ -7,6 +7,7 @@ import type {
   Track,
 } from '../shared/types.ts';
 import type {StudioAudioEngine} from './audioEngine.ts';
+import {applyChromaKeyShader, rgbToHex} from './chromaKeyShader.ts';
 import {loadCustomFont, preloadProjectFonts} from './fontLoader.ts';
 import {evaluateClipTransform} from './keyframeEngine.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
@@ -178,21 +179,120 @@ export function buildFilterString(
   return parts.length > 0 ? parts.join(' ') : 'none';
 }
 
+function drawLockBadge(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  name: string,
+  color: string,
+  sf: number
+) {
+  ctx.save();
+  ctx.font = `700 ${Math.round(13 * sf)}px "Plus Jakarta Sans", sans-serif`;
+  const label = `🔒 ${name}`;
+  const metrics = ctx.measureText(label);
+  const bw = metrics.width + 14 * sf;
+  const bh = 22 * sf;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.roundRect(x, y - bh - 4 * sf, bw, bh, 6 * sf);
+  ctx.fill();
+  ctx.fillStyle = '#09090b';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, x + 7 * sf, y - bh / 2 - 4 * sf);
+  ctx.restore();
+}
+
+function drawDownloadingStub(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  h: number,
+  clip: Clip,
+  sf: number
+) {
+  ctx.save();
+  ctx.fillStyle = 'rgba(24, 24, 27, 0.92)';
+  ctx.fillRect(-w / 2, -h / 2, w, h);
+
+  ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
+  ctx.lineWidth = 2 * sf;
+  ctx.setLineDash([8 * sf, 6 * sf]);
+  ctx.strokeRect(-w / 2 + 4 * sf, -h / 2 + 4 * sf, w - 8 * sf, h - 8 * sf);
+  ctx.setLineDash([]);
+
+  const pct = Math.max(0, Math.min(100, Math.round(clip.downloadProgress ?? 0)));
+  ctx.fillStyle = '#e4e4e7';
+  ctx.font = `600 ${Math.max(12, Math.round(16 * sf))}px "Plus Jakarta Sans", sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(
+    clip.name.slice(0, 22),
+    0,
+    -14 * sf,
+    Math.max(40, w - 24 * sf)
+  );
+
+  ctx.fillStyle = '#22d3ee';
+  ctx.font = `700 ${Math.max(11, Math.round(14 * sf))}px monospace`;
+  ctx.fillText(`Загрузка P2P... ${pct}%`, 0, 8 * sf);
+
+  const barW = Math.min(w * 0.72, 240 * sf);
+  const barH = 6 * sf;
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.beginPath();
+  ctx.roundRect(-barW / 2, 24 * sf, barW, barH, 3 * sf);
+  ctx.fill();
+
+  ctx.fillStyle = '#22d3ee';
+  ctx.beginPath();
+  ctx.roundRect(-barW / 2, 24 * sf, (barW * pct) / 100, barH, 3 * sf);
+  ctx.fill();
+  ctx.restore();
+}
+
+function getClipPeerLock(
+  clip: Clip,
+  collaborators: Collaborator[],
+  currentUserId?: string
+): {color: string; name: string} | null {
+  if (clip.lockedByUserId && clip.lockedByUserId !== currentUserId) {
+    return {
+      color: clip.lockedByUserColor || '#f97316',
+      name: clip.lockedByUserName || 'Участник',
+    };
+  }
+  const remoteOwner = collaborators.find((u) => u.selectedClipId === clip.id);
+  if (remoteOwner) {
+    return {color: remoteOwner.color, name: remoteOwner.name};
+  }
+  return null;
+}
+
 function drawCoverMedia(
   ctx: CanvasRenderingContext2D,
-  media: HTMLImageElement | HTMLVideoElement,
+  media: HTMLImageElement | HTMLVideoElement | null,
   cw: number,
   ch: number,
   clip: Clip,
   time: number,
   progress: number,
   selectedClipId: string | null,
-  collaborators: Collaborator[]
+  collaborators: Collaborator[],
+  currentUserId?: string
 ) {
   const mw =
-    media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
+    media instanceof HTMLVideoElement
+      ? media.videoWidth
+      : media instanceof HTMLImageElement
+        ? media.naturalWidth
+        : cw;
   const mh =
-    media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
+    media instanceof HTMLVideoElement
+      ? media.videoHeight
+      : media instanceof HTMLImageElement
+        ? media.naturalHeight
+        : ch;
   if (!mw || !mh) return;
 
   const kf = evaluateClipTransform(clip, time);
@@ -250,24 +350,43 @@ function drawCoverMedia(
   const drawH = mh * baseScale * zoom;
   const centerX = cw * kf.x + offsetX;
   const centerY = ch * kf.y + offsetY;
+  const sf = cw / 720;
 
   ctx.save();
   ctx.globalAlpha = Math.max(0, Math.min(1, transAlpha));
   ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
-  ctx.filter = buildFilterString(
-    clip.filter,
-    clip.brightness,
-    clip.contrast,
-    clip.saturate,
-    clip.blur
-  );
   ctx.translate(centerX, centerY);
   if (kf.rotation) ctx.rotate((kf.rotation * Math.PI) / 180);
-  if (clip.flipHorizontal) ctx.scale(-1, 1);
-  ctx.drawImage(media, -drawW / 2, -drawH / 2, drawW, drawH);
+
+  if (clip.mediaStatus === 'DOWNLOADING' || !media) {
+    drawDownloadingStub(ctx, drawW, drawH, clip, sf);
+  } else {
+    const sourceToDraw =
+      clip.chromaKeyEnabled &&
+      clip.chromaKeyColor &&
+      (clip.chromaKeyIntensity ?? 0) > 0
+        ? applyChromaKeyShader(
+            media,
+            mw,
+            mh,
+            clip.chromaKeyColor,
+            clip.chromaKeyIntensity ?? 0,
+            clip.chromaKeySmoothness ?? 0.1
+          )
+        : media;
+    ctx.filter = buildFilterString(
+      clip.filter,
+      clip.brightness,
+      clip.contrast,
+      clip.saturate,
+      clip.blur
+    );
+    if (clip.flipHorizontal) ctx.scale(-1, 1);
+    ctx.drawImage(sourceToDraw, -drawW / 2, -drawH / 2, drawW, drawH);
+  }
   ctx.restore();
 
-  if (clip.vignette && clip.vignette > 0) {
+  if (clip.vignette && clip.vignette > 0 && media) {
     ctx.save();
     const grad = ctx.createRadialGradient(
       cw / 2,
@@ -284,16 +403,30 @@ function drawCoverMedia(
     ctx.restore();
   }
 
-  const remoteOwner = collaborators.find((u) => u.selectedClipId === clip.id);
-  if (clip.id === selectedClipId || remoteOwner) {
-    const sf = cw / 720;
+  const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
+  if (clip.id === selectedClipId || peerLock) {
+    const strokeCol = peerLock ? peerLock.color : '#22d3ee';
     ctx.save();
     ctx.translate(centerX, centerY);
     if (kf.rotation) ctx.rotate((kf.rotation * Math.PI) / 180);
-    ctx.strokeStyle =
-      clip.id === selectedClipId ? '#22d3ee' : remoteOwner!.color;
-    ctx.lineWidth = 2.5 * sf;
-    ctx.strokeRect(-drawW / 2 + 2 * sf, -drawH / 2 + 2 * sf, drawW - 4 * sf, drawH - 4 * sf);
+    ctx.strokeStyle = strokeCol;
+    ctx.lineWidth = (peerLock ? 3 : 2.5) * sf;
+    ctx.strokeRect(
+      -drawW / 2 + 2 * sf,
+      -drawH / 2 + 2 * sf,
+      drawW - 4 * sf,
+      drawH - 4 * sf
+    );
+    if (peerLock) {
+      drawLockBadge(
+        ctx,
+        -drawW / 2 + 8 * sf,
+        -drawH / 2 + 28 * sf,
+        peerLock.name,
+        peerLock.color,
+        sf
+      );
+    }
     ctx.restore();
   }
 }
@@ -306,14 +439,17 @@ function drawOverlayClip(
   time: number,
   pool: MediaPool,
   selectedClipId: string | null,
-  collaborators: Collaborator[]
+  collaborators: Collaborator[],
+  currentUserId?: string
 ) {
   const media =
-    clip.kind === 'video' && clip.src
-      ? pool.getVideo(clip.src)
-      : clip.src
-        ? pool.getImage(clip.src)
-        : null;
+    clip.mediaStatus === 'DOWNLOADING'
+      ? null
+      : clip.kind === 'video' && clip.src
+        ? pool.getVideo(clip.src)
+        : clip.src
+          ? pool.getImage(clip.src)
+          : null;
 
   const mw =
     media instanceof HTMLVideoElement
@@ -335,6 +471,7 @@ function drawOverlayClip(
   const pipH = pipW / aspect;
   const cx = cw * kf.x;
   const cy = ch * kf.y;
+  const sf = cw / 720;
 
   const elapsed = time - clip.start;
   const remaining = clip.start + clip.duration - time;
@@ -355,7 +492,7 @@ function drawOverlayClip(
     if (clip.transitionOut === 'fade') alpha *= t;
   }
 
-  const radius = (clip.borderRadius ?? 20) * (cw / 720);
+  const radius = (clip.borderRadius ?? 20) * sf;
   const rotRad = (kf.rotation * Math.PI) / 180;
 
   ctx.save();
@@ -369,12 +506,27 @@ function drawOverlayClip(
   ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
   ctx.clip();
 
-  if (
-    media &&
+  if (clip.mediaStatus === 'DOWNLOADING' || !media) {
+    drawDownloadingStub(ctx, pipW, pipH, clip, sf);
+  } else if (
     (media instanceof HTMLImageElement || media.readyState >= 2) &&
     mw &&
     mh
   ) {
+    const sourceToDraw =
+      clip.chromaKeyEnabled &&
+      clip.chromaKeyColor &&
+      (clip.chromaKeyIntensity ?? 0) > 0
+        ? applyChromaKeyShader(
+            media,
+            mw,
+            mh,
+            clip.chromaKeyColor,
+            clip.chromaKeyIntensity ?? 0,
+            clip.chromaKeySmoothness ?? 0.1
+          )
+        : media;
+
     ctx.save();
     if (clip.flipHorizontal) ctx.scale(-1, 1);
     ctx.filter = buildFilterString(
@@ -384,7 +536,7 @@ function drawOverlayClip(
       clip.saturate,
       clip.blur
     );
-    ctx.drawImage(media, -pipW / 2, -pipH / 2, pipW, pipH);
+    ctx.drawImage(sourceToDraw, -pipW / 2, -pipH / 2, pipW, pipH);
     ctx.restore();
   }
   ctx.restore();
@@ -396,39 +548,39 @@ function drawOverlayClip(
     if (animScale !== 1) ctx.scale(animScale, animScale);
     ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
     ctx.strokeStyle = clip.borderColor || '#ffffff';
-    ctx.lineWidth = clip.borderWidth * (cw / 720);
+    ctx.lineWidth = clip.borderWidth * sf;
     ctx.beginPath();
     ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
     ctx.stroke();
     ctx.restore();
   }
 
-  const remoteOwner = collaborators.find((u) => u.selectedClipId === clip.id);
-  if (clip.id === selectedClipId || remoteOwner) {
-    const sf = cw / 720;
+  const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
+  if (clip.id === selectedClipId || peerLock) {
+    const strokeCol = peerLock ? peerLock.color : '#22d3ee';
     ctx.save();
     ctx.translate(cx, cy);
     if (rotRad !== 0) ctx.rotate(rotRad);
-    ctx.strokeStyle =
-      clip.id === selectedClipId ? '#22d3ee' : remoteOwner!.color;
-    ctx.lineWidth = 2.5 * sf;
+    ctx.strokeStyle = strokeCol;
+    ctx.lineWidth = (peerLock ? 3 : 2.5) * sf;
     ctx.beginPath();
     ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
     ctx.stroke();
 
-    // Corner handles for active turquoise selection frame
     const corners = [
       [-pipW / 2, -pipH / 2],
       [pipW / 2, -pipH / 2],
       [-pipW / 2, pipH / 2],
       [pipW / 2, pipH / 2],
     ];
-    ctx.fillStyle =
-      clip.id === selectedClipId ? '#22d3ee' : remoteOwner!.color;
+    ctx.fillStyle = strokeCol;
     for (const [hx, hy] of corners) {
       ctx.beginPath();
       ctx.arc(hx, hy, 5 * sf, 0, Math.PI * 2);
       ctx.fill();
+    }
+    if (peerLock) {
+      drawLockBadge(ctx, -pipW / 2, -pipH / 2, peerLock.name, peerLock.color, sf);
     }
     ctx.restore();
   }
@@ -441,7 +593,8 @@ function drawTextClip(
   clip: Clip,
   time: number,
   selectedClipId: string | null,
-  collaborators: Collaborator[]
+  collaborators: Collaborator[],
+  currentUserId?: string
 ) {
   const style = clip.textStyle ?? {
     fontSize: 48,
@@ -530,21 +683,99 @@ function drawTextClip(
     ctx.fillText(line, 0, ly);
   });
 
-  const remoteUser = collaborators.find((u) => u.selectedClipId === clip.id);
-  if (clip.id === selectedClipId || remoteUser) {
+  const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
+  if (clip.id === selectedClipId || peerLock) {
     ctx.shadowBlur = 0;
-    ctx.strokeStyle =
-      clip.id === selectedClipId ? '#22d3ee' : remoteUser!.color;
-    ctx.lineWidth = 2.5 * scaleFactor;
+    ctx.strokeStyle = peerLock ? peerLock.color : '#22d3ee';
+    ctx.lineWidth = (peerLock ? 3 : 2.5) * scaleFactor;
     ctx.strokeRect(
       localBoxX - 6 * scaleFactor,
       localBoxY - 6 * scaleFactor,
       boxW + 12 * scaleFactor,
       boxH + 12 * scaleFactor
     );
+    if (peerLock) {
+      drawLockBadge(
+        ctx,
+        localBoxX - 6 * scaleFactor,
+        localBoxY - 6 * scaleFactor,
+        peerLock.name,
+        peerLock.color,
+        scaleFactor
+      );
+    }
   }
 
   ctx.restore();
+}
+
+let sampleCanvas: HTMLCanvasElement | null = null;
+export function sampleClipColorAtNormalizedPoint(
+  clip: Clip,
+  nx: number,
+  ny: number,
+  cw: number,
+  ch: number,
+  time: number,
+  pool: MediaPool
+): string | null {
+  if (clip.kind !== 'image' && clip.kind !== 'video') return null;
+  if (!clip.src) return null;
+
+  const media =
+    clip.kind === 'video' ? pool.getVideo(clip.src) : pool.getImage(clip.src);
+  if (!media) return null;
+  if (media instanceof HTMLVideoElement && media.readyState < 2) return null;
+
+  const mw =
+    media instanceof HTMLVideoElement ? media.videoWidth : media.naturalWidth;
+  const mh =
+    media instanceof HTMLVideoElement ? media.videoHeight : media.naturalHeight;
+  if (!mw || !mh) return null;
+
+  if (!sampleCanvas) {
+    sampleCanvas = document.createElement('canvas');
+    sampleCanvas.width = 1;
+    sampleCanvas.height = 1;
+  }
+  const sctx = sampleCanvas.getContext('2d', {willReadFrequently: true});
+  if (!sctx) return null;
+
+  sctx.clearRect(0, 0, 1, 1);
+  sctx.save();
+  sctx.translate(-nx * cw, -ny * ch);
+
+  const kf = evaluateClipTransform(clip, time);
+  if (clip.track === 'overlay') {
+    const aspect = mw / mh;
+    const pipW = cw * kf.scale;
+    const pipH = pipW / aspect;
+    const cx = cw * kf.x;
+    const cy = ch * kf.y;
+    sctx.translate(cx, cy);
+    if (kf.rotation) sctx.rotate((kf.rotation * Math.PI) / 180);
+    if (clip.flipHorizontal) sctx.scale(-1, 1);
+    sctx.drawImage(media, -pipW / 2, -pipH / 2, pipW, pipH);
+  } else {
+    const baseScale = Math.max(cw / mw, ch / mh);
+    const drawW = mw * baseScale * kf.scale;
+    const drawH = mh * baseScale * kf.scale;
+    const cx = cw * kf.x;
+    const cy = ch * kf.y;
+    sctx.translate(cx, cy);
+    if (kf.rotation) sctx.rotate((kf.rotation * Math.PI) / 180);
+    if (clip.flipHorizontal) sctx.scale(-1, 1);
+    sctx.drawImage(media, -drawW / 2, -drawH / 2, drawW, drawH);
+  }
+  sctx.restore();
+
+  try {
+    const pixel = sctx.getImageData(0, 0, 1, 1).data;
+    if (pixel[3] < 10) return null;
+    return rgbToHex(pixel[0], pixel[1], pixel[2]);
+  } catch {
+    return null;
+  }
 }
 
 export function renderCompositeFrame(
@@ -558,7 +789,8 @@ export function renderCompositeFrame(
   collaborators: Collaborator[],
   tracks?: Track[],
   backgroundColor?: string,
-  snapGuides?: {x: boolean; y: boolean}
+  snapGuides?: {x: boolean; y: boolean},
+  currentUserId?: string
 ) {
   ctx.fillStyle = backgroundColor || '#09090b';
   ctx.fillRect(0, 0, cw, ch);
@@ -595,35 +827,47 @@ export function renderCompositeFrame(
       0,
       Math.min(1, (time - clip.start) / Math.max(0.01, clip.duration))
     );
-    if (clip.kind === 'image' && clip.src) {
+    if (clip.mediaStatus === 'DOWNLOADING') {
+      drawCoverMedia(
+        ctx,
+        null,
+        cw,
+        ch,
+        clip,
+        time,
+        progress,
+        selectedClipId,
+        collaborators,
+        currentUserId
+      );
+    } else if (clip.kind === 'image' && clip.src) {
       const img = pool.getImage(clip.src);
-      if (img)
-        drawCoverMedia(
-          ctx,
-          img,
-          cw,
-          ch,
-          clip,
-          time,
-          progress,
-          selectedClipId,
-          collaborators
-        );
+      drawCoverMedia(
+        ctx,
+        img,
+        cw,
+        ch,
+        clip,
+        time,
+        progress,
+        selectedClipId,
+        collaborators,
+        currentUserId
+      );
     } else if (clip.kind === 'video' && clip.src) {
       const vid = pool.getVideo(clip.src);
-      if (vid.readyState >= 2) {
-        drawCoverMedia(
-          ctx,
-          vid,
-          cw,
-          ch,
-          clip,
-          time,
-          progress,
-          selectedClipId,
-          collaborators
-        );
-      }
+      drawCoverMedia(
+        ctx,
+        vid.readyState >= 2 ? vid : null,
+        cw,
+        ch,
+        clip,
+        time,
+        progress,
+        selectedClipId,
+        collaborators,
+        currentUserId
+      );
     }
   }
 
@@ -637,13 +881,23 @@ export function renderCompositeFrame(
       time,
       pool,
       selectedClipId,
-      collaborators
+      collaborators,
+      currentUserId
     );
   }
 
   // 3. Text Tracks
   for (const clip of orderedClipsForType('text')) {
-    drawTextClip(ctx, cw, ch, clip, time, selectedClipId, collaborators);
+    drawTextClip(
+      ctx,
+      cw,
+      ch,
+      clip,
+      time,
+      selectedClipId,
+      collaborators,
+      currentUserId
+    );
   }
 
   // 4. Magnetic Center Snap Guide Lines

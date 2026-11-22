@@ -15,7 +15,9 @@ export type TrackpadMode = 'position' | 'scale' | 'rotation';
 interface TransformTrackpadProps {
   clip: Clip;
   currentTime: number;
+  currentUserId?: string;
   snapEnabled: boolean;
+  onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onTransformClip: (
     clipId: string,
     patch: CanvasTransformPatch,
@@ -42,7 +44,9 @@ function wrapRadiansDiff(diff: number): number {
 export const TransformTrackpad: React.FC<TransformTrackpadProps> = ({
   clip,
   currentTime,
+  currentUserId,
   snapEnabled,
+  onLockLayer,
   onTransformClip,
   onSnapGuidesChange,
   onClose,
@@ -185,6 +189,13 @@ export const TransformTrackpad: React.FC<TransformTrackpadProps> = ({
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     const pad = padRef.current;
     if (!pad) return;
+    if (clip.lockedByUserId && clip.lockedByUserId !== currentUserId) {
+      onLockLayer?.(clip.id, true);
+      return;
+    }
+    if (onLockLayer && onLockLayer(clip.id, true) === false) {
+      return;
+    }
     pad.setPointerCapture(e.pointerId);
     pointersRef.current.set(e.pointerId, {x: e.clientX, y: e.clientY});
     setIsTouching(true);
@@ -333,6 +344,7 @@ export const TransformTrackpad: React.FC<TransformTrackpadProps> = ({
       setIsTouching(false);
       setTouchReticle(null);
       onTransformClip(targetId, finalPatch, true);
+      onLockLayer?.(targetId, false);
     }
   };
 

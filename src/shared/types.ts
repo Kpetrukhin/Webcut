@@ -111,8 +111,38 @@ export interface Clip {
   borderColor?: string;
   flipHorizontal?: boolean;
   blendMode?: BlendMode;
+  chromaKeyEnabled?: boolean;
+  chromaKeyColor?: string;
+  chromaKeyIntensity?: number;
+  chromaKeySmoothness?: number;
+  mediaStatus?: 'READY' | 'DOWNLOADING' | 'ERROR';
+  mediaFileName?: string;
+  mediaRemoteUrl?: string;
+  downloadProgress?: number;
+  lockedByUserId?: string | null;
+  lockedByUserName?: string | null;
+  lockedByUserColor?: string | null;
   keyframes?: ClipKeyframe[];
   updatedBy?: string;
+}
+
+export interface NetworkInterfaceInfo {
+  name: string;
+  ip: string;
+  type: 'zerotier' | 'wifi' | 'lan';
+  label: string;
+}
+
+export interface DiscoveredUdpRoom {
+  roomId: string;
+  title: string;
+  hostName: string;
+  ip: string;
+  ips?: string[];
+  port: number;
+  aspectRatio: AspectRatio;
+  participants: number;
+  lastSeen: number;
 }
 
 export interface Collaborator {
@@ -222,7 +252,24 @@ export type ClientWsMessage =
       selectedClipId: string | null;
       isPlaying: boolean;
     }
-  | {type: 'chat:send'; text: string; messageId: string};
+  | {type: 'chat:send'; text: string; messageId: string}
+  | {
+      type: 'LAYER_MEDIA_UPDATED';
+      layerId: string;
+      fileName: string;
+      mediaUrl: string;
+      senderId: string;
+      clip?: Clip;
+      newTrack?: Track;
+    }
+  | {
+      type: 'LAYER_LOCK';
+      layerId: string;
+      userId: string;
+      userName: string;
+      userColor: string;
+      locked: boolean;
+    };
 
 export type ServerWsMessage =
   | {
@@ -293,6 +340,24 @@ export type ServerWsMessage =
     }
   | {type: 'presence:update'; collaborators: Collaborator[]}
   | {type: 'chat:message'; message: ChatMessage}
+  | {
+      type: 'LAYER_MEDIA_UPDATED';
+      layerId: string;
+      fileName: string;
+      mediaUrl: string;
+      senderId: string;
+      clip?: Clip;
+      newTrack?: Track;
+      revision?: number;
+    }
+  | {
+      type: 'LAYER_LOCK';
+      layerId: string;
+      userId: string;
+      userName: string;
+      userColor: string;
+      locked: boolean;
+    }
   | {type: 'error'; message: string};
 
 export const SAMPLE_MEDIA_ASSETS: MediaAsset[] = [

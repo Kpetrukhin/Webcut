@@ -31,11 +31,7 @@ import {
   generateKeyframePreset,
   upsertKeyframeAtTime,
 } from '../lib/keyframeEngine.ts';
-import {
-  getApiUrl,
-  getSavedServerUrl,
-  isNativeCapacitorApp,
-} from '../lib/serverConfig.ts';
+import {uploadFileForP2P} from '../lib/lanSyncBridge.ts';
 import {
   SAMPLE_MEDIA_ASSETS,
   SYNTH_AUDIO_PRESETS,
@@ -46,9 +42,11 @@ import type {
   Clip,
   ClipKeyframe,
   Collaborator,
+  DiscoveredUdpRoom,
   FilterPreset,
   KeyframeEasing,
   MotionEffect,
+  NetworkInterfaceInfo,
   ProjectFont,
   RoomSummary,
   TransitionType,
@@ -68,35 +66,18 @@ async function uploadOrLocalMedia(
   fallbackKind: 'video' | 'image' | 'audio' | 'font'
 ): Promise<{
   name: string;
+  fileName: string;
   kind: 'video' | 'image' | 'audio' | 'font';
   src: string;
+  shareUrl: string;
 }> {
-  const uploadEndpoint = getApiUrl('/api/upload');
-  if (uploadEndpoint) {
-    try {
-      const form = new FormData();
-      form.append('file', file);
-      const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
-      const data = (await res.json()) as {
-        name?: string;
-        kind?: 'video' | 'image' | 'audio' | 'font';
-        src?: string;
-      };
-      if (res.ok && data.src) {
-        return {
-          name: data.name || file.name,
-          kind: data.kind || fallbackKind,
-          src: data.src,
-        };
-      }
-    } catch {
-      // Fall back to local URL
-    }
-  }
+  const prepared = await uploadFileForP2P(file, fallbackKind);
   return {
-    name: file.name,
-    kind: fallbackKind,
-    src: URL.createObjectURL(file),
+    name: prepared.name,
+    fileName: prepared.fileName,
+    kind: prepared.kind,
+    src: prepared.localSrc,
+    shareUrl: prepared.shareUrl,
   };
 }
 
@@ -363,6 +344,8 @@ interface MediaPanelProps {
     name: string;
     kind: 'video' | 'image';
     src: string;
+    fileName?: string;
+    remoteUrl?: string;
     duration: number;
     track: 'video' | 'overlay';
     forceNewTrack?: boolean;
@@ -403,6 +386,8 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
           name: uploaded.name,
           kind: mediaKind,
           src: uploaded.src,
+          fileName: uploaded.fileName,
+          remoteUrl: uploaded.shareUrl,
           duration: Math.min(30, dur),
           track: targetTrack,
           forceNewTrack,
@@ -1524,6 +1509,10 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
 interface TeamPanelProps {
   roomId: string;
   serverUrl: string;
+  p2pMode: 'idle' | 'host' | 'client';
+  networkInterfaces: NetworkInterfaceInfo[];
+  hostPort: number;
+  udpRooms: DiscoveredUdpRoom[];
   user: {id: string; name: string; color: string};
   allCollaborators: Collaborator[];
   availableRooms: RoomSummary[];
@@ -1534,6 +1523,10 @@ interface TeamPanelProps {
   onSwitchRoom: (nextRoomId: string) => void;
   onSendChat: (text: string) => void;
   onUpdateServerUrl: (url: string) => void;
+  onStartHost: () => Promise<unknown>;
+  onStopHost: () => Promise<void>;
+  onConnectToHostIp: (ipOrUrl: string, targetRoomId?: string) => void;
+  onRefreshNetwork: () => void;
 }
 
 const PROFILE_COLORS = [
@@ -1548,6 +1541,10 @@ const PROFILE_COLORS = [
 export const TeamPanel: React.FC<TeamPanelProps> = ({
   roomId,
   serverUrl,
+  p2pMode,
+  networkInterfaces,
+  hostPort,
+  udpRooms,
   user,
   allCollaborators,
   availableRooms,
@@ -1557,44 +1554,34 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
   onOpenLobby,
   onSwitchRoom,
   onSendChat,
-  onUpdateServerUrl,
+  onStartHost,
+  onStopHost,
+  onConnectToHostIp,
+  onRefreshNetwork,
 }) => {
-  const [copied, setCopied] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [nameInput, setNameInput] = useState(user.name);
   const [chatInput, setChatInput] = useState('');
-  const [serverInput, setServerInput] = useState(serverUrl);
-  const [lanUrls, setLanUrls] = useState<string[]>([]);
-  const isNative = isNativeCapacitorApp();
+  const [manualIpInput, setManualIpInput] = useState(
+    serverUrl ? serverUrl.replace(/^https?:\/\//, '') : ''
+  );
+  const [startingHost, setStartingHost] = useState(false);
 
   useEffect(() => {
     setNameInput(user.name);
   }, [user.name]);
 
   useEffect(() => {
-    setServerInput(serverUrl);
+    if (serverUrl) {
+      setManualIpInput(serverUrl.replace(/^https?:\/\//, ''));
+    }
   }, [serverUrl]);
 
-  useEffect(() => {
-    const endpoint = getApiUrl('/api/network-info');
-    if (!endpoint) return;
-    fetch(endpoint)
-      .then((r) => r.json())
-      .then((d: {lanUrls?: string[]}) => {
-        if (Array.isArray(d.lanUrls)) setLanUrls(d.lanUrls);
-      })
-      .catch(() => {});
-  }, [serverUrl]);
-
-  const baseShareOrigin = isNative
-    ? getSavedServerUrl() || 'https://your-server-url'
-    : window.location.origin;
-  const shareUrl = `${baseShareOrigin}/?room=${encodeURIComponent(roomId)}`;
-
-  const handleCopy = async () => {
+  const handleCopyText = async (key: string, text: string) => {
     try {
-      await navigator.clipboard.writeText(shareUrl);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1800);
+      await navigator.clipboard.writeText(text);
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey(null), 1600);
     } catch {
       // ignore clipboard error
     }
@@ -1602,33 +1589,192 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
 
   return (
     <div className="space-y-4">
-      <button
-        type="button"
-        onClick={onOpenLobby}
-        className="flex min-h-[48px] w-full items-center justify-between rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-3.5 py-2.5 text-left hover:bg-emerald-500/20 active:scale-[0.99]"
-      >
-        <div className="flex items-center gap-2.5">
-          <Wifi className="h-4 w-4 text-emerald-400" />
-          <div>
-            <p className="text-xs font-semibold text-white">
-              Список комнат в сети ({availableRooms.length})
-            </p>
-            <p className="text-[11px] text-emerald-200/80">
-              Войти, создать или найти сервер в Wi-Fi
-            </p>
+      {/* P2P Host & Client Control Panel (Ktor 8080 + UDP 8081 + ZeroTier) */}
+      <div className="space-y-3 rounded-xl border border-emerald-500/35 bg-gradient-to-br from-emerald-950/30 via-zinc-900/90 to-zinc-950 p-3">
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <Wifi className="h-4 w-4 text-emerald-400" />
+            <div>
+              <p className="text-xs font-bold text-white">
+                Локальная сеть (LAN / ZeroTier)
+              </p>
+              <p className="text-[10px] text-zinc-400">
+                Порт {hostPort} (WS / HTTP) · UDP 8081 автопоиск
+              </p>
+            </div>
           </div>
+          <span
+            className={`rounded-md px-2 py-0.5 text-[10px] font-bold ${
+              p2pMode === 'host'
+                ? 'bg-emerald-500/20 text-emerald-300'
+                : status === 'connected'
+                  ? 'bg-cyan-500/20 text-cyan-300'
+                  : 'bg-zinc-800 text-zinc-400'
+            }`}
+          >
+            {p2pMode === 'host'
+              ? 'ХОСТ АКТИВЕН'
+              : status === 'connected'
+                ? 'ПОДКЛЮЧЕНО'
+                : 'ОФФЛАЙН'}
+          </span>
         </div>
-        <span className="rounded-lg bg-emerald-500 px-2.5 py-1 text-[11px] font-bold text-zinc-950">
-          Открыть
-        </span>
-      </button>
 
-      {/* Live Studio Chat (Right at top for easy access in team rooms!) */}
+        {/* 1. Host Mode Button & Local/ZeroTier IPs */}
+        <div className="flex gap-2">
+          {p2pMode === 'host' ? (
+            <button
+              type="button"
+              onClick={() => void onStopHost()}
+              className="flex h-10 flex-1 items-center justify-center gap-1.5 rounded-xl border border-rose-500/40 bg-rose-500/15 text-xs font-semibold text-rose-300 hover:bg-rose-500/25"
+            >
+              Остановить хост
+            </button>
+          ) : (
+            <button
+              type="button"
+              disabled={startingHost}
+              onClick={async () => {
+                setStartingHost(true);
+                try {
+                  await onStartHost();
+                } finally {
+                  setStartingHost(false);
+                }
+              }}
+              className="flex h-10 flex-1 items-center justify-center gap-1.5 rounded-xl bg-emerald-500 text-xs font-bold text-zinc-950 hover:bg-emerald-400 disabled:opacity-50 active:scale-[0.99]"
+            >
+              <Plus className="h-4 w-4" />
+              {startingHost ? 'Запуск Ktor...' : 'Создать комнату (Хост)'}
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onRefreshNetwork}
+            className="flex h-10 items-center justify-center rounded-xl border border-white/10 bg-zinc-900 px-3 text-[11px] font-medium text-zinc-200 hover:border-cyan-400/50"
+          >
+            IP / Сеть
+          </button>
+        </div>
+
+        {/* Local Interfaces (ZeroTier zt* + Wi-Fi) */}
+        {networkInterfaces.length > 0 && (
+          <div className="space-y-1.5 rounded-lg border border-white/10 bg-zinc-950/80 p-2.5">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">
+              Ваши IP-адреса для подключения друзей:
+            </p>
+            <div className="space-y-1">
+              {networkInterfaces.map((iface) => (
+                <button
+                  key={`${iface.name}-${iface.ip}`}
+                  type="button"
+                  onClick={() =>
+                    void handleCopyText(iface.ip, `${iface.ip}:${hostPort}`)
+                  }
+                  className="flex w-full items-center justify-between rounded-lg border border-white/5 bg-zinc-900/90 px-2.5 py-1.5 text-left hover:border-cyan-400/50"
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className={`rounded px-1.5 py-0.5 text-[9px] font-bold uppercase ${
+                        iface.type === 'zerotier'
+                          ? 'bg-violet-500/25 text-violet-300'
+                          : iface.type === 'wifi'
+                            ? 'bg-emerald-500/20 text-emerald-300'
+                            : 'bg-zinc-800 text-zinc-300'
+                      }`}
+                    >
+                      {iface.type === 'zerotier'
+                        ? 'ZeroTier'
+                        : iface.type === 'wifi'
+                          ? 'Wi-Fi'
+                          : 'LAN'}
+                    </span>
+                    <span className="truncate font-mono text-xs text-white">
+                      {iface.ip}:{hostPort}
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-medium text-cyan-400">
+                    {copiedKey === iface.ip ? 'Скопировано' : 'Копировать'}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* 2. Client Mode: UDP 8081 Discovered Rooms + Manual Host IP */}
+        <div className="space-y-2 border-t border-white/10 pt-2.5">
+          <div className="flex items-center justify-between">
+            <span className="text-[11px] font-semibold text-zinc-200">
+              Подключиться (Клиент)
+            </span>
+            <button
+              type="button"
+              onClick={onOpenLobby}
+              className="text-[11px] font-medium text-cyan-400 hover:underline"
+            >
+              Все комнаты ({availableRooms.length + udpRooms.length})
+            </button>
+          </div>
+
+          {udpRooms.length > 0 && (
+            <div className="space-y-1.5">
+              {udpRooms.map((ur) => (
+                <button
+                  key={`${ur.ip}-${ur.roomId}`}
+                  type="button"
+                  onClick={() =>
+                    onConnectToHostIp(`${ur.ip}:${ur.port}`, ur.roomId)
+                  }
+                  className="flex w-full items-center justify-between rounded-xl border border-emerald-500/60 bg-emerald-950/30 px-3 py-2 text-left hover:bg-emerald-950/50"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate text-xs font-bold text-white">
+                      {ur.title} · {ur.hostName}
+                    </p>
+                    <p className="font-mono text-[10px] text-emerald-300">
+                      UDP 8081 · {ur.ip}:{ur.port}
+                    </p>
+                  </div>
+                  <span className="rounded-lg bg-emerald-500 px-2.5 py-1 text-[10px] font-bold text-zinc-950">
+                    Войти
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!manualIpInput.trim()) return;
+              onConnectToHostIp(manualIpInput.trim());
+            }}
+            className="flex gap-2"
+          >
+            <input
+              type="text"
+              value={manualIpInput}
+              onChange={(e) => setManualIpInput(e.target.value)}
+              placeholder="IP хоста (Wi-Fi или ZeroTier, напр. 10.147.20.5)"
+              className="h-10 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+            />
+            <button
+              type="submit"
+              className="h-10 shrink-0 rounded-lg bg-cyan-500 px-3.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400"
+            >
+              Подкл.
+            </button>
+          </form>
+        </div>
+      </div>
+
+      {/* Live Studio Chat */}
       <div className="space-y-2 rounded-xl border border-white/10 bg-zinc-900/70 p-3">
         <div className="flex items-center justify-between">
           <p className="text-xs font-semibold text-white">Чат команды</p>
           <span className="text-[11px] font-medium text-emerald-400">
-            • {allCollaborators.length} в комнате
+            • {allCollaborators.length} в комнате ({roomId})
           </span>
         </div>
         <div className="studio-scrollbar max-h-40 space-y-1.5 overflow-y-auto rounded-lg border border-white/5 bg-zinc-950/90 p-2.5">
@@ -1670,123 +1816,20 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
         </form>
       </div>
 
-      {isNative && (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            onUpdateServerUrl(serverInput);
-          }}
-          className="rounded-xl border border-white/10 bg-zinc-900/70 p-3 space-y-2"
-        >
-          <p className="text-xs font-medium text-zinc-200">
-            IP / URL сервера для синхронизации
-          </p>
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={serverInput}
-              onChange={(e) => setServerInput(e.target.value)}
-              placeholder="192.168.1.15 или https://..."
-              className="h-10 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
-            />
-            <button
-              type="submit"
-              className="h-10 rounded-lg bg-cyan-500 px-3 text-xs font-semibold text-zinc-950"
-            >
-              OK
-            </button>
-          </div>
-        </form>
-      )}
-
-      {/* Room Status & Invite */}
-      <div className="rounded-xl border border-white/10 bg-zinc-900/80 p-3 space-y-2.5">
-        <div className="flex items-center justify-between text-xs">
-          <span className="font-medium text-zinc-200">
-            Комната: <span className="font-mono text-cyan-400">{roomId}</span>
-          </span>
-          <span className="flex items-center gap-1.5 text-[11px] text-zinc-400">
-            <span
-              className={`h-2 w-2 rounded-full ${
-                status === 'connected'
-                  ? 'bg-emerald-400'
-                  : status === 'offline'
-                    ? 'bg-zinc-500'
-                    : 'bg-amber-400'
-              }`}
-            />
-            {status === 'connected'
-              ? 'Онлайн'
-              : status === 'offline'
-                ? 'Локально'
-                : 'Подключение...'}
-          </span>
-        </div>
-
-        <button
-          type="button"
-          onClick={handleCopy}
-          className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-xl bg-zinc-800 px-3 text-xs font-medium text-zinc-100 hover:bg-zinc-700"
-        >
-          {copied ? (
-            <>
-              <Check className="h-4 w-4 text-emerald-400" />
-              Ссылка скопирована
-            </>
-          ) : (
-            <>
-              <Copy className="h-4 w-4 text-cyan-400" />
-              Копировать ссылку-приглашение
-            </>
-          )}
-        </button>
-
-        {lanUrls.length > 0 && (
-          <div className="rounded-lg bg-zinc-950/70 px-2.5 py-2 text-[11px] text-zinc-400">
-            <span className="block text-zinc-500">
-              Локальный адрес в вашей Wi-Fi сети:
-            </span>
-            <span className="font-mono text-zinc-300 break-all">
-              {lanUrls[0]}
-            </span>
-          </div>
-        )}
-
-        {availableRooms.length > 1 && (
-          <div className="space-y-1 pt-1">
-            <p className="text-[11px] text-zinc-400">Быстрый вход в комнату:</p>
-            <div className="flex flex-wrap gap-1.5">
-              {availableRooms.slice(0, 4).map((r) => (
-                <button
-                  key={r.roomId}
-                  type="button"
-                  onClick={() => onSwitchRoom(r.roomId)}
-                  className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium border ${
-                    r.roomId === roomId
-                      ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300'
-                      : 'border-emerald-500/50 bg-emerald-950/30 text-emerald-200'
-                  }`}
-                >
-                  {r.title} ({r.collaboratorsCount})
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      {/* Your Profile */}
-      <div className="space-y-2">
-        <p className="text-xs font-medium text-zinc-400">Ваше имя и цвет курсора</p>
-        <div className="flex gap-2">
+      {/* Your Profile: Name + Lock/Cursor Color */}
+      <div className="space-y-2 rounded-xl border border-white/10 bg-zinc-900/70 p-3">
+        <p className="text-xs font-medium text-zinc-300">
+          Ваше имя и цвет рамки блокировки
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
           <input
             type="text"
             value={nameInput}
             onChange={(e) => setNameInput(e.target.value)}
             onBlur={() => onUpdateProfile(nameInput, user.color)}
-            className="h-10 flex-1 rounded-lg border border-white/10 bg-zinc-900 px-3 text-xs text-white focus:border-cyan-400 focus:outline-none"
+            className="h-10 min-w-[120px] flex-1 rounded-lg border border-white/10 bg-zinc-950 px-3 text-xs text-white focus:border-cyan-400 focus:outline-none"
           />
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-1.5">
             {PROFILE_COLORS.map((c) => (
               <button
                 key={c}
@@ -1794,14 +1837,44 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
                 onClick={() => onUpdateProfile(nameInput, c)}
                 style={{backgroundColor: c}}
                 aria-label={`Выбрать цвет ${c}`}
-                className={`h-7 w-7 rounded-full border-2 ${
+                className={`h-7 w-7 rounded-full border-2 transition ${
                   user.color === c ? 'border-white scale-110' : 'border-transparent'
                 }`}
               />
             ))}
+            <input
+              type="color"
+              value={user.color}
+              onChange={(e) => onUpdateProfile(nameInput, e.target.value)}
+              title="Свой цвет участника"
+              className="h-7 w-7 cursor-pointer rounded-full border border-white/20 bg-transparent p-0"
+            />
           </div>
         </div>
       </div>
+
+      {/* Room Switcher Shortcut */}
+      {availableRooms.length > 1 && (
+        <div className="space-y-1.5 rounded-xl border border-white/10 bg-zinc-900/70 p-3">
+          <p className="text-[11px] text-zinc-400">Быстрый вход в комнату:</p>
+          <div className="flex flex-wrap gap-1.5">
+            {availableRooms.slice(0, 4).map((r) => (
+              <button
+                key={r.roomId}
+                type="button"
+                onClick={() => onSwitchRoom(r.roomId)}
+                className={`rounded-lg px-2.5 py-1.5 text-[11px] font-medium border ${
+                  r.roomId === roomId
+                    ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300'
+                    : 'border-emerald-500/50 bg-emerald-950/30 text-emerald-200'
+                }`}
+              >
+                {r.title} ({r.collaboratorsCount})
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Active Collaborators */}
       <div className="space-y-1.5">

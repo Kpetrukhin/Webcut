@@ -22,6 +22,7 @@ interface TimelineProps {
   currentTime: number;
   pxPerSec: number;
   selectedClipId: string | null;
+  currentUserId?: string;
   collaborators: Collaborator[];
   onSeek: (time: number) => void;
   onSelectClip: (clipId: string | null) => void;
@@ -29,6 +30,7 @@ interface TimelineProps {
   onAddTrack: (type: TrackType) => void;
   onUpdateTrack: (trackId: string, patch: Partial<Track>) => void;
   onDeleteTrack: (trackId: string) => void;
+  onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onClipTransform: (
     clipId: string,
     patch: Partial<Clip>,
@@ -81,6 +83,7 @@ export const Timeline: React.FC<TimelineProps> = ({
   currentTime,
   pxPerSec,
   selectedClipId,
+  currentUserId,
   collaborators,
   onSeek,
   onSelectClip,
@@ -88,6 +91,7 @@ export const Timeline: React.FC<TimelineProps> = ({
   onAddTrack,
   onUpdateTrack,
   onDeleteTrack,
+  onLockLayer,
   onClipTransform,
 }) => {
   const rulerRef = useRef<HTMLDivElement | null>(null);
@@ -177,6 +181,13 @@ export const Timeline: React.FC<TimelineProps> = ({
   ) => {
     e.stopPropagation();
     onSelectClip(clip.id);
+    if (clip.lockedByUserId && clip.lockedByUserId !== currentUserId) {
+      onLockLayer?.(clip.id, true);
+      return;
+    }
+    if (onLockLayer && onLockLayer(clip.id, true) === false) {
+      return;
+    }
     e.currentTarget.setPointerCapture(e.pointerId);
     dragClipRef.current = {
       clipId: clip.id,
@@ -251,6 +262,7 @@ export const Timeline: React.FC<TimelineProps> = ({
       // ignore
     }
     onClipTransform(drag.clipId, patch, true);
+    onLockLayer?.(drag.clipId, false);
   };
 
   const secStep = pxPerSec >= 90 ? 1 : pxPerSec >= 55 ? 2 : 5;
@@ -442,9 +454,17 @@ export const Timeline: React.FC<TimelineProps> = ({
                 >
                   {trackClips.map((clip) => {
                     const isSelected = clip.id === selectedClipId;
-                    const remoteOwner = collaborators.find(
-                      (u) => u.selectedClipId === clip.id
-                    );
+                    const peerLock =
+                      clip.lockedByUserId &&
+                      clip.lockedByUserId !== currentUserId
+                        ? {
+                            color: clip.lockedByUserColor || '#f97316',
+                            name: clip.lockedByUserName || 'Участник',
+                          }
+                        : collaborators.find(
+                            (u) => u.selectedClipId === clip.id
+                          );
+                    const isDownloading = clip.mediaStatus === 'DOWNLOADING';
                     const leftPx = clip.start * pxPerSec;
                     const widthPx = Math.max(28, clip.duration * pxPerSec);
 
@@ -463,10 +483,10 @@ export const Timeline: React.FC<TimelineProps> = ({
                         style={{
                           left: `${leftPx}px`,
                           width: `${widthPx}px`,
-                          boxShadow: isSelected
-                            ? '0 0 0 2px #22d3ee'
-                            : remoteOwner
-                              ? `0 0 0 2px ${remoteOwner.color}`
+                          boxShadow: peerLock
+                            ? `0 0 0 2px ${peerLock.color}`
+                            : isSelected
+                              ? '0 0 0 2px #22d3ee'
                               : 'inset 0 0 0 1px rgba(255,255,255,0.12)',
                         }}
                         onClick={(e) => {
@@ -479,7 +499,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                         onPointerCancel={handleClipPointerUp}
                         className={`group absolute top-1 bottom-1 z-10 flex touch-none cursor-grab items-center overflow-hidden rounded-lg ${baseSurface} active:cursor-grabbing`}
                       >
-                        {clip.kind === 'image' && clip.src && (
+                        {clip.kind === 'image' && clip.src && !isDownloading && (
                           <div
                             className="pointer-events-none absolute inset-0 opacity-45"
                             style={{
@@ -488,6 +508,15 @@ export const Timeline: React.FC<TimelineProps> = ({
                               backgroundRepeat: 'repeat-x',
                             }}
                           />
+                        )}
+
+                        {isDownloading && (
+                          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-1 bg-zinc-900/90">
+                            <div
+                              style={{width: `${clip.downloadProgress ?? 0}%`}}
+                              className="h-full bg-cyan-400 transition-all duration-150"
+                            />
+                          </div>
                         )}
 
                         {track.type === 'audio' && (
@@ -508,9 +537,11 @@ export const Timeline: React.FC<TimelineProps> = ({
 
                         <div className="relative z-10 flex w-full items-center justify-between gap-1 px-2.5 text-[11px] font-medium text-white drop-shadow">
                           <span className="truncate">
-                            {clip.kind === 'text'
-                              ? clip.text || clip.name
-                              : clip.name}
+                            {isDownloading
+                              ? `⬇ ${clip.downloadProgress ?? 0}% · ${clip.name}`
+                              : clip.kind === 'text'
+                                ? clip.text || clip.name
+                                : clip.name}
                           </span>
                           <span className="shrink-0 font-mono text-[10px] text-zinc-200/80 tabular-nums">
                             {clip.duration.toFixed(1)}с
@@ -533,12 +564,15 @@ export const Timeline: React.FC<TimelineProps> = ({
                             />
                           ))}
 
-                        {remoteOwner && (
+                        {peerLock && (
                           <span
-                            style={{backgroundColor: remoteOwner.color}}
+                            style={{backgroundColor: peerLock.color}}
                             className="pointer-events-none absolute top-0.5 right-1 z-20 rounded px-1 py-px text-[9px] font-semibold text-zinc-950"
                           >
-                            {remoteOwner.name}
+                            {clip.lockedByUserId &&
+                            clip.lockedByUserId !== currentUserId
+                              ? `🔒 ${peerLock.name}`
+                              : peerLock.name}
                           </span>
                         )}
 

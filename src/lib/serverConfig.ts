@@ -16,7 +16,7 @@ export function normalizeServerUrl(raw: string): string {
   if (!trimmed) return '';
   if (/^https?:\/\//i.test(trimmed)) return trimmed;
   if (/^\d+\.\d+\.\d+\.\d+$/.test(trimmed)) {
-    return `http://${trimmed}:3000`;
+    return `http://${trimmed}:8080`;
   }
   return `http://${trimmed}`;
 }
@@ -68,28 +68,39 @@ export function saveServerUrl(raw: string): string {
 
 export function getApiUrl(path: string): string {
   const cleanPath = path.startsWith('/') ? path : `/${path}`;
-  if (!isNativeCapacitorApp()) {
-    return cleanPath;
-  }
   const base = getSavedServerUrl();
+  if (!isNativeCapacitorApp()) {
+    return base ? `${base}${cleanPath}` : cleanPath;
+  }
   return base ? `${base}${cleanPath}` : '';
 }
 
-export function getWebSocketUrl(): string | null {
-  if (!isNativeCapacitorApp()) {
-    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${proto}//${window.location.host}/ws`;
+export function getWebSocketUrl(overrideBaseUrl?: string): string | null {
+  const base = overrideBaseUrl ? normalizeServerUrl(overrideBaseUrl) : getSavedServerUrl();
+  if (!base) {
+    if (!isNativeCapacitorApp()) {
+      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      return `${proto}//${window.location.host}/sync`;
+    }
+    return null;
   }
-  const base = getSavedServerUrl();
-  if (!base) return null;
-  return base.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:') + '/ws';
+  return base.replace(/^http:/i, 'ws:').replace(/^https:/i, 'wss:') + '/sync';
 }
 
 export function resolveMediaSrc(src: string | undefined): string | undefined {
   if (!src) return src;
-  if (src.startsWith('/uploads/') && isNativeCapacitorApp()) {
+  if (
+    src.startsWith('http://') ||
+    src.startsWith('https://') ||
+    src.startsWith('blob:') ||
+    src.startsWith('data:') ||
+    src.startsWith('synth:')
+  ) {
+    return src;
+  }
+  if (src.startsWith('/uploads/') || src.startsWith('/media/')) {
     const base = getSavedServerUrl();
-    return base ? `${base}${src}` : src;
+    if (base) return `${base}${src}`;
   }
   return src;
 }
@@ -118,13 +129,14 @@ async function probeServerHost(
       host?: string;
       roomsCount?: number;
       onlineUsers?: number;
+      participants?: number;
     };
     if (!data.ok || data.app !== 'CutSync') return null;
     return {
       url,
       host: data.host || url.replace(/^https?:\/\//, ''),
       roomsCount: data.roomsCount ?? 1,
-      onlineUsers: data.onlineUsers ?? 0,
+      onlineUsers: data.onlineUsers ?? data.participants ?? 0,
     };
   } catch {
     return null;
@@ -133,11 +145,6 @@ async function probeServerHost(
   }
 }
 
-/**
- * Attempts WebRTC ICE candidate local IP detection so the APK/phone can
- * automatically discover CutSync servers running on the same Wi-Fi LAN
- * (like Minecraft's "Scanning for games on your local network").
- */
 async function detectLocalSubnetPrefix(): Promise<string | null> {
   try {
     const pc = new RTCPeerConnection({iceServers: []});
@@ -185,11 +192,16 @@ export async function scanLocalLanServers(
     ? [detectedPrefix]
     : ['192.168.1', '192.168.0', '192.168.43', '192.168.31'];
 
-  // Probe common host IPs on detected/common Wi-Fi subnets in fast batches
+  // Probe Ktor P2P hosts on port 8080 (and desktop Node hosts on 3000)
   for (const prefix of prefixes) {
-    // Check router/common PC static & DHCP IPs (.1..60 + .100..125)
-    for (let i = 1; i <= 40; i++) candidates.add(`http://${prefix}.${i}:3000`);
-    for (let i = 100; i <= 130; i++) candidates.add(`http://${prefix}.${i}:3000`);
+    for (let i = 1; i <= 40; i++) {
+      candidates.add(`http://${prefix}.${i}:8080`);
+      candidates.add(`http://${prefix}.${i}:3000`);
+    }
+    for (let i = 100; i <= 130; i++) {
+      candidates.add(`http://${prefix}.${i}:8080`);
+      candidates.add(`http://${prefix}.${i}:3000`);
+    }
   }
 
   const found: DiscoveredServer[] = [];

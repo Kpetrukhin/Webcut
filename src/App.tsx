@@ -10,8 +10,10 @@ import {
   MessageSquare,
   Move,
   Pause,
+  Pipette,
   Play,
   Redo2,
+  RefreshCw,
   RotateCcw,
   Scissors,
   Sparkles,
@@ -30,6 +32,7 @@ import {
   evaluateClipTransform,
   upsertKeyframeAtTime,
 } from './lib/keyframeEngine.ts';
+import {uploadFileForP2P} from './lib/lanSyncBridge.ts';
 import {
   getLocalProjects,
   removeLocalProject,
@@ -37,7 +40,7 @@ import {
 } from './lib/localProjects.ts';
 import type {LocalProjectRecord} from './lib/localProjects.ts';
 import {exportProjectToVideo, MediaPool} from './lib/renderEngine.ts';
-import {getApiUrl} from './lib/serverConfig.ts';
+import {getApiUrl, isNativeCapacitorApp} from './lib/serverConfig.ts';
 import {
   hasExplicitRoomInUrl,
   useCollaborativeRoom,
@@ -80,6 +83,11 @@ export default function App() {
     user,
     roomId,
     serverUrl,
+    p2pMode,
+    networkInterfaces,
+    hostPort,
+    udpRooms,
+    lockWarning,
     status,
     project,
     collaborators,
@@ -101,10 +109,16 @@ export default function App() {
     redo,
     sendPresence,
     sendChatMessage,
+    sendLayerMediaUpdated,
+    sendLayerLock,
     switchRoom,
     updateUserProfile,
     updateServerConnection,
+    startHostRoom,
+    stopHostRoom,
+    connectToHostIp,
     refreshRooms,
+    refreshNetworkInfo,
   } = useCollaborativeRoom();
 
   const [screen, setScreen] = useState<'home' | 'editor'>(() =>
@@ -120,9 +134,11 @@ export default function App() {
   const [desktopTab, setDesktopTab] = useState<ActiveToolTab>('media');
   const [mobileSheet, setMobileSheet] = useState<ActiveToolTab | null>(null);
   const [showOpacitySlider, setShowOpacitySlider] = useState(false);
+  const [showChromaKeyPanel, setShowChromaKeyPanel] = useState(false);
   const [showTrackpad, setShowTrackpad] = useState(false);
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [showSelectionOutline, setShowSelectionOutline] = useState(true);
+  const [replacingMedia, setReplacingMedia] = useState(false);
   const [trackpadSnapGuides, setTrackpadSnapGuides] = useState<{
     x: boolean;
     y: boolean;
@@ -168,6 +184,12 @@ export default function App() {
       setShowOpacitySlider(false);
       setShowTrackpad(false);
       setTrackpadSnapGuides({x: false, y: false});
+    }
+    if (
+      !selectedClip ||
+      (selectedClip.kind !== 'image' && selectedClip.kind !== 'video')
+    ) {
+      setShowChromaKeyPanel(false);
     }
   }, [selectedClip]);
 
@@ -255,13 +277,16 @@ export default function App() {
 
   const handleDuplicateSelected = useCallback(() => {
     if (!selectedClip) return;
-    const copy = addClip(
+    const {clip: copy} = addClip(
       {
         ...structuredClone(selectedClip),
         id: `clip-${Math.random().toString(36).slice(2, 9)}`,
         name: `${selectedClip.name} (копия)`,
         start:
           Math.round((selectedClip.start + selectedClip.duration) * 100) / 100,
+        lockedByUserId: null,
+        lockedByUserName: null,
+        lockedByUserColor: null,
       },
       {forceNewTrack: selectedClip.track !== 'video'}
     );
@@ -322,6 +347,8 @@ export default function App() {
       name: string;
       kind: 'video' | 'image';
       src: string;
+      fileName?: string;
+      remoteUrl?: string;
       duration: number;
       track: 'video' | 'overlay';
       forceNewTrack?: boolean;
@@ -336,13 +363,18 @@ export default function App() {
           ? Math.round(trackEnd * 100) / 100
           : Math.round(currentTime * 100) / 100;
 
-      const clip = addClip(
+      const hasRemoteMedia = Boolean(opts.remoteUrl);
+      const {clip, newTrack} = addClip(
         {
           id: `clip-${Math.random().toString(36).slice(2, 9)}`,
           track: opts.track,
           kind: opts.kind,
           name: opts.name,
           src: opts.src,
+          mediaFileName: opts.fileName,
+          mediaRemoteUrl: opts.remoteUrl,
+          mediaStatus: 'READY',
+          downloadProgress: 100,
           start,
           duration: opts.duration,
           trimStart: 0,
@@ -366,17 +398,85 @@ export default function App() {
           borderRadius: opts.track === 'overlay' ? 20 : 0,
           blendMode: 'source-over',
         },
-        {forceNewTrack: opts.forceNewTrack}
+        {forceNewTrack: opts.forceNewTrack, skipWs: hasRemoteMedia}
       );
+
+      if (hasRemoteMedia && opts.remoteUrl) {
+        sendLayerMediaUpdated({
+          layerId: clip.id,
+          fileName: opts.fileName || opts.name,
+          mediaUrl: opts.remoteUrl,
+          localSrc: opts.src,
+          clip,
+          newTrack,
+        });
+      }
+
       setSelectedClipId(clip.id);
       setCurrentTime(start);
     },
-    [project.clips, currentTime, addClip]
+    [project.clips, currentTime, addClip, sendLayerMediaUpdated]
+  );
+
+  const handleReplaceClipMedia = useCallback(
+    async (clipId: string, file: File) => {
+      const target = project.clips.find((c) => c.id === clipId);
+      if (!target) return;
+      if (target.lockedByUserId && target.lockedByUserId !== user.id) return;
+
+      setReplacingMedia(true);
+      try {
+        const fallbackKind = file.type.startsWith('video/') ? 'video' : 'image';
+        const prepared = await uploadFileForP2P(file, fallbackKind);
+        const mediaKind = prepared.kind === 'video' ? 'video' : 'image';
+
+        let probedDuration = target.duration;
+        if (mediaKind === 'video') {
+          probedDuration = await new Promise<number>((resolve) => {
+            const v = document.createElement('video');
+            v.preload = 'metadata';
+            v.onloadedmetadata = () => {
+              resolve(
+                Number.isFinite(v.duration) && v.duration > 0
+                  ? Math.min(60, Math.round(v.duration * 10) / 10)
+                  : target.duration
+              );
+            };
+            v.onerror = () => resolve(target.duration);
+            v.src = prepared.localSrc;
+          });
+        }
+
+        const updatedClip: Clip = {
+          ...target,
+          kind: mediaKind,
+          name: prepared.name,
+          src: prepared.localSrc,
+          mediaFileName: prepared.fileName,
+          mediaRemoteUrl: prepared.shareUrl,
+          mediaStatus: 'READY',
+          downloadProgress: 100,
+          trimStart: 0,
+          sourceDuration: mediaKind === 'image' ? 60 : probedDuration,
+        };
+
+        sendLayerMediaUpdated({
+          layerId: target.id,
+          fileName: prepared.fileName,
+          mediaUrl: prepared.shareUrl,
+          localSrc: prepared.localSrc,
+          clip: updatedClip,
+        });
+      } finally {
+        setReplacingMedia(false);
+      }
+    },
+    [project.clips, user.id, sendLayerMediaUpdated]
   );
 
   const handleAddText = useCallback(
     (text: string, forceNewTrack = true) => {
-      const clip = addClip(
+      const {clip} = addClip(
         {
           id: `clip-${Math.random().toString(36).slice(2, 9)}`,
           track: 'text',
@@ -423,7 +523,7 @@ export default function App() {
       duration: number;
       forceNewTrack?: boolean;
     }) => {
-      const clip = addClip(
+      const {clip} = addClip(
         {
           id: `clip-${Math.random().toString(36).slice(2, 9)}`,
           track: 'audio',
@@ -536,6 +636,46 @@ export default function App() {
     [selectedClip, currentTime, updateClip]
   );
 
+  const handlePickChromaKeyColor = useCallback(
+    (clipId: string, hexColor: string, commit: boolean) => {
+      const target = project.clips.find((c) => c.id === clipId);
+      if (!target) return;
+      updateClip(
+        clipId,
+        {
+          chromaKeyEnabled: true,
+          chromaKeyColor: hexColor,
+          chromaKeyIntensity:
+            target.chromaKeyIntensity && target.chromaKeyIntensity > 0
+              ? target.chromaKeyIntensity
+              : 0.35,
+          chromaKeySmoothness: target.chromaKeySmoothness ?? 0.15,
+        },
+        {skipUndo: !commit, skipSync: !commit}
+      );
+    },
+    [project.clips, updateClip]
+  );
+
+  const handleUpdateChromaKey = useCallback(
+    (
+      clipId: string,
+      patch: Partial<
+        Pick<
+          Clip,
+          | 'chromaKeyEnabled'
+          | 'chromaKeyColor'
+          | 'chromaKeyIntensity'
+          | 'chromaKeySmoothness'
+        >
+      >,
+      commit: boolean
+    ) => {
+      updateClip(clipId, patch, {skipUndo: !commit, skipSync: !commit});
+    },
+    [updateClip]
+  );
+
   const lastTimelineSyncRef = useRef(0);
   const handleClipTransform = useCallback(
     (clipId: string, patch: Partial<Clip>, commit: boolean) => {
@@ -561,6 +701,23 @@ export default function App() {
     const endpoint = getApiUrl('/api/rooms');
     const localClips = opts.blank ? [] : createStarterClips();
     const localTracks = createDefaultTracks();
+
+    if (opts.isPublicLan && (isNativeCapacitorApp() || !endpoint)) {
+      const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
+      await startHostRoom({
+        roomId: localId,
+        title: opts.title,
+        aspectRatio: opts.aspectRatio,
+        backgroundColor: opts.backgroundColor,
+        tracks: localTracks,
+        clips: localClips,
+      });
+      switchRoom(localId);
+      setCurrentTime(0);
+      setSelectedClipId(null);
+      setScreen('editor');
+      return;
+    }
 
     if (!endpoint) {
       const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
@@ -595,12 +752,23 @@ export default function App() {
       }
     } catch {
       const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
-      replaceClips(localClips, {
-        title: opts.title,
-        aspectRatio: opts.aspectRatio,
-        backgroundColor: opts.backgroundColor,
-        tracks: localTracks,
-      });
+      if (opts.isPublicLan) {
+        await startHostRoom({
+          roomId: localId,
+          title: opts.title,
+          aspectRatio: opts.aspectRatio,
+          backgroundColor: opts.backgroundColor,
+          tracks: localTracks,
+          clips: localClips,
+        });
+      } else {
+        replaceClips(localClips, {
+          title: opts.title,
+          aspectRatio: opts.aspectRatio,
+          backgroundColor: opts.backgroundColor,
+          tracks: localTracks,
+        });
+      }
       switchRoom(localId);
       setCurrentTime(0);
       setSelectedClipId(null);
@@ -700,6 +868,10 @@ export default function App() {
         <HomeScreen
           user={user}
           serverUrl={serverUrl}
+          p2pMode={p2pMode}
+          networkInterfaces={networkInterfaces}
+          hostPort={hostPort}
+          udpRooms={udpRooms}
           status={status}
           availableRooms={availableRooms}
           localProjects={localProjects}
@@ -725,6 +897,19 @@ export default function App() {
           }}
           onUpdateProfile={updateUserProfile}
           onConnectServer={updateServerConnection}
+          onStartHost={startHostRoom}
+          onStopHost={stopHostRoom}
+          onConnectToHostIp={(ipOrUrl, nextRoomId) => {
+            connectToHostIp(ipOrUrl, nextRoomId);
+            if (nextRoomId) {
+              setCurrentTime(0);
+              setSelectedClipId(null);
+              setScreen('editor');
+            }
+          }}
+          onRefreshNetwork={() => {
+            void refreshNetworkInfo();
+          }}
           onRefreshRooms={() => {
             void refreshRooms();
           }}
@@ -797,16 +982,18 @@ export default function App() {
           >
             <span
               className={`h-2 w-2 shrink-0 rounded-full ${
-                status === 'connected'
-                  ? 'bg-emerald-400'
-                  : status === 'offline'
-                    ? 'bg-zinc-500'
-                    : 'bg-amber-400 animate-pulse'
+                p2pMode === 'host'
+                  ? 'bg-emerald-400 animate-pulse'
+                  : status === 'connected'
+                    ? 'bg-emerald-400'
+                    : status === 'offline'
+                      ? 'bg-zinc-500'
+                      : 'bg-amber-400 animate-pulse'
               }`}
             />
             <Wifi className="h-3.5 w-3.5 text-emerald-400" />
             <span className="text-[11px] font-medium text-zinc-200 whitespace-nowrap sm:text-xs">
-              ({availableRooms.length})
+              ({availableRooms.length + udpRooms.length})
             </span>
           </button>
 
@@ -930,6 +1117,10 @@ export default function App() {
               <TeamPanel
                 roomId={roomId}
                 serverUrl={serverUrl}
+                p2pMode={p2pMode}
+                networkInterfaces={networkInterfaces}
+                hostPort={hostPort}
+                udpRooms={udpRooms}
                 user={user}
                 allCollaborators={allCollaborators}
                 availableRooms={availableRooms}
@@ -940,13 +1131,24 @@ export default function App() {
                 onSwitchRoom={switchRoom}
                 onSendChat={sendChatMessage}
                 onUpdateServerUrl={updateServerConnection}
+                onStartHost={startHostRoom}
+                onStopHost={stopHostRoom}
+                onConnectToHostIp={connectToHostIp}
+                onRefreshNetwork={() => {
+                  void refreshNetworkInfo();
+                }}
               />
             )}
           </div>
         </aside>
 
         {/* Center Preview Canvas + Transport Bar */}
-        <main className="flex flex-1 min-h-0 flex-col bg-[#09090b]">
+        <main className="relative flex flex-1 min-h-0 flex-col bg-[#09090b]">
+          {lockWarning && (
+            <div className="pointer-events-none absolute top-3 left-1/2 z-30 -translate-x-1/2 rounded-full border border-amber-400/50 bg-zinc-950/90 px-3.5 py-1.5 text-xs font-semibold text-amber-300 shadow-lg backdrop-blur-xs">
+              {lockWarning}
+            </div>
+          )}
           <div className="flex-1 min-h-0">
             <PreviewCanvas
               tracks={project.tracks}
@@ -957,6 +1159,7 @@ export default function App() {
               currentTime={currentTime}
               isPlaying={isPlaying}
               selectedClipId={selectedClipId}
+              currentUserId={user.id}
               collaborators={collaborators}
               mediaPool={mediaPoolRef.current}
               snapEnabled={snapEnabled}
@@ -966,6 +1169,9 @@ export default function App() {
                 setShowSelectionOutline((v) => !v)
               }
               externalSnapGuides={trackpadSnapGuides}
+              chromaKeyPickerActive={showChromaKeyPanel}
+              onPickChromaKeyColor={handlePickChromaKeyColor}
+              onLockLayer={sendLayerLock}
               onSelectClip={setSelectedClipId}
               onTransformClip={handleTransformClipOnCanvas}
             />
@@ -1125,20 +1331,200 @@ export default function App() {
               </div>
 
               {selectedClip.track !== 'audio' && (
-                <button
-                  type="button"
-                  onClick={() => setShowTrackpad((v) => !v)}
-                  className={`flex h-9 w-full items-center justify-center gap-2 rounded-lg border text-xs font-medium transition ${
-                    showTrackpad
-                      ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
-                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400/60'
-                  }`}
-                >
-                  <Move className="h-3.5 w-3.5 text-cyan-400" />
-                  <span>
-                    {showTrackpad ? 'Скрыть трекпад' : 'Трекпад (Move & Transform)'}
-                  </span>
-                </button>
+                <div className="space-y-2">
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowTrackpad((v) => !v)}
+                      className={`flex h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition ${
+                        showTrackpad
+                          ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                          : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400/60'
+                      }`}
+                    >
+                      <Move className="h-3.5 w-3.5 text-cyan-400" />
+                      <span>Трекпад</span>
+                    </button>
+                    {(selectedClip.kind === 'image' ||
+                      selectedClip.kind === 'video') && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => setShowChromaKeyPanel((v) => !v)}
+                          className={`flex h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition ${
+                            showChromaKeyPanel
+                              ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
+                              : selectedClip.chromaKeyEnabled
+                                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300'
+                                : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-emerald-400/60'
+                          }`}
+                        >
+                          <Pipette className="h-3.5 w-3.5 text-emerald-400" />
+                          <span>Хромакей</span>
+                        </button>
+                        <label
+                          className={`flex h-9 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-zinc-900 px-2.5 text-xs font-medium text-zinc-200 hover:border-cyan-400/60 ${
+                            replacingMedia ? 'opacity-50 pointer-events-none' : ''
+                          }`}
+                        >
+                          <RefreshCw
+                            className={`h-3.5 w-3.5 text-cyan-400 ${
+                              replacingMedia ? 'animate-spin' : ''
+                            }`}
+                          />
+                          <span>Заменить</span>
+                          <input
+                            type="file"
+                            accept="video/*,image/*"
+                            disabled={replacingMedia}
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file && selectedClip) {
+                                void handleReplaceClipMedia(
+                                  selectedClip.id,
+                                  file
+                                );
+                              }
+                              e.target.value = '';
+                            }}
+                            className="hidden"
+                          />
+                        </label>
+                      </>
+                    )}
+                  </div>
+
+                  {showChromaKeyPanel &&
+                    (selectedClip.kind === 'image' ||
+                      selectedClip.kind === 'video') && (
+                      <div className="space-y-2.5 rounded-xl border border-emerald-500/30 bg-[#14171a] p-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span
+                              className="h-5 w-5 rounded-full border border-white/80 shadow-xs"
+                              style={{
+                                backgroundColor:
+                                  selectedClip.chromaKeyColor || '#00ff00',
+                              }}
+                            />
+                            <span className="font-mono text-[11px] text-zinc-200">
+                              {(
+                                selectedClip.chromaKeyColor || '#00ff00'
+                              ).toUpperCase()}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleUpdateChromaKey(
+                                selectedClip.id,
+                                {
+                                  chromaKeyEnabled:
+                                    !selectedClip.chromaKeyEnabled,
+                                  chromaKeyColor:
+                                    selectedClip.chromaKeyColor || '#00ff00',
+                                  chromaKeyIntensity:
+                                    selectedClip.chromaKeyIntensity ?? 0.35,
+                                  chromaKeySmoothness:
+                                    selectedClip.chromaKeySmoothness ?? 0.15,
+                                },
+                                true
+                              )
+                            }
+                            className={`rounded-md px-2 py-0.5 text-[10px] font-semibold ${
+                              selectedClip.chromaKeyEnabled
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-white/10 text-zinc-400'
+                            }`}
+                          >
+                            {selectedClip.chromaKeyEnabled ? 'ВКЛ' : 'ВЫКЛ'}
+                          </button>
+                        </div>
+
+                        <label className="block space-y-1 text-xs text-zinc-300">
+                          <div className="flex justify-between text-[11px]">
+                            <span>Интенсивность</span>
+                            <span className="font-mono tabular-nums text-emerald-300">
+                              {(selectedClip.chromaKeyIntensity ?? 0.35).toFixed(2)}
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            value={selectedClip.chromaKeyIntensity ?? 0.35}
+                            onChange={(e) =>
+                              handleUpdateChromaKey(
+                                selectedClip.id,
+                                {
+                                  chromaKeyEnabled: true,
+                                  chromaKeyColor:
+                                    selectedClip.chromaKeyColor || '#00ff00',
+                                  chromaKeyIntensity: Number(e.target.value),
+                                },
+                                false
+                              )
+                            }
+                            onPointerUp={(e) =>
+                              handleUpdateChromaKey(
+                                selectedClip.id,
+                                {
+                                  chromaKeyIntensity: Number(
+                                    (e.target as HTMLInputElement).value
+                                  ),
+                                },
+                                true
+                              )
+                            }
+                            className="w-full accent-emerald-400"
+                          />
+                        </label>
+
+                        <label className="block space-y-1 text-xs text-zinc-300">
+                          <div className="flex justify-between text-[11px]">
+                            <span>Сглаживание</span>
+                            <span className="font-mono tabular-nums text-emerald-300">
+                              {(
+                                selectedClip.chromaKeySmoothness ?? 0.15
+                              ).toFixed(2)}
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            value={selectedClip.chromaKeySmoothness ?? 0.15}
+                            onChange={(e) =>
+                              handleUpdateChromaKey(
+                                selectedClip.id,
+                                {
+                                  chromaKeyEnabled: true,
+                                  chromaKeyColor:
+                                    selectedClip.chromaKeyColor || '#00ff00',
+                                  chromaKeySmoothness: Number(e.target.value),
+                                },
+                                false
+                              )
+                            }
+                            onPointerUp={(e) =>
+                              handleUpdateChromaKey(
+                                selectedClip.id,
+                                {
+                                  chromaKeySmoothness: Number(
+                                    (e.target as HTMLInputElement).value
+                                  ),
+                                },
+                                true
+                              )
+                            }
+                            className="w-full accent-emerald-400"
+                          />
+                        </label>
+                      </div>
+                    )}
+                </div>
               )}
 
               {(selectedClip.track === 'overlay' ||
@@ -1215,7 +1601,9 @@ export default function App() {
           <TransformTrackpad
             clip={selectedClip}
             currentTime={currentTime}
+            currentUserId={user.id}
             snapEnabled={snapEnabled}
+            onLockLayer={sendLayerLock}
             onTransformClip={handleTransformClipOnCanvas}
             onSnapGuidesChange={setTrackpadSnapGuides}
             onClose={() => {
@@ -1231,6 +1619,7 @@ export default function App() {
             currentTime={currentTime}
             pxPerSec={pxPerSec}
             selectedClipId={selectedClipId}
+            currentUserId={user.id}
             collaborators={collaborators}
             onSeek={handleSeek}
             onSelectClip={setSelectedClipId}
@@ -1238,6 +1627,7 @@ export default function App() {
             onAddTrack={addTrack}
             onUpdateTrack={updateTrack}
             onDeleteTrack={deleteTrack}
+            onLockLayer={sendLayerLock}
             onClipTransform={handleClipTransform}
           />
         )}
@@ -1285,6 +1675,160 @@ export default function App() {
             </button>
           </div>
         )}
+        {selectedClip &&
+          (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+          showChromaKeyPanel && (
+            <div className="space-y-2 border-b border-white/10 bg-[#14171a] px-3 py-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span
+                    className="h-6 w-6 shrink-0 rounded-full border-2 border-white/85 shadow-sm"
+                    style={{
+                      backgroundColor: selectedClip.chromaKeyColor || '#00ff00',
+                    }}
+                  />
+                  <div className="leading-tight">
+                    <p className="text-[11px] font-semibold text-emerald-300">
+                      Хромакей · пипетка на кадре
+                    </p>
+                    <p className="font-mono text-[10px] text-zinc-400">
+                      {(selectedClip.chromaKeyColor || '#00ff00').toUpperCase()}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleUpdateChromaKey(
+                        selectedClip.id,
+                        {chromaKeyEnabled: !selectedClip.chromaKeyEnabled},
+                        true
+                      )
+                    }
+                    className={`rounded-md px-2 py-1 text-[10px] font-semibold ${
+                      selectedClip.chromaKeyEnabled
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : 'bg-white/10 text-zinc-400'
+                    }`}
+                  >
+                    {selectedClip.chromaKeyEnabled ? 'ВКЛ' : 'ВЫКЛ'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowChromaKeyPanel(false)}
+                    className="rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-zinc-200"
+                  >
+                    Готово
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <label className="space-y-1">
+                  <div className="flex justify-between text-[10px] text-zinc-300">
+                    <span>Интенсивность</span>
+                    <span className="font-mono tabular-nums text-emerald-300">
+                      {(selectedClip.chromaKeyIntensity ?? 0.35).toFixed(2)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={selectedClip.chromaKeyIntensity ?? 0.35}
+                    onChange={(e) =>
+                      handleUpdateChromaKey(
+                        selectedClip.id,
+                        {
+                          chromaKeyEnabled: true,
+                          chromaKeyColor:
+                            selectedClip.chromaKeyColor || '#00ff00',
+                          chromaKeyIntensity: Number(e.target.value),
+                        },
+                        false
+                      )
+                    }
+                    onPointerUp={(e) =>
+                      handleUpdateChromaKey(
+                        selectedClip.id,
+                        {
+                          chromaKeyIntensity: Number(
+                            (e.target as HTMLInputElement).value
+                          ),
+                        },
+                        true
+                      )
+                    }
+                    onTouchEnd={(e) =>
+                      handleUpdateChromaKey(
+                        selectedClip.id,
+                        {
+                          chromaKeyIntensity: Number(
+                            (e.target as HTMLInputElement).value
+                          ),
+                        },
+                        true
+                      )
+                    }
+                    className="h-2 w-full cursor-pointer accent-emerald-400"
+                  />
+                </label>
+
+                <label className="space-y-1">
+                  <div className="flex justify-between text-[10px] text-zinc-300">
+                    <span>Сглаживание</span>
+                    <span className="font-mono tabular-nums text-emerald-300">
+                      {(selectedClip.chromaKeySmoothness ?? 0.15).toFixed(2)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={selectedClip.chromaKeySmoothness ?? 0.15}
+                    onChange={(e) =>
+                      handleUpdateChromaKey(
+                        selectedClip.id,
+                        {
+                          chromaKeyEnabled: true,
+                          chromaKeyColor:
+                            selectedClip.chromaKeyColor || '#00ff00',
+                          chromaKeySmoothness: Number(e.target.value),
+                        },
+                        false
+                      )
+                    }
+                    onPointerUp={(e) =>
+                      handleUpdateChromaKey(
+                        selectedClip.id,
+                        {
+                          chromaKeySmoothness: Number(
+                            (e.target as HTMLInputElement).value
+                          ),
+                        },
+                        true
+                      )
+                    }
+                    onTouchEnd={(e) =>
+                      handleUpdateChromaKey(
+                        selectedClip.id,
+                        {
+                          chromaKeySmoothness: Number(
+                            (e.target as HTMLInputElement).value
+                          ),
+                        },
+                        true
+                      )
+                    }
+                    className="h-2 w-full cursor-pointer accent-emerald-400"
+                  />
+                </label>
+              </div>
+            </div>
+          )}
         {selectedClip ? (
           <div className="no-scrollbar flex h-14 items-center gap-1 overflow-x-auto px-2">
             <button
@@ -1321,7 +1865,10 @@ export default function App() {
             {selectedClip.track !== 'audio' && (
               <button
                 type="button"
-                onClick={() => setShowOpacitySlider((v) => !v)}
+                onClick={() => {
+                  setShowChromaKeyPanel(false);
+                  setShowOpacitySlider((v) => !v);
+                }}
                 className={`flex h-11 min-w-[78px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
                   showOpacitySlider
                     ? 'bg-cyan-500/20 text-cyan-300'
@@ -1331,6 +1878,53 @@ export default function App() {
                 <Droplet className="h-4 w-4 text-cyan-400" />
                 <span>Прозрачность</span>
               </button>
+            )}
+            {(selectedClip.kind === 'image' ||
+              selectedClip.kind === 'video') && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setShowChromaKeyPanel((v) => !v);
+                  }}
+                  className={`flex h-11 min-w-[70px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    showChromaKeyPanel
+                      ? 'bg-emerald-500/20 text-emerald-300'
+                      : selectedClip.chromaKeyEnabled
+                        ? 'text-emerald-300 hover:bg-white/5'
+                        : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Pipette className="h-4 w-4 text-emerald-400" />
+                  <span>Хромакей</span>
+                </button>
+                <label
+                  className={`flex h-11 min-w-[66px] shrink-0 cursor-pointer flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5 ${
+                    replacingMedia ? 'opacity-50 pointer-events-none' : ''
+                  }`}
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 text-cyan-400 ${
+                      replacingMedia ? 'animate-spin' : ''
+                    }`}
+                  />
+                  <span>Заменить</span>
+                  <input
+                    type="file"
+                    accept="video/*,image/*"
+                    disabled={replacingMedia}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file && selectedClip) {
+                        void handleReplaceClipMedia(selectedClip.id, file);
+                      }
+                      e.target.value = '';
+                    }}
+                    className="hidden"
+                  />
+                </label>
+              </>
             )}
             {selectedClip.track === 'overlay' && (
               <button
@@ -1491,12 +2085,16 @@ export default function App() {
       )}
       {mobileSheet === 'team' && (
         <BottomSheet
-          title="Чат и команда"
+          title="Чат и сеть (LAN / ZeroTier)"
           onClose={() => setMobileSheet(null)}
         >
           <TeamPanel
             roomId={roomId}
             serverUrl={serverUrl}
+            p2pMode={p2pMode}
+            networkInterfaces={networkInterfaces}
+            hostPort={hostPort}
+            udpRooms={udpRooms}
             user={user}
             allCollaborators={allCollaborators}
             availableRooms={availableRooms}
@@ -1510,15 +2108,25 @@ export default function App() {
             onSwitchRoom={switchRoom}
             onSendChat={sendChatMessage}
             onUpdateServerUrl={updateServerConnection}
+            onStartHost={startHostRoom}
+            onStopHost={stopHostRoom}
+            onConnectToHostIp={connectToHostIp}
+            onRefreshNetwork={() => {
+              void refreshNetworkInfo();
+            }}
           />
         </BottomSheet>
       )}
 
-      {/* Minecraft-style LAN Room Browser Modal */}
+      {/* Minecraft-style LAN / ZeroTier Room Browser Modal */}
       {showLobbyModal && (
         <RoomsLobbyModal
           currentRoomId={roomId}
           serverUrl={serverUrl}
+          p2pMode={p2pMode}
+          networkInterfaces={networkInterfaces}
+          hostPort={hostPort}
+          udpRooms={udpRooms}
           status={status}
           availableRooms={availableRooms}
           onSelectRoom={(nextId) => switchRoom(nextId)}
@@ -1527,6 +2135,9 @@ export default function App() {
             void refreshRooms();
           }}
           onConnectServer={(url) => updateServerConnection(url)}
+          onStartHost={startHostRoom}
+          onStopHost={stopHostRoom}
+          onConnectToHostIp={connectToHostIp}
           onClose={() => setShowLobbyModal(false)}
         />
       )}

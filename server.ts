@@ -18,6 +18,7 @@ import type {
   AspectRatio,
   ClientWsMessage,
   Collaborator,
+  NetworkInterfaceInfo,
   ProjectState,
   RoomSummary,
   ServerWsMessage,
@@ -215,18 +216,41 @@ function broadcastLobbyRooms() {
   }, 120);
 }
 
-function getLocalLanIps(): string[] {
+function getNetworkInterfacesList(): NetworkInterfaceInfo[] {
   const nets = os.networkInterfaces();
-  const ips: string[] = [];
-  for (const iface of Object.values(nets)) {
-    if (!iface) continue;
-    for (const addr of iface) {
+  const list: NetworkInterfaceInfo[] = [];
+  for (const [name, addrs] of Object.entries(nets)) {
+    if (!addrs) continue;
+    for (const addr of addrs) {
       if (addr.family === 'IPv4' && !addr.internal) {
-        ips.push(addr.address);
+        const lower = name.toLowerCase();
+        const type: NetworkInterfaceInfo['type'] = lower.startsWith('zt')
+          ? 'zerotier'
+          : lower.startsWith('wl') ||
+              lower.startsWith('wifi') ||
+              lower.startsWith('wi-fi') ||
+              lower.startsWith('en')
+            ? 'wifi'
+            : 'lan';
+        const label =
+          type === 'zerotier'
+            ? `ZeroTier (${name})`
+            : type === 'wifi'
+              ? `Wi-Fi (${name})`
+              : `LAN (${name})`;
+        list.push({name, ip: addr.address, type, label});
       }
     }
   }
-  return ips;
+  return list.sort((a, b) => {
+    const rank = (t: NetworkInterfaceInfo['type']) =>
+      t === 'zerotier' ? 0 : t === 'wifi' ? 1 : 2;
+    return rank(a.type) - rank(b.type);
+  });
+}
+
+function getLocalLanIps(): string[] {
+  return getNetworkInterfacesList().map((n) => n.ip);
 }
 
 loadRoomsFromDisk();
@@ -297,6 +321,46 @@ app.use(
   })
 );
 
+app.use(
+  '/media',
+  express.static(UPLOADS_DIR, {
+    acceptRanges: true,
+    maxAge: '1d',
+  })
+);
+
+app.post('/media/upload', (req, res, next) => {
+  const rawName = req.query.fileName;
+  const contentType = req.headers['content-type'] || '';
+  if (contentType.includes('multipart/form-data')) {
+    return next();
+  }
+  const safeBase =
+    typeof rawName === 'string' && rawName.trim()
+      ? path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_')
+      : `media-${Date.now()}.bin`;
+  const finalName = `${Date.now()}-${safeBase}`;
+  const destPath = path.join(UPLOADS_DIR, finalName);
+  const ws = fs.createWriteStream(destPath);
+  req.pipe(ws);
+  ws.on('finish', () => {
+    const ifaces = getNetworkInterfacesList();
+    const primaryIp =
+      ifaces.find((i) => i.type === 'wifi')?.ip ||
+      ifaces[0]?.ip ||
+      '127.0.0.1';
+    res.json({
+      ok: true,
+      fileName: finalName,
+      localUrl: `/media/${finalName}`,
+      shareUrl: `http://${primaryIp}:${PORT}/media/${finalName}`,
+    });
+  });
+  ws.on('error', (err) => {
+    res.status(500).json({error: err.message});
+  });
+});
+
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
@@ -309,11 +373,20 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.get('/api/network-info', (req, res) => {
-  const ips = getLocalLanIps();
+  const interfaces = getNetworkInterfacesList();
+  const ips = interfaces.map((i) => i.ip);
+  const primaryIp =
+    interfaces.find((i) => i.type === 'wifi')?.ip ||
+    interfaces[0]?.ip ||
+    '127.0.0.1';
   const protocol = req.protocol;
   const host = req.get('host');
   res.json({
     origin: `${protocol}://${host}`,
+    interfaces,
+    primaryIp,
+    port: PORT,
+    udpPort: 8081,
     lanUrls: ips.map((ip) => `http://${ip}:${PORT}`),
     hostName: os.hostname(),
   });
@@ -399,7 +472,8 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     id: crypto.randomBytes(6).toString('hex'),
     name: displayName,
     kind,
-    src: `/uploads/${file.filename}`,
+    fileName: file.filename,
+    src: `/media/${file.filename}`,
     sizeBytes: file.size,
   });
 });
@@ -416,10 +490,40 @@ app.use(
 );
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({server, path: '/ws'});
+const wss = new WebSocketServer({noServer: true});
+
+server.on('upgrade', (request, socket, head) => {
+  const pathname = (request.url || '').split('?')[0];
+  if (pathname === '/ws' || pathname === '/sync') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 function removeSession(session: ClientSession | null) {
   if (!session) return;
+  const project = rooms.get(session.roomId);
+  if (project) {
+    for (const clip of project.clips) {
+      if (clip.lockedByUserId === session.user.id) {
+        clip.lockedByUserId = null;
+        clip.lockedByUserName = null;
+        clip.lockedByUserColor = null;
+        broadcastToRoom(session.roomId, {
+          type: 'LAYER_LOCK',
+          layerId: clip.id,
+          userId: session.user.id,
+          userName: '',
+          userColor: '',
+          locked: false,
+        });
+      }
+    }
+  }
+
   const set = roomConnections.get(session.roomId);
   if (set) {
     set.delete(session);
@@ -795,6 +899,85 @@ wss.on('connection', (ws) => {
         });
         break;
       }
+
+      case 'LAYER_MEDIA_UPDATED': {
+        if (
+          msg.newTrack &&
+          !project.tracks.some((t) => t.id === msg.newTrack!.id)
+        ) {
+          project.tracks.push(msg.newTrack);
+        }
+        const idx = project.clips.findIndex((c) => c.id === msg.layerId);
+        if (idx !== -1) {
+          project.clips[idx] = {
+            ...project.clips[idx],
+            src: msg.mediaUrl,
+            mediaRemoteUrl: msg.mediaUrl,
+            mediaFileName: msg.fileName,
+          };
+        } else if (msg.clip) {
+          project.clips.push({
+            ...msg.clip,
+            id: msg.layerId,
+            src: msg.mediaUrl,
+            mediaRemoteUrl: msg.mediaUrl,
+            mediaFileName: msg.fileName,
+          });
+        }
+        project.revision += 1;
+        project.updatedAt = Date.now();
+        scheduleSaveRooms();
+        broadcastToRoom(
+          session.roomId,
+          {
+            type: 'LAYER_MEDIA_UPDATED',
+            layerId: msg.layerId,
+            fileName: msg.fileName,
+            mediaUrl: msg.mediaUrl,
+            senderId: session.user.id,
+            clip: msg.clip,
+            newTrack: msg.newTrack,
+            revision: project.revision,
+          },
+          ws
+        );
+        broadcastLobbyRooms();
+        break;
+      }
+
+      case 'LAYER_LOCK': {
+        const idx = project.clips.findIndex((c) => c.id === msg.layerId);
+        if (idx !== -1) {
+          if (msg.locked) {
+            project.clips[idx] = {
+              ...project.clips[idx],
+              lockedByUserId: session.user.id,
+              lockedByUserName: session.user.name,
+              lockedByUserColor: session.user.color,
+            };
+          } else if (project.clips[idx].lockedByUserId === session.user.id) {
+            project.clips[idx] = {
+              ...project.clips[idx],
+              lockedByUserId: null,
+              lockedByUserName: null,
+              lockedByUserColor: null,
+            };
+          }
+        }
+        broadcastToRoom(
+          session.roomId,
+          {
+            type: 'LAYER_LOCK',
+            layerId: msg.layerId,
+            userId: session.user.id,
+            userName: msg.locked ? session.user.name : '',
+            userColor: msg.locked ? session.user.color : '',
+            locked: msg.locked,
+          },
+          ws
+        );
+        break;
+      }
     }
   });
 
@@ -825,7 +1008,7 @@ setInterval(() => {
   }
 }, 25000);
 
-// Minecraft-style UDP LAN discovery beacon on local Wi-Fi networks
+// Minecraft-style UDP LAN discovery beacon on port 8081
 function startLanBeacon() {
   try {
     const udp = dgram.createSocket('udp4');
@@ -842,20 +1025,32 @@ function startLanBeacon() {
     setInterval(() => {
       const publicRooms = getPublicRoomSummaries();
       if (publicRooms.length === 0) return;
+      const ifaces = getNetworkInterfacesList();
+      const primary = publicRooms[0];
+      const primaryIp =
+        ifaces.find((i) => i.type === 'wifi')?.ip ||
+        ifaces[0]?.ip ||
+        '127.0.0.1';
       const packet = Buffer.from(
         JSON.stringify({
           app: 'CutSync',
+          roomId: primary.roomId,
+          title: primary.title,
+          hostName: primary.hostName || os.hostname(),
+          ip: primaryIp,
+          ips: ifaces.map((i) => i.ip),
           port: PORT,
-          host: os.hostname(),
+          aspectRatio: primary.aspectRatio,
+          participants: primary.collaboratorsCount,
           roomsCount: publicRooms.length,
         })
       );
       try {
-        udp.send(packet, 41234, '255.255.255.255');
+        udp.send(packet, 8081, '255.255.255.255');
       } catch {
         // ignore
       }
-    }, 2500);
+    }, 1500);
   } catch {
     // ignore
   }
