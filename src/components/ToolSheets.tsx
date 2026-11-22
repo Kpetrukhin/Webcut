@@ -1655,7 +1655,7 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
               value={manualIpInput}
               onChange={(e) => setManualIpInput(e.target.value)}
               placeholder="IP хоста (Wi-Fi или ZeroTier, напр. 10.147.20.5)"
-              className="h-10 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+              className="h-10 min-w-0 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
             />
             <button
               type="submit"
@@ -1702,12 +1702,12 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
             value={chatInput}
             onChange={(e) => setChatInput(e.target.value)}
             placeholder="Написать команде..."
-            className="h-10 flex-1 rounded-lg border border-white/10 bg-zinc-950 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+            className="h-10 min-w-0 flex-1 rounded-lg border border-white/10 bg-zinc-950 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
           />
           <button
             type="submit"
             aria-label="Отправить сообщение"
-            className="flex h-10 w-10 items-center justify-center rounded-lg bg-cyan-500 text-zinc-950 hover:bg-cyan-400"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-cyan-500 text-zinc-950 hover:bg-cyan-400"
           >
             <Send className="h-4 w-4" />
           </button>

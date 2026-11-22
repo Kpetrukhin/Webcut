@@ -422,13 +422,13 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
               </div>
             )}
 
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2 sm:flex-nowrap">
               <input
                 type="text"
                 value={subnetHint}
                 onChange={(e) => setSubnetHint(e.target.value)}
                 placeholder="Подсеть (192.168.1)"
-                className="h-9 w-32 rounded-lg border border-white/10 bg-zinc-950 px-2 font-mono text-[11px] text-zinc-200 placeholder:text-zinc-600 focus:border-cyan-400 focus:outline-none"
+                className="h-9 w-full rounded-lg border border-white/10 bg-zinc-950 px-2 font-mono text-[11px] text-zinc-200 placeholder:text-zinc-600 focus:border-cyan-400 focus:outline-none sm:w-32 sm:shrink-0"
               />
               <form
                 onSubmit={(e) => {
@@ -436,18 +436,18 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
                   if (!manualHost.trim()) return;
                   onConnectToHostIp(manualHost.trim());
                 }}
-                className="flex flex-1 gap-2"
+                className="flex min-w-0 flex-1 gap-2"
               >
                 <input
                   type="text"
                   value={manualHost}
                   onChange={(e) => setManualHost(e.target.value)}
                   placeholder="IP хоста (10.147.x.x / 192.168.x.x)"
-                  className="h-9 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+                  className="h-9 min-w-0 flex-1 rounded-lg border border-white/15 bg-zinc-950 px-2.5 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
                 />
                 <button
                   type="submit"
-                  className="h-9 rounded-lg bg-cyan-500 px-3 text-xs font-bold text-zinc-950 hover:bg-cyan-400"
+                  className="h-9 shrink-0 rounded-lg bg-cyan-500 px-3 text-xs font-bold text-zinc-950 hover:bg-cyan-400"
                 >
                   Войти
                 </button>

@@ -35,8 +35,12 @@ const DEFAULT_LOCK_TIMEOUT_MS = Number(process.env.LOCK_TIMEOUT_MS) || 5000;
 let lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS;
 
 const ROOT_DIR = process.cwd();
-const UPLOADS_DIR = path.join(ROOT_DIR, 'uploads');
-const DATA_DIR = path.join(ROOT_DIR, 'data');
+const UPLOADS_DIR = process.env.CUTSYNC_UPLOADS_DIR
+  ? path.resolve(process.env.CUTSYNC_UPLOADS_DIR)
+  : path.join(ROOT_DIR, 'uploads');
+const DATA_DIR = process.env.CUTSYNC_DATA_DIR
+  ? path.resolve(process.env.CUTSYNC_DATA_DIR)
+  : path.join(ROOT_DIR, 'data');
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
 
 fs.mkdirSync(UPLOADS_DIR, {recursive: true});
@@ -165,15 +169,31 @@ function loadRoomsFromDisk() {
 }
 
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
+function serializeRoomsState(): string {
+  const obj: Record<string, ProjectState> = {};
+  for (const [k, v] of rooms.entries()) {
+    obj[k] = v;
+  }
+  return JSON.stringify(obj, null, 2);
+}
+
+function flushRoomsToDiskSync() {
+  if (saveTimer) {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+  }
+  try {
+    fs.writeFileSync(ROOMS_FILE, serializeRoomsState(), 'utf-8');
+  } catch (err) {
+    console.error('Failed to flush rooms.json:', err);
+  }
+}
+
 function scheduleSaveRooms() {
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    const obj: Record<string, ProjectState> = {};
-    for (const [k, v] of rooms.entries()) {
-      obj[k] = v;
-    }
-    fs.writeFile(ROOMS_FILE, JSON.stringify(obj, null, 2), (err) => {
+    fs.writeFile(ROOMS_FILE, serializeRoomsState(), (err) => {
       if (err) console.error('Failed to persist rooms.json:', err);
     });
   }, 400);
@@ -1339,6 +1359,7 @@ export async function startServer(opts?: {
   lockTimeoutMs?: number;
   disableVite?: boolean;
   disableBeacon?: boolean;
+  fallbackToRandomPort?: boolean;
 }): Promise<{port: number; server: http.Server}> {
   if (wssClosed) {
     wss = new WebSocketServer({noServer: true});
@@ -1360,7 +1381,9 @@ export async function startServer(opts?: {
       });
       app.use(vite.middlewares);
     } else {
-      const distDir = path.join(ROOT_DIR, 'dist');
+      const distDir = process.env.CUTSYNC_DIST_DIR
+        ? path.resolve(process.env.CUTSYNC_DIST_DIR)
+        : path.join(ROOT_DIR, 'dist');
       app.use(express.static(distDir));
       app.get('*', (_req, res) => {
         res.sendFile(path.join(distDir, 'index.html'));
@@ -1369,17 +1392,32 @@ export async function startServer(opts?: {
   }
 
   const listenPort = opts?.port ?? ACTIVE_PORT;
-  await new Promise<void>((resolve) => {
-    server.listen(listenPort, '0.0.0.0', () => {
-      const addr = server.address();
-      if (addr && typeof addr === 'object') {
-        ACTIVE_PORT = addr.port;
-      }
-      if (!opts?.disableBeacon) {
-        startLanBeacon();
-      }
-      resolve();
-    });
+  await new Promise<void>((resolve, reject) => {
+    const attemptListen = (targetPort: number, allowFallback: boolean) => {
+      const onError = (err: NodeJS.ErrnoException) => {
+        server.off('listening', onListening);
+        if (err.code === 'EADDRINUSE' && allowFallback && targetPort !== 0) {
+          attemptListen(0, false);
+          return;
+        }
+        reject(err);
+      };
+      const onListening = () => {
+        server.off('error', onError);
+        const addr = server.address();
+        if (addr && typeof addr === 'object') {
+          ACTIVE_PORT = addr.port;
+        }
+        if (!opts?.disableBeacon) {
+          startLanBeacon();
+        }
+        resolve();
+      };
+      server.once('error', onError);
+      server.once('listening', onListening);
+      server.listen(targetPort, '0.0.0.0');
+    };
+    attemptListen(listenPort, Boolean(opts?.fallbackToRandomPort));
   });
 
   if (process.env.CUTSYNC_NO_AUTOSTART !== '1') {
@@ -1389,6 +1427,9 @@ export async function startServer(opts?: {
 }
 
 export async function stopServer(): Promise<void> {
+  if (saveTimer) {
+    flushRoomsToDiskSync();
+  }
   if (wsHealthTimer) {
     clearInterval(wsHealthTimer);
     wsHealthTimer = null;

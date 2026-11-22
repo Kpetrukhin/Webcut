@@ -12,10 +12,12 @@ import {
   applyClipSplit,
   applyTrackReorder,
   createDefaultTracks,
+  createStarterClips,
   encodePatchForSync,
   normalizeProjectTracks,
 } from '../src/shared/types.ts';
 import type {Clip, ProjectState, ServerWsMessage} from '../src/shared/types.ts';
+import {evaluateClipTransform} from '../src/lib/keyframeEngine.ts';
 import {sha256Hex, sha256SyncHex} from '../src/lib/sha256.ts';
 import {downloadMediaInBackground} from '../src/lib/lanSyncBridge.ts';
 import {
@@ -1266,4 +1268,18 @@ test('E2E Concurrent Multi-User: 2 участника одновременно �
     }
   }
 });
+
+test('Основное видео и стартовые клипы не приближаются автоматически без ключевых кадров', () => {
+  const starter = createStarterClips();
+  for (const c of starter) {
+    assert.equal(c.motionEffect, 'none');
+    assert.notEqual(c.transitionIn, 'zoom');
+    const atStart = evaluateClipTransform(c, c.start);
+    const atMid = evaluateClipTransform(c, c.start + c.duration * 0.5);
+    const atEnd = evaluateClipTransform(c, c.start + c.duration);
+    assert.equal(atStart.scale, atMid.scale);
+    assert.equal(atMid.scale, atEnd.scale);
+  }
+});
+
 

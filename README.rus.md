@@ -60,15 +60,34 @@ cd android && ./gradlew assembleDebug
 
 После запуска откройте `http://localhost:3000` на ПК. Чтобы подключиться с телефона в той же Wi-Fi сети, откройте вкладку **Команда** — там автоматически отобразится локальный LAN-адрес вида `http://192.168.x.x:3000/?room=studio-demo`.
 
+## Сборка и скачивание Windows Desktop (.exe)
+
+Автономное портативное приложение для Windows (Electron + встроенный сервер CutSync, не требует установки и Node.js на компьютере пользователя):
+
+1. Откройте вкладку **Actions** в репозитории GitHub.
+2. Выберите последний успешный запуск **Build Windows Desktop (.exe)** (запускается автоматически при `push` в `main`/`master` или вручную кнопкой **Run workflow**).
+3. В разделе **Artifacts** скачайте архив **`CutSync-Windows-EXE`** (внутри находится **`CutSync-Portable.exe`**). При создании git-тега вида `v1.0.0` готовый `.exe` также прикрепляется к **GitHub Releases**.
+4. Проекты (`data/rooms.json`) и загруженные медиафайлы (`uploads`) автоматически сохраняются в пользовательской папке Windows (`%APPDATA%\CutSync\`), а экспортированные видео сохраняются через стандартный диалог Windows.
+
+Для локальной сборки `.exe` (на Windows):
+
+```bash
+npm install
+npm run build:exe
+# Готовый файл появится в release/CutSync-Portable.exe
+```
+
 ## Стек
 
 - **Frontend**: React 19, TypeScript, Tailwind CSS v4, Lucide Icons, Vite, `vite-plugin-pwa`
 - **Backend**: Node.js, Express 4, `ws` (WebSocket), Multer (загрузка медиа)
+- **Desktop / Mobile**: Electron + `electron-builder` (`.exe`), Capacitor (`.apk`)
 - **Рендер и звук**: HTML5 Canvas 2D, `MediaRecorder` API, Web Audio API
 
 ## Структура проекта
 
 - `server.ts` — Express-сервер, WebSocket-комнаты, загрузка файлов в `/uploads`, хранение комнат в `/data/rooms.json`
+- `electron/main.cjs` — точка входа Electron: запуск локального сервера, права на камеру/микрофон, скачивание экспорта
 - `src/shared/types.ts` — общие типы данных, протокол WebSocket и стартовые пресеты
 - `src/lib/renderEngine.ts` — композитинг кадров на Canvas и экспорт видео
 - `src/lib/audioEngine.ts` — синхронизация аудио и процедурный Web Audio синтезатор

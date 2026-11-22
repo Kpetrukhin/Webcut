@@ -654,10 +654,7 @@ export default function App() {
           contrast: 1,
           saturate: 1,
           transitionIn: 'none',
-          motionEffect:
-            opts.kind === 'image' && opts.track === 'video'
-              ? 'kenburns-in'
-              : 'none',
+          motionEffect: 'none',
           mediaScale: isSticker ? 0.36 : opts.track === 'overlay' ? 0.55 : 1,
           mediaX: 0.5,
           mediaY: 0.5,
@@ -929,6 +926,8 @@ export default function App() {
           downloadProgress: 100,
           trimStart: 0,
           sourceDuration: mediaKind === 'image' ? 60 : probedDuration,
+          motionEffect: 'none',
+          transitionIn: target.transitionIn === 'zoom' ? 'none' : target.transitionIn,
         };
 
         sendLayerMediaUpdated({
@@ -1681,7 +1680,7 @@ export default function App() {
         </div>
 
         {/* Center: Rooms Browser + Quick Team Chat Button */}
-        <div className="flex items-center gap-1.5">
+        <div className="flex shrink-0 items-center gap-1.5">
           <button
             type="button"
             onClick={() => setShowLobbyModal(true)}
@@ -1759,7 +1758,7 @@ export default function App() {
       </header>
 
       {/* Main Studio Body */}
-      <div className="flex flex-1 min-h-0 flex-col lg:grid lg:grid-cols-[360px_1fr_310px]">
+      <div className="flex flex-1 min-h-0 flex-col lg:grid lg:grid-cols-[300px_1fr_272px] xl:grid-cols-[356px_1fr_308px]">
         {/* Desktop Left Sidebar */}
         <aside className="hidden border-r border-white/10 bg-[#111114] lg:flex lg:min-h-0 lg:flex-col">
           <div className="grid grid-cols-4 gap-1 border-b border-white/10 p-1.5">
@@ -1822,32 +1821,32 @@ export default function App() {
                         type="button"
                         onClick={handleSplitSelectedOrCurrent}
                         disabled={!canSplitNow}
-                        className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-3 text-xs font-medium text-zinc-200 hover:border-cyan-400 disabled:opacity-35"
+                        className="flex h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-2.5 text-xs font-medium text-zinc-200 hover:border-cyan-400 disabled:opacity-35"
                       >
-                        <Scissors className="h-4 w-4 text-cyan-400" />
-                        Разделить
+                        <Scissors className="h-4 w-4 shrink-0 text-cyan-400" />
+                        <span className="truncate">Разделить</span>
                       </button>
                       <button
                         type="button"
                         onClick={handleDuplicateSelected}
-                        className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-3 text-xs font-medium text-zinc-200 hover:border-cyan-400"
+                        className="flex h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-2.5 text-xs font-medium text-zinc-200 hover:border-cyan-400"
                       >
-                        <CopyPlus className="h-4 w-4 text-cyan-400" />
-                        Копия
+                        <CopyPlus className="h-4 w-4 shrink-0 text-cyan-400" />
+                        <span className="truncate">Копия</span>
                       </button>
                       {(selectedClip.kind === 'image' ||
                         selectedClip.kind === 'video') && (
                         <label
-                          className={`flex h-11 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-3 text-xs font-medium text-zinc-200 hover:border-cyan-400 ${
+                          className={`flex h-11 min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-2.5 text-xs font-medium text-zinc-200 hover:border-cyan-400 ${
                             replacingMedia ? 'opacity-50 pointer-events-none' : ''
                           }`}
                         >
                           <RefreshCw
-                            className={`h-4 w-4 text-cyan-400 ${
+                            className={`h-4 w-4 shrink-0 text-cyan-400 ${
                               replacingMedia ? 'animate-spin' : ''
                             }`}
                           />
-                          Заменить
+                          <span className="truncate">Заменить</span>
                           <input
                             type="file"
                             accept="video/*,image/*"
@@ -1870,10 +1869,10 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => retryMediaDownload(selectedClip.id)}
-                          className="col-span-2 flex h-11 items-center justify-center gap-1.5 rounded-xl border border-rose-500/50 bg-rose-500/20 px-3 text-xs font-semibold text-rose-200 hover:bg-rose-500/30"
+                          className="col-span-2 flex h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl border border-rose-500/50 bg-rose-500/20 px-2.5 text-xs font-semibold text-rose-200 hover:bg-rose-500/30"
                         >
-                          <RefreshCw className="h-4 w-4 text-rose-300" />
-                          Перекачать файл P2P
+                          <RefreshCw className="h-4 w-4 shrink-0 text-rose-300" />
+                          <span className="truncate">Перекачать файл P2P</span>
                         </button>
                       )}
                       {(selectedClip.track === 'video' ||
@@ -1888,12 +1887,14 @@ export default function App() {
                                 : 'video'
                             )
                           }
-                          className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-indigo-500/35 bg-indigo-500/10 px-3 text-xs font-medium text-indigo-200 hover:border-indigo-400"
+                          className="flex h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl border border-indigo-500/35 bg-indigo-500/10 px-2.5 text-xs font-medium text-indigo-200 hover:border-indigo-400"
                         >
-                          <Layers className="h-4 w-4 text-indigo-400" />
-                          {selectedClip.track === 'video'
-                            ? 'Наложение'
-                            : 'Основное'}
+                          <Layers className="h-4 w-4 shrink-0 text-indigo-400" />
+                          <span className="truncate">
+                            {selectedClip.track === 'video'
+                              ? 'Наложение'
+                              : 'Основное'}
+                          </span>
                         </button>
                       )}
                       {(selectedClip.kind === 'image' ||
@@ -1901,10 +1902,10 @@ export default function App() {
                         <button
                           type="button"
                           onClick={() => setShowCompressModal(true)}
-                          className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-200 hover:border-emerald-400"
+                          className="flex h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-2.5 text-xs font-medium text-emerald-200 hover:border-emerald-400"
                         >
-                          <Minimize2 className="h-4 w-4 text-emerald-400" />
-                          Сжать (Качество)
+                          <Minimize2 className="h-4 w-4 shrink-0 text-emerald-400" />
+                          <span className="truncate">Сжать</span>
                         </button>
                       )}
                       <button
@@ -1913,10 +1914,10 @@ export default function App() {
                           deleteClip(selectedClip.id);
                           setSelectedClipId(null);
                         }}
-                        className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-xs font-medium text-rose-300 hover:border-rose-400"
+                        className="flex h-11 min-w-0 items-center justify-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 px-2.5 text-xs font-medium text-rose-300 hover:border-rose-400"
                       >
-                        <Trash2 className="h-4 w-4" />
-                        Удалить
+                        <Trash2 className="h-4 w-4 shrink-0" />
+                        <span className="truncate">Удалить</span>
                       </button>
                     </div>
 
@@ -2578,48 +2579,48 @@ export default function App() {
         {/* Center Preview Canvas + Transport Bar */}
         <main className="relative flex flex-1 min-h-0 flex-col bg-[#09090b]">
           {(lockWarning || noticeMsg) && (
-            <div className="pointer-events-none absolute top-3 left-1/2 z-30 -translate-x-1/2 rounded-full border border-amber-400/50 bg-zinc-950/90 px-3.5 py-1.5 text-xs font-semibold text-amber-300 shadow-lg backdrop-blur-xs">
+            <div className="pointer-events-none absolute top-3 left-1/2 z-30 max-w-[calc(100%-96px)] -translate-x-1/2 truncate rounded-full border border-amber-400/50 bg-zinc-950/90 px-3.5 py-1.5 text-xs font-semibold text-amber-300 shadow-lg backdrop-blur-xs">
               {lockWarning || noticeMsg}
             </div>
           )}
           {bgColorPickerActive && (
-            <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border border-cyan-400/60 bg-zinc-950/90 px-3 py-1.5 shadow-xl backdrop-blur-xs">
+            <div className="absolute top-3 left-1/2 z-30 flex max-w-[calc(100%-96px)] -translate-x-1/2 items-center gap-2 rounded-full border border-cyan-400/60 bg-zinc-950/90 px-3 py-1.5 shadow-xl backdrop-blur-xs">
               <span
                 className="h-4 w-4 shrink-0 rounded-full border border-white/40"
                 style={{backgroundColor: project.backgroundColor || '#09090b'}}
               />
-              <span className="whitespace-nowrap text-[11px] font-medium text-cyan-200">
+              <span className="truncate text-[11px] font-medium text-cyan-200">
                 Пипетка (Фон холста): ведите по холсту
               </span>
               <button
                 type="button"
                 onClick={() => setBgColorPickerActive(false)}
-                className="rounded-full bg-cyan-500 px-2.5 py-0.5 text-[10px] font-bold text-zinc-950 hover:bg-cyan-400"
+                className="shrink-0 rounded-full bg-cyan-500 px-2.5 py-0.5 text-[10px] font-bold text-zinc-950 hover:bg-cyan-400"
               >
                 Готово
               </button>
             </div>
           )}
           {isTextColorPickerActive && (
-            <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border border-cyan-400/60 bg-zinc-950/90 px-3 py-1.5 shadow-xl backdrop-blur-xs">
+            <div className="absolute top-3 left-1/2 z-30 flex max-w-[calc(100%-96px)] -translate-x-1/2 items-center gap-2 rounded-full border border-cyan-400/60 bg-zinc-950/90 px-3 py-1.5 shadow-xl backdrop-blur-xs">
               <span
                 className="h-4 w-4 shrink-0 rounded-full border border-white/40"
                 style={{backgroundColor: textColorPickerHex}}
               />
-              <span className="whitespace-nowrap text-[11px] font-medium text-cyan-200">
+              <span className="truncate text-[11px] font-medium text-cyan-200">
                 Пипетка ({textColorPickerFieldLabel}): ведите по холсту
               </span>
               <button
                 type="button"
                 onClick={() => setTextColorPicker(null)}
-                className="rounded-full bg-cyan-500 px-2.5 py-0.5 text-[10px] font-bold text-zinc-950 hover:bg-cyan-400"
+                className="shrink-0 rounded-full bg-cyan-500 px-2.5 py-0.5 text-[10px] font-bold text-zinc-950 hover:bg-cyan-400"
               >
                 Готово
               </button>
             </div>
           )}
           {isCurveEditOverlayActive && selectedClip && (
-            <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-cyan-400/50 bg-zinc-950/90 px-2.5 py-1 shadow-xl backdrop-blur-xs">
+            <div className="absolute top-3 left-1/2 z-30 flex max-w-[calc(100%-96px)] -translate-x-1/2 items-center gap-1.5 rounded-full border border-cyan-400/50 bg-zinc-950/90 px-2.5 py-1 shadow-xl backdrop-blur-xs">
               <Spline className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
               <span className="hidden whitespace-nowrap text-[11px] font-medium text-zinc-200 sm:inline">
                 Кривая ({activeCurvePoints.length} т.)
@@ -2699,7 +2700,7 @@ export default function App() {
             !isChromaKeyPickerActive &&
             !isTextColorPickerActive &&
             !bgColorPickerActive && (
-              <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-blue-400/60 bg-zinc-950/90 px-2.5 py-1 shadow-xl backdrop-blur-xs">
+              <div className="absolute top-3 left-1/2 z-30 flex max-w-[calc(100%-96px)] -translate-x-1/2 items-center gap-1.5 rounded-full border border-blue-400/60 bg-zinc-950/90 px-2.5 py-1 shadow-xl backdrop-blur-xs">
                 <Grid3X3 className="h-3.5 w-3.5 shrink-0 text-blue-400" />
                 <span className="whitespace-nowrap text-[11px] font-medium text-blue-100">
                   {activeWarpState.mode === 'perspective'
@@ -2785,14 +2786,14 @@ export default function App() {
           </div>
 
           {/* Transport Bar */}
-          <div className="flex h-11 shrink-0 items-center justify-between border-t border-white/5 bg-[#101013] px-3 sm:px-4">
-            <div className="flex items-center gap-1">
+          <div className="flex h-11 min-w-0 shrink-0 items-center justify-between gap-2 border-t border-white/5 bg-[#101013] px-2.5 sm:px-4">
+            <div className="flex shrink-0 items-center gap-1">
               <button
                 type="button"
                 onClick={undo}
                 disabled={!canUndo}
                 aria-label="Отменить"
-                className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
               >
                 <Undo2 className="h-4 w-4" />
               </button>
@@ -2801,21 +2802,21 @@ export default function App() {
                 onClick={redo}
                 disabled={!canRedo}
                 aria-label="Повторить"
-                className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
               >
                 <Redo2 className="h-4 w-4" />
               </button>
             </div>
 
-            <div className="flex items-center gap-2 sm:gap-3">
-              <span className="font-mono text-xs tabular-nums text-white">
+            <div className="flex min-w-0 shrink-0 items-center gap-1.5 sm:gap-2.5">
+              <span className="font-mono text-xs tabular-nums text-white whitespace-nowrap">
                 {formatTimecode(currentTime)}
               </span>
               <button
                 type="button"
                 onClick={() => setIsPlaying((p) => !p)}
                 aria-label={isPlaying ? 'Пауза' : 'Воспроизвести'}
-                className="flex h-9 w-11 items-center justify-center rounded-full bg-white text-zinc-950 shadow hover:bg-zinc-200 active:scale-95"
+                className="flex h-9 w-11 shrink-0 items-center justify-center rounded-full bg-white text-zinc-950 shadow hover:bg-zinc-200 active:scale-95"
               >
                 {isPlaying ? (
                   <Pause className="h-4 w-4 fill-current" />
@@ -2829,7 +2830,7 @@ export default function App() {
                 disabled={!selectedClip || selectedClip.track === 'audio'}
                 title="Поставить ключевой кадр в текущем времени"
                 aria-label="Ключевой кадр"
-                className={`flex h-8 w-8 items-center justify-center rounded-lg border transition active:scale-95 disabled:opacity-30 ${
+                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition active:scale-95 disabled:opacity-30 ${
                   hasKeyframeAtPlayhead
                     ? 'border-amber-400/70 bg-amber-500/20 text-amber-300'
                     : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-amber-400/60 hover:text-amber-200'
@@ -2849,21 +2850,21 @@ export default function App() {
                   <path d="M9 12h6" />
                 </svg>
               </button>
-              <span className="font-mono text-xs tabular-nums text-zinc-500">
+              <span className="font-mono text-xs tabular-nums text-zinc-500 whitespace-nowrap">
                 {formatTimecode(duration)}
               </span>
             </div>
 
-            <div className="flex items-center gap-1">
+            <div className="flex shrink-0 items-center gap-1">
               <button
                 type="button"
                 onClick={handleSplitSelectedOrCurrent}
                 disabled={!canSplitNow}
                 title="Разделить клип по линии времени (S)"
-                className="flex h-9 items-center gap-1 rounded-lg px-2 text-xs font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-30"
+                className="flex h-9 shrink-0 items-center gap-1 rounded-lg px-2 text-xs font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-30"
               >
-                <Scissors className="h-4 w-4 text-cyan-400" />
-                <span className="hidden sm:inline">Разделить</span>
+                <Scissors className="h-4 w-4 shrink-0 text-cyan-400" />
+                <span className="hidden xl:inline whitespace-nowrap">Разделить</span>
               </button>
               <button
                 type="button"
@@ -2873,7 +2874,7 @@ export default function App() {
                   })
                 }
                 title="Сбросить к демо-проекту"
-                className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-400 hover:bg-white/10 hover:text-white"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-white/10 hover:text-white"
               >
                 <RotateCcw className="h-4 w-4" />
               </button>
@@ -2958,10 +2959,10 @@ export default function App() {
                         selectedClip.track === 'video' ? 'overlay' : 'video'
                       )
                     }
-                    className="flex h-9 items-center justify-center gap-1.5 rounded-lg border border-indigo-500/35 bg-indigo-500/10 px-2.5 text-xs font-medium text-indigo-200 hover:border-indigo-400"
+                    className="flex h-9 min-w-0 items-center justify-center gap-1.5 rounded-lg border border-indigo-500/35 bg-indigo-500/10 px-2 text-xs font-medium text-indigo-200 hover:border-indigo-400"
                   >
-                    <Layers className="h-3.5 w-3.5 text-indigo-400" />
-                    <span>
+                    <Layers className="h-3.5 w-3.5 shrink-0 text-indigo-400" />
+                    <span className="truncate">
                       {selectedClip.track === 'video'
                         ? 'Наложение'
                         : 'Основное'}
@@ -2972,10 +2973,10 @@ export default function App() {
                     <button
                       type="button"
                       onClick={() => setShowCompressModal(true)}
-                      className="flex h-9 items-center justify-center gap-1.5 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2.5 text-xs font-medium text-emerald-200 hover:border-emerald-400"
+                      className="flex h-9 min-w-0 items-center justify-center gap-1.5 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2 text-xs font-medium text-emerald-200 hover:border-emerald-400"
                     >
-                      <Minimize2 className="h-3.5 w-3.5 text-emerald-400" />
-                      <span>Сжать</span>
+                      <Minimize2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                      <span className="truncate">Сжать</span>
                     </button>
                   )}
                 </div>
@@ -2985,18 +2986,18 @@ export default function App() {
                 selectedClip.track !== 'adjustment' &&
                 selectedClip.kind !== 'adjustment' && (
                 <div className="space-y-2">
-                  <div className="flex gap-2">
+                  <div className="grid grid-cols-2 gap-2">
                     <button
                       type="button"
                       onClick={() => setShowTrackpad((v) => !v)}
-                      className={`flex h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition ${
+                      className={`flex h-9 min-w-0 items-center justify-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition ${
                         showTrackpad
                           ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
                           : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400/60'
                       }`}
                     >
-                      <Move className="h-3.5 w-3.5 text-cyan-400" />
-                      <span>Трекпад</span>
+                      <Move className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
+                      <span className="truncate">Трекпад</span>
                     </button>
                     {(selectedClip.kind === 'image' ||
                       selectedClip.kind === 'video') && (
@@ -3007,7 +3008,7 @@ export default function App() {
                             if (editSubMode === 'mask') setEditSubMode('menu');
                             setShowChromaKeyPanel((v) => !v);
                           }}
-                          className={`flex h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition ${
+                          className={`flex h-9 min-w-0 items-center justify-center gap-1.5 rounded-lg border px-2 text-xs font-medium transition ${
                             showChromaKeyPanel
                               ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
                               : selectedClip.chromaKeyEnabled
@@ -3015,20 +3016,20 @@ export default function App() {
                                 : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-emerald-400/60'
                           }`}
                         >
-                          <Pipette className="h-3.5 w-3.5 text-emerald-400" />
-                          <span>Хромакей</span>
+                          <Pipette className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                          <span className="truncate">Хромакей</span>
                         </button>
                         <label
-                          className={`flex h-9 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-zinc-900 px-2.5 text-xs font-medium text-zinc-200 hover:border-cyan-400/60 ${
+                          className={`col-span-2 flex h-9 min-w-0 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-white/10 bg-zinc-900 px-2.5 text-xs font-medium text-zinc-200 hover:border-cyan-400/60 ${
                             replacingMedia ? 'opacity-50 pointer-events-none' : ''
                           }`}
                         >
                           <RefreshCw
-                            className={`h-3.5 w-3.5 text-cyan-400 ${
+                            className={`h-3.5 w-3.5 shrink-0 text-cyan-400 ${
                               replacingMedia ? 'animate-spin' : ''
                             }`}
                           />
-                          <span>Заменить</span>
+                          <span className="truncate">Заменить медиа</span>
                           <input
                             type="file"
                             accept="video/*,image/*"
@@ -3050,10 +3051,10 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => retryMediaDownload(selectedClip.id)}
-                            className="flex h-10 shrink-0 items-center gap-1 rounded-xl border border-rose-500/50 bg-rose-500/20 px-2.5 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/30"
+                            className="col-span-2 flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-xl border border-rose-500/50 bg-rose-500/20 px-2.5 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/30"
                           >
-                            <RefreshCw className="h-3.5 w-3.5 text-rose-300" />
-                            <span>Перекачать</span>
+                            <RefreshCw className="h-3.5 w-3.5 shrink-0 text-rose-300" />
+                            <span className="truncate">Перекачать файл P2P</span>
                           </button>
                         )}
                       </>

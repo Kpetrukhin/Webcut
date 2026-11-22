@@ -891,18 +891,18 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       if (!serverInput.trim()) return;
                       onConnectToHostIp(serverInput.trim());
                     }}
-                    className="flex flex-1 gap-2"
+                    className="flex min-w-0 flex-1 gap-2"
                   >
                     <input
                       type="text"
                       value={serverInput}
                       onChange={(e) => setServerInput(e.target.value)}
                       placeholder="IP хоста (10.147.x.x ZeroTier или 192.168.x.x)"
-                      className="h-10 flex-1 rounded-xl border border-white/10 bg-zinc-950 px-3 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
+                      className="h-10 min-w-0 flex-1 rounded-xl border border-white/10 bg-zinc-950 px-3 font-mono text-xs text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
                     />
                     <button
                       type="submit"
-                      className="h-10 rounded-xl bg-cyan-500 px-3.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400"
+                      className="h-10 shrink-0 rounded-xl bg-cyan-500 px-3.5 text-xs font-bold text-zinc-950 hover:bg-cyan-400"
                     >
                       Подкл.
                     </button>

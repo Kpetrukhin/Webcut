@@ -886,7 +886,7 @@ export function createStarterClips(): Clip[] {
       contrast: 1.08,
       saturate: 1.1,
       transitionIn: 'fade',
-      motionEffect: 'kenburns-in',
+      motionEffect: 'none',
     },
     {
       id: 'clip-v2',
@@ -907,7 +907,7 @@ export function createStarterClips(): Clip[] {
       contrast: 1.05,
       saturate: 1.15,
       transitionIn: 'slide',
-      motionEffect: 'pan-right',
+      motionEffect: 'none',
     },
     {
       id: 'clip-v3',
@@ -927,8 +927,8 @@ export function createStarterClips(): Clip[] {
       brightness: 1,
       contrast: 1.06,
       saturate: 1.1,
-      transitionIn: 'zoom',
-      motionEffect: 'kenburns-out',
+      transitionIn: 'none',
+      motionEffect: 'none',
     },
     {
       id: 'clip-o1',
