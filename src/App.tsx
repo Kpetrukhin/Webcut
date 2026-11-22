@@ -8,6 +8,7 @@ import {
   Home,
   Layers,
   MessageSquare,
+  Move,
   Pause,
   Play,
   Redo2,
@@ -45,6 +46,7 @@ import {HomeScreen} from './components/HomeScreen.tsx';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
 import type {CanvasTransformPatch} from './components/PreviewCanvas.tsx';
 import {Timeline} from './components/Timeline.tsx';
+import {TransformTrackpad} from './components/TransformTrackpad.tsx';
 import {RoomsLobbyModal} from './components/RoomsLobbyModal.tsx';
 import {
   AudioPanel,
@@ -118,6 +120,13 @@ export default function App() {
   const [desktopTab, setDesktopTab] = useState<ActiveToolTab>('media');
   const [mobileSheet, setMobileSheet] = useState<ActiveToolTab | null>(null);
   const [showOpacitySlider, setShowOpacitySlider] = useState(false);
+  const [showTrackpad, setShowTrackpad] = useState(false);
+  const [snapEnabled, setSnapEnabled] = useState(true);
+  const [showSelectionOutline, setShowSelectionOutline] = useState(true);
+  const [trackpadSnapGuides, setTrackpadSnapGuides] = useState<{
+    x: boolean;
+    y: boolean;
+  }>({x: false, y: false});
   const [showLobbyModal, setShowLobbyModal] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(project.title);
@@ -157,6 +166,8 @@ export default function App() {
   useEffect(() => {
     if (!selectedClip || selectedClip.track === 'audio') {
       setShowOpacitySlider(false);
+      setShowTrackpad(false);
+      setTrackpadSnapGuides({x: false, y: false});
     }
   }, [selectedClip]);
 
@@ -948,6 +959,13 @@ export default function App() {
               selectedClipId={selectedClipId}
               collaborators={collaborators}
               mediaPool={mediaPoolRef.current}
+              snapEnabled={snapEnabled}
+              onToggleSnap={() => setSnapEnabled((v) => !v)}
+              showSelectionOutline={showSelectionOutline}
+              onToggleSelectionOutline={() =>
+                setShowSelectionOutline((v) => !v)
+              }
+              externalSnapGuides={trackpadSnapGuides}
               onSelectClip={setSelectedClipId}
               onTransformClip={handleTransformClipOnCanvas}
             />
@@ -1106,6 +1124,23 @@ export default function App() {
                 </button>
               </div>
 
+              {selectedClip.track !== 'audio' && (
+                <button
+                  type="button"
+                  onClick={() => setShowTrackpad((v) => !v)}
+                  className={`flex h-9 w-full items-center justify-center gap-2 rounded-lg border text-xs font-medium transition ${
+                    showTrackpad
+                      ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400/60'
+                  }`}
+                >
+                  <Move className="h-3.5 w-3.5 text-cyan-400" />
+                  <span>
+                    {showTrackpad ? 'Скрыть трекпад' : 'Трекпад (Move & Transform)'}
+                  </span>
+                </button>
+              )}
+
               {(selectedClip.track === 'overlay' ||
                 selectedClip.track === 'text') && (
                 <KeyframeControls
@@ -1174,24 +1209,38 @@ export default function App() {
         </aside>
       </div>
 
-      {/* Multi-Track Dynamic Timeline */}
+      {/* Multi-Track Dynamic Timeline OR Alight Motion Trackpad */}
       <div className="h-[220px] shrink-0 sm:h-[245px] lg:h-[260px]">
-        <Timeline
-          tracks={project.tracks}
-          clips={project.clips}
-          duration={duration}
-          currentTime={currentTime}
-          pxPerSec={pxPerSec}
-          selectedClipId={selectedClipId}
-          collaborators={collaborators}
-          onSeek={handleSeek}
-          onSelectClip={setSelectedClipId}
-          onZoomChange={setPxPerSec}
-          onAddTrack={addTrack}
-          onUpdateTrack={updateTrack}
-          onDeleteTrack={deleteTrack}
-          onClipTransform={handleClipTransform}
-        />
+        {showTrackpad && selectedClip && selectedClip.track !== 'audio' ? (
+          <TransformTrackpad
+            clip={selectedClip}
+            currentTime={currentTime}
+            snapEnabled={snapEnabled}
+            onTransformClip={handleTransformClipOnCanvas}
+            onSnapGuidesChange={setTrackpadSnapGuides}
+            onClose={() => {
+              setShowTrackpad(false);
+              setTrackpadSnapGuides({x: false, y: false});
+            }}
+          />
+        ) : (
+          <Timeline
+            tracks={project.tracks}
+            clips={project.clips}
+            duration={duration}
+            currentTime={currentTime}
+            pxPerSec={pxPerSec}
+            selectedClipId={selectedClipId}
+            collaborators={collaborators}
+            onSeek={handleSeek}
+            onSelectClip={setSelectedClipId}
+            onZoomChange={setPxPerSec}
+            onAddTrack={addTrack}
+            onUpdateTrack={updateTrack}
+            onDeleteTrack={deleteTrack}
+            onClipTransform={handleClipTransform}
+          />
+        )}
       </div>
 
       {/* Mobile Bottom Thumb Toolbar */}
@@ -1255,6 +1304,20 @@ export default function App() {
               <Scissors className="h-4 w-4 text-cyan-400" />
               <span>Разделить</span>
             </button>
+            {selectedClip.track !== 'audio' && (
+              <button
+                type="button"
+                onClick={() => setShowTrackpad((v) => !v)}
+                className={`flex h-11 min-w-[68px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  showTrackpad
+                    ? 'bg-cyan-500/20 text-cyan-300'
+                    : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <Move className="h-4 w-4 text-cyan-400" />
+                <span>Трекпад</span>
+              </button>
+            )}
             {selectedClip.track !== 'audio' && (
               <button
                 type="button"

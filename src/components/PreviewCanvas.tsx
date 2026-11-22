@@ -1,4 +1,5 @@
 import React, {useEffect, useRef, useState} from 'react';
+import {EyeOff, Magnet} from 'lucide-react';
 import type {
   AspectRatio,
   Clip,
@@ -32,6 +33,11 @@ interface PreviewCanvasProps {
   selectedClipId: string | null;
   collaborators: Collaborator[];
   mediaPool: MediaPool;
+  snapEnabled?: boolean;
+  onToggleSnap?: () => void;
+  showSelectionOutline?: boolean;
+  onToggleSelectionOutline?: () => void;
+  externalSnapGuides?: {x: boolean; y: boolean};
   onSelectClip: (clipId: string | null) => void;
   onTransformClip: (
     clipId: string,
@@ -58,6 +64,11 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   selectedClipId,
   collaborators,
   mediaPool,
+  snapEnabled = true,
+  onToggleSnap,
+  showSelectionOutline = true,
+  onToggleSelectionOutline,
+  externalSnapGuides,
   onSelectClip,
   onTransformClip,
 }) => {
@@ -108,6 +119,21 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     }
   }, [customFonts]);
 
+  const renderedSelectedId = showSelectionOutline ? selectedClipId : null;
+  const effectiveSnapGuides = snapEnabled
+    ? {
+        x: snapGuides.x || Boolean(externalSnapGuides?.x),
+        y: snapGuides.y || Boolean(externalSnapGuides?.y),
+      }
+    : {x: false, y: false};
+
+  useEffect(() => {
+    if (!snapEnabled) {
+      snapStateRef.current = {x: false, y: false};
+      setSnapGuides({x: false, y: false});
+    }
+  }, [snapEnabled]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -122,11 +148,11 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       clips,
       currentTime,
       mediaPool,
-      selectedClipId,
+      renderedSelectedId,
       collaborators,
       tracks,
       backgroundColor,
-      snapGuides
+      effectiveSnapGuides
     );
   }, [
     tracks,
@@ -135,13 +161,14 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     backgroundColor,
     currentTime,
     isPlaying,
-    selectedClipId,
+    renderedSelectedId,
     collaborators,
     mediaPool,
     width,
     height,
     renderNonce,
-    snapGuides,
+    effectiveSnapGuides.x,
+    effectiveSnapGuides.y,
   ]);
 
   useEffect(() => {
@@ -158,11 +185,11 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           clips,
           currentTime,
           mediaPool,
-          selectedClipId,
+          renderedSelectedId,
           collaborators,
           tracks,
           backgroundColor,
-          snapGuides
+          effectiveSnapGuides
         );
       }
       raf = requestAnimationFrame(loop);
@@ -178,9 +205,10 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     width,
     height,
     mediaPool,
-    selectedClipId,
+    renderedSelectedId,
     collaborators,
-    snapGuides,
+    effectiveSnapGuides.x,
+    effectiveSnapGuides.y,
   ]);
 
   const findHitClip = (nx: number, ny: number): Clip | null => {
@@ -291,17 +319,19 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     let snappedX = false;
     let snappedY = false;
 
-    if (Math.abs(x - 0.5) <= snapNormX) {
-      x = 0.5;
-      snappedX = true;
-    }
-    if (Math.abs(y - 0.5) <= snapNormY) {
-      y = 0.5;
-      snappedY = true;
+    if (snapEnabled) {
+      if (Math.abs(x - 0.5) <= snapNormX) {
+        x = 0.5;
+        snappedX = true;
+      }
+      if (Math.abs(y - 0.5) <= snapNormY) {
+        y = 0.5;
+        snappedY = true;
+      }
     }
 
     const prev = snapStateRef.current;
-    if ((!prev.x && snappedX) || (!prev.y && snappedY)) {
+    if (snapEnabled && ((!prev.x && snappedX) || (!prev.y && snappedY))) {
       try {
         navigator.vibrate?.(12);
       } catch {
@@ -460,8 +490,78 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           ? 'aspect-[4/5]'
           : 'aspect-square';
 
+  const hasEditableSelection = Boolean(
+    selectedClipId &&
+      clips.some((c) => c.id === selectedClipId && c.track !== 'audio')
+  );
+
   return (
     <div className="relative flex h-full w-full items-center justify-center overflow-hidden p-2 sm:p-4">
+      {hasEditableSelection && (
+        <div className="absolute right-2.5 top-2.5 z-20 flex items-center gap-1.5 sm:right-4 sm:top-4">
+          <button
+            type="button"
+            onClick={onToggleSnap}
+            title={
+              snapEnabled
+                ? 'Привязка к сетке: ВКЛ'
+                : 'Привязка к сетке: ВЫКЛ'
+            }
+            aria-label="Привязка к сетке"
+            className={`flex h-8 w-8 items-center justify-center rounded-lg border backdrop-blur-md transition active:scale-95 ${
+              snapEnabled
+                ? 'border-cyan-400/70 bg-cyan-500/20 text-cyan-300 shadow-sm'
+                : 'border-white/15 bg-zinc-950/75 text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Magnet className="h-4 w-4" />
+          </button>
+
+          <button
+            type="button"
+            onClick={onToggleSelectionOutline}
+            title={
+              showSelectionOutline
+                ? 'Скрыть рамку выделения'
+                : 'Показать рамку выделения'
+            }
+            aria-label="Рамка выделения"
+            className={`flex h-8 w-8 items-center justify-center rounded-lg border backdrop-blur-md transition active:scale-95 ${
+              showSelectionOutline
+                ? 'border-cyan-400/70 bg-cyan-500/20 text-cyan-300 shadow-sm'
+                : 'border-white/15 bg-zinc-950/75 text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            {showSelectionOutline ? (
+              <svg
+                viewBox="0 0 24 24"
+                className="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M4 7V5a1 1 0 0 1 1-1h2" />
+                <path d="M17 4h2a1 1 0 0 1 1 1v2" />
+                <path d="M20 17v2a1 1 0 0 1-1 1h-2" />
+                <path d="M7 20H5a1 1 0 0 1-1-1v-2" />
+                <rect
+                  x="7"
+                  y="7"
+                  width="10"
+                  height="10"
+                  rx="1"
+                  strokeDasharray="2.5 2.5"
+                />
+              </svg>
+            ) : (
+              <EyeOff className="h-4 w-4" />
+            )}
+          </button>
+        </div>
+      )}
+
       <div
         className={`relative max-h-full max-w-full ${aspectClass} overflow-hidden rounded-xl border border-white/10 shadow-2xl`}
         style={{
