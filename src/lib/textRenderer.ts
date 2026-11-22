@@ -7,9 +7,20 @@ import type {
   TextCurvePoint,
   TextStyle,
 } from '../shared/types.ts';
+import {applyColorGradeShader} from './colorGradeShader.ts';
+import {
+  getClipEffectiveAdjustments,
+  isNeutralColorGrade,
+} from './colorPresets.ts';
 import {loadCustomFont} from './fontLoader.ts';
 import {evaluateClipTransform} from './keyframeEngine.ts';
 import {applyMaskToCanvas} from './maskEngine.ts';
+import {
+  getWarpedOutlinePolygon,
+  isIdentityWarp,
+  pointInPolygon,
+  renderWarpedLayer,
+} from './warpEngine.ts';
 
 export interface NormalizedTextStyle {
   fontSize: number;
@@ -911,7 +922,8 @@ export function drawTextClipCanvas(
   getScratchCtx: (
     w: number,
     h: number
-  ) => {canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D} | null
+  ) => {canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D} | null,
+  maskOnly = false
 ) {
   const style = normalizeTextStyle(clip.textStyle);
   if (style.fontFamily && style.fontSrc) {
@@ -971,22 +983,31 @@ export function drawTextClipCanvas(
   const sxFactor = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
   const syFactor = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
 
-  const drawTextBody = (
+  const renderTextBodyToTarget = (
     targetCtx: CanvasRenderingContext2D,
-    layerAlpha: number
+    layerAlpha: number,
+    customOrigin?: {x: number; y: number; applyRotation: boolean}
   ) => {
     targetCtx.save();
     targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
     targetCtx.font = layout.fontString;
     targetCtx.textAlign = 'center';
     targetCtx.textBaseline = 'middle';
-    if (anim.blurPx > 0.2) {
-      targetCtx.filter = `blur(${anim.blurPx.toFixed(1)}px)`;
+    const totalBlur = anim.blurPx + (clip.blur ?? 0);
+    if (totalBlur > 0.2 && !maskOnly) {
+      targetCtx.filter = `blur(${totalBlur.toFixed(1)}px)`;
     }
 
-    targetCtx.translate(anchorX, anchorY);
-    if (effectiveRotation !== 0) {
-      targetCtx.rotate((effectiveRotation * Math.PI) / 180);
+    if (customOrigin) {
+      targetCtx.translate(customOrigin.x, customOrigin.y);
+      if (customOrigin.applyRotation && effectiveRotation !== 0) {
+        targetCtx.rotate((effectiveRotation * Math.PI) / 180);
+      }
+    } else {
+      targetCtx.translate(anchorX, anchorY);
+      if (effectiveRotation !== 0) {
+        targetCtx.rotate((effectiveRotation * Math.PI) / 180);
+      }
     }
     if (sxFactor !== 1 || syFactor !== 1) {
       targetCtx.scale(sxFactor, syFactor);
@@ -997,7 +1018,6 @@ export function drawTextClipCanvas(
       0
     );
 
-    // 1. Background modes ('chars' | 'lines' | 'block')
     if (
       style.bgMode !== 'none' &&
       style.bgOpacity > 0.01 &&
@@ -1008,7 +1028,9 @@ export function drawTextClipCanvas(
       targetCtx.shadowBlur = 0;
       targetCtx.shadowOffsetX = 0;
       targetCtx.shadowOffsetY = 0;
-      targetCtx.fillStyle = colorWithOpacity(style.bgColor, style.bgOpacity);
+      targetCtx.fillStyle = maskOnly
+        ? '#ffffff'
+        : colorWithOpacity(style.bgColor, style.bgOpacity);
 
       if (style.bgMode === 'block') {
         targetCtx.fillRect(
@@ -1035,12 +1057,14 @@ export function drawTextClipCanvas(
           const maxY = hasTypewriter
             ? Math.max(...vl.glyphs.map((it) => it.g.y + layout.fontSizePx * 0.58))
             : vl.line.maxY;
-          const lx = minX - linePadX;
-          const ly = minY - linePadY;
-          const lw = maxX - minX + linePadX * 2;
-          const lh = maxY - minY + linePadY * 2;
           targetCtx.beginPath();
-          targetCtx.roundRect(lx, ly, lw, lh, radius);
+          targetCtx.roundRect(
+            minX - linePadX,
+            minY - linePadY,
+            maxX - minX + linePadX * 2,
+            maxY - minY + linePadY * 2,
+            radius
+          );
           targetCtx.fill();
         }
       } else if (style.bgMode === 'chars') {
@@ -1051,9 +1075,7 @@ export function drawTextClipCanvas(
           for (const {g, charAlpha} of vl.glyphs) {
             if (g.isSpace || !g.ch.trim()) continue;
             targetCtx.save();
-            if (charAlpha < 0.999) {
-              targetCtx.globalAlpha *= charAlpha;
-            }
+            if (charAlpha < 0.999) targetCtx.globalAlpha *= charAlpha;
             targetCtx.translate(g.x, g.y);
             if (g.angle !== 0) targetCtx.rotate(g.angle);
             targetCtx.beginPath();
@@ -1073,7 +1095,7 @@ export function drawTextClipCanvas(
     }
 
     const applyShadow = () => {
-      if (style.shadow) {
+      if (style.shadow && !maskOnly) {
         targetCtx.shadowColor = style.shadowColor || 'rgba(0,0,0,0.65)';
         targetCtx.shadowOffsetX =
           style.shadowOffsetX * sf * kf.scale * anim.scaleMul;
@@ -1106,14 +1128,13 @@ export function drawTextClipCanvas(
       (style.curveMode === 'custom' && style.curvePoints.length >= 2) ||
       (style.curveMode !== 'none' && Math.abs(style.curveAmplitude) >= 0.5);
 
-    // 2. Stroke pass (underneath main text, Paint.Style.STROKE equivalent)
     if (hasStroke) {
       targetCtx.save();
       applyShadow();
       targetCtx.lineJoin = 'round';
       targetCtx.lineCap = 'round';
       targetCtx.miterLimit = 2;
-      targetCtx.strokeStyle = style.strokeColor;
+      targetCtx.strokeStyle = maskOnly ? '#ffffff' : style.strokeColor;
       targetCtx.lineWidth = strokePx;
 
       for (const vl of visibleLines) {
@@ -1152,15 +1173,14 @@ export function drawTextClipCanvas(
       targetCtx.restore();
     }
 
-    // 3. Main text fill pass (Paint.Style.FILL)
     targetCtx.save();
-    if (hasStroke) {
+    if (hasStroke || maskOnly) {
       clearShadow();
     } else {
       applyShadow();
     }
-    targetCtx.fillStyle = style.color;
-    targetCtx.strokeStyle = style.color;
+    targetCtx.fillStyle = maskOnly ? '#ffffff' : style.color;
+    targetCtx.strokeStyle = maskOnly ? '#ffffff' : style.color;
     targetCtx.lineCap = 'round';
 
     for (const vl of visibleLines) {
@@ -1201,53 +1221,250 @@ export function drawTextClipCanvas(
     targetCtx.restore();
   };
 
+  // Compute screen-aligned bounding box for warping & selection
+  const boxCenterLocalX = (layout.boxX + layout.boxW / 2) * sxFactor;
+  const boxCenterLocalY = (layout.boxY + layout.boxH / 2) * syFactor;
+  const rotRad = (effectiveRotation * Math.PI) / 180;
+  const cosR = Math.cos(rotRad);
+  const sinR = Math.sin(rotRad);
+  const boxCenterX = anchorX + (boxCenterLocalX * cosR - boxCenterLocalY * sinR);
+  const boxCenterY = anchorY + (boxCenterLocalX * sinR + boxCenterLocalY * cosR);
+  const boxW = Math.max(24, (layout.boxW + 12 * sf) * Math.abs(sxFactor));
+  const boxH = Math.max(24, (layout.boxH + 12 * sf) * Math.abs(syFactor));
+
+  const hasWarp = !isIdentityWarp(kf.warp);
+  const grade = maskOnly ? null : getClipEffectiveAdjustments(clip);
+  const needsOffscreenColorGrade = Boolean(grade && !isNeutralColorGrade(grade));
+
+  const drawUnmasked = (targetCtx: CanvasRenderingContext2D, layerAlpha: number) => {
+    if (!hasWarp && !needsOffscreenColorGrade) {
+      renderTextBodyToTarget(targetCtx, layerAlpha);
+      return;
+    }
+
+    // Render text centered in a tight local offscreen canvas aligned with (boxW, boxH)
+    const texW = Math.max(4, Math.min(2048, Math.ceil(boxW)));
+    const texH = Math.max(4, Math.min(2048, Math.ceil(boxH)));
+    if (!textLayerScratchCanvas) {
+      textLayerScratchCanvas = document.createElement('canvas');
+    }
+    textLayerScratchCanvas.width = texW;
+    textLayerScratchCanvas.height = texH;
+    const lctx = textLayerScratchCanvas.getContext('2d');
+    if (!lctx) {
+      renderTextBodyToTarget(targetCtx, layerAlpha);
+      return;
+    }
+    lctx.setTransform(1, 0, 0, 1, 0, 0);
+    lctx.clearRect(0, 0, texW, texH);
+
+    // Draw into local canvas without rotation (boxCenterLocal corresponds to texW/2, texH/2)
+    lctx.save();
+    lctx.translate(texW / 2 - boxCenterLocalX, texH / 2 - boxCenterLocalY);
+    renderTextBodyToTarget(lctx, 1, {x: 0, y: 0, applyRotation: false});
+    lctx.restore();
+
+    let sourceCanvas: HTMLCanvasElement = textLayerScratchCanvas;
+    if (needsOffscreenColorGrade && grade) {
+      const graded = applyColorGradeShader(
+        sourceCanvas,
+        texW,
+        texH,
+        grade,
+        time
+      );
+      if (graded instanceof HTMLCanvasElement) {
+        sourceCanvas = graded;
+      }
+    }
+
+    if (hasWarp && kf.warp) {
+      const warped = renderWarpedLayer({
+        source: sourceCanvas,
+        centerX: boxCenterX,
+        centerY: boxCenterY,
+        layerW: boxW,
+        layerH: boxH,
+        rotationDeg: effectiveRotation,
+        warp: kf.warp,
+        cw,
+        ch,
+      });
+      if (warped) {
+        targetCtx.save();
+        targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
+        targetCtx.drawImage(
+          warped.canvas,
+          warped.outX,
+          warped.outY,
+          warped.outW,
+          warped.outH
+        );
+        targetCtx.restore();
+        return;
+      }
+    }
+
+    targetCtx.save();
+    targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
+    targetCtx.translate(boxCenterX, boxCenterY);
+    if (effectiveRotation !== 0) targetCtx.rotate(rotRad);
+    targetCtx.drawImage(sourceCanvas, -boxW / 2, -boxH / 2, boxW, boxH);
+    targetCtx.restore();
+  };
+
   if (clip.mask) {
     const scratch = getScratchCtx(cw, ch);
     if (scratch) {
-      drawTextBody(scratch.ctx, 1);
+      drawUnmasked(scratch.ctx, 1);
       applyMaskToCanvas(scratch.canvas, cw, ch, clip.mask);
       ctx.save();
-      ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+      ctx.globalAlpha = Math.max(0, Math.min(1, maskOnly ? 1 : alpha));
+      if (!maskOnly && clip.blendMode) {
+        ctx.globalCompositeOperation = clip.blendMode;
+      }
       ctx.drawImage(scratch.canvas, 0, 0);
       ctx.restore();
     } else {
-      drawTextBody(ctx, alpha);
+      drawUnmasked(ctx, maskOnly ? 1 : alpha);
     }
   } else {
-    drawTextBody(ctx, alpha);
-  }
-
-  // 4. Selection outline & collaborative lock badge
-  const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
-  if (clip.id === selectedClipId || peerLock) {
     ctx.save();
-    ctx.translate(anchorX, anchorY);
-    if (effectiveRotation !== 0) {
-      ctx.rotate((effectiveRotation * Math.PI) / 180);
+    if (!maskOnly && clip.blendMode) {
+      ctx.globalCompositeOperation = clip.blendMode;
     }
-    if (sxFactor !== 1 || syFactor !== 1) {
-      ctx.scale(sxFactor, syFactor);
-    }
-    ctx.strokeStyle = peerLock ? peerLock.color : '#22d3ee';
-    ctx.lineWidth = (peerLock ? 3 : 2.5) * sf;
-    ctx.strokeRect(
-      layout.boxX - 6 * sf,
-      layout.boxY - 6 * sf,
-      layout.boxW + 12 * sf,
-      layout.boxH + 12 * sf
-    );
-    if (peerLock) {
-      drawLockBadge(
-        ctx,
-        layout.boxX - 6 * sf,
-        layout.boxY - 6 * sf,
-        peerLock.name,
-        peerLock.color,
-        sf
-      );
-    }
+    drawUnmasked(ctx, maskOnly ? 1 : alpha);
     ctx.restore();
   }
+
+  // 4. Selection outline & collaborative lock badge (skipped when drawing silhouette mask)
+  if (maskOnly) return;
+
+  const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
+  if (clip.id === selectedClipId || peerLock) {
+    const strokeCol = peerLock
+      ? peerLock.color
+      : clip.adjustmentMask
+        ? '#c084fc'
+        : '#22d3ee';
+    if (hasWarp && kf.warp) {
+      const poly = getWarpedOutlinePolygon(
+        boxCenterX,
+        boxCenterY,
+        boxW,
+        boxH,
+        effectiveRotation,
+        kf.warp
+      );
+      ctx.save();
+      ctx.strokeStyle = strokeCol;
+      ctx.lineWidth = (peerLock ? 3 : 2.5) * sf;
+      if (clip.adjustmentMask && !peerLock) ctx.setLineDash([7 * sf, 5 * sf]);
+      ctx.beginPath();
+      poly.forEach((p, idx) => {
+        if (idx === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      });
+      ctx.closePath();
+      ctx.stroke();
+      ctx.setLineDash([]);
+      if (peerLock && poly[0]) {
+        drawLockBadge(ctx, poly[0].x, poly[0].y, peerLock.name, peerLock.color, sf);
+      }
+      ctx.restore();
+    } else {
+      ctx.save();
+      ctx.translate(anchorX, anchorY);
+      if (effectiveRotation !== 0) {
+        ctx.rotate((effectiveRotation * Math.PI) / 180);
+      }
+      if (sxFactor !== 1 || syFactor !== 1) {
+        ctx.scale(sxFactor, syFactor);
+      }
+      ctx.strokeStyle = strokeCol;
+      ctx.lineWidth = (peerLock ? 3 : 2.5) * sf;
+      if (clip.adjustmentMask && !peerLock) ctx.setLineDash([7 * sf, 5 * sf]);
+      ctx.strokeRect(
+        layout.boxX - 6 * sf,
+        layout.boxY - 6 * sf,
+        layout.boxW + 12 * sf,
+        layout.boxH + 12 * sf
+      );
+      ctx.setLineDash([]);
+      if (peerLock) {
+        drawLockBadge(
+          ctx,
+          layout.boxX - 6 * sf,
+          layout.boxY - 6 * sf,
+          peerLock.name,
+          peerLock.color,
+          sf
+        );
+      }
+      ctx.restore();
+    }
+  }
+}
+
+let textLayerScratchCanvas: HTMLCanvasElement | null = null;
+
+export function getTextClipUnwarpedBox(
+  clip: Clip,
+  cw: number,
+  ch: number,
+  time: number
+): {
+  centerX: number;
+  centerY: number;
+  layerW: number;
+  layerH: number;
+  rotationDeg: number;
+} {
+  if (!hitMeasureCanvas) {
+    hitMeasureCanvas = document.createElement('canvas');
+    hitMeasureCanvas.width = 4;
+    hitMeasureCanvas.height = 4;
+  }
+  const mctx = hitMeasureCanvas.getContext('2d');
+  const kf = evaluateClipTransform(clip, time);
+  const sf = cw / 720;
+  const anim = evaluateTextClipAnimation(clip, time, sf);
+  const anchorX = cw * kf.x + anim.offsetX;
+  const anchorY = ch * kf.y + anim.offsetY;
+  const effectiveRotation = kf.rotation + anim.rotDeg;
+
+  if (!mctx) {
+    return {
+      centerX: anchorX,
+      centerY: anchorY,
+      layerW: cw * 0.45 * kf.scale * Math.abs(clip.scaleX ?? 1),
+      layerH: 80 * sf * kf.scale * Math.abs(clip.scaleY ?? 1),
+      rotationDeg: effectiveRotation,
+    };
+  }
+
+  const layout = computeTextLayout(
+    mctx,
+    cw,
+    clip.text ?? clip.name ?? '',
+    clip.textStyle,
+    kf.scale * anim.scaleMul
+  );
+  const sxFactor = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
+  const syFactor = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
+  const localCx = (layout.boxX + layout.boxW / 2) * sxFactor;
+  const localCy = (layout.boxY + layout.boxH / 2) * syFactor;
+  const rad = (effectiveRotation * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+
+  return {
+    centerX: anchorX + (localCx * cos - localCy * sin),
+    centerY: anchorY + (localCx * sin + localCy * cos),
+    layerW: Math.max(24, (layout.boxW + 12 * layout.sf) * Math.abs(sxFactor)),
+    layerH: Math.max(24, (layout.boxH + 12 * layout.sf) * Math.abs(syFactor)),
+    rotationDeg: effectiveRotation,
+  };
 }
 
 let hitMeasureCanvas: HTMLCanvasElement | null = null;
@@ -1267,6 +1484,20 @@ export function hitTestTextClip(
   }
   const ctx = hitMeasureCanvas.getContext('2d');
   const kf = evaluateClipTransform(clip, time);
+  if (!isIdentityWarp(kf.warp) && kf.warp) {
+    const box = getTextClipUnwarpedBox(clip, cw, ch, time);
+    const poly = getWarpedOutlinePolygon(
+      box.centerX,
+      box.centerY,
+      box.layerW,
+      box.layerH,
+      box.rotationDeg,
+      kf.warp
+    );
+    if (pointInPolygon(nx * cw, ny * ch, poly)) {
+      return true;
+    }
+  }
   if (!ctx) {
     return Math.abs(nx - kf.x) < 0.28 && Math.abs(ny - kf.y) < 0.12;
   }

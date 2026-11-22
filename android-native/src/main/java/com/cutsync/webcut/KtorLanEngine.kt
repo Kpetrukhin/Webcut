@@ -995,6 +995,7 @@ class KtorLanEngine(private val context: Context) {
                 if (msg.has("title")) hostRoomState.put("title", msg.optString("title"))
                 if (msg.has("aspectRatio")) hostRoomState.put("aspectRatio", msg.optString("aspectRatio"))
                 if (msg.has("backgroundColor")) hostRoomState.put("backgroundColor", msg.optString("backgroundColor"))
+                if (msg.has("canvasBackground")) hostRoomState.put("canvasBackground", msg.opt("canvasBackground"))
                 if (msg.has("customFonts")) hostRoomState.put("customFonts", msg.optJSONArray("customFonts"))
             }
         }

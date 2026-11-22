@@ -15,10 +15,12 @@ import {
   applyTrackReorder,
   createDefaultTracks,
   createStarterClips,
+  insertTrackAt,
   normalizeProjectTracks,
 } from './src/shared/types.ts';
 import type {
   AspectRatio,
+  CanvasBackground,
   ClientWsMessage,
   Collaborator,
   NetworkInterfaceInfo,
@@ -108,17 +110,20 @@ function createDefaultProject(
     title?: string;
     aspectRatio?: AspectRatio;
     backgroundColor?: string;
+    canvasBackground?: CanvasBackground;
     hostName?: string;
     isPublicLan?: boolean;
   }
 ): ProjectState {
   const defaultTitle =
     roomId === 'studio-demo' ? 'Ночной ролик' : `Проект ${roomId}`;
+  const bg = opts?.backgroundColor || '#09090b';
   return {
     roomId,
     title: opts?.title?.trim().slice(0, 60) || defaultTitle,
     aspectRatio: opts?.aspectRatio || '9:16',
-    backgroundColor: opts?.backgroundColor || '#09090b',
+    backgroundColor: bg,
+    canvasBackground: opts?.canvasBackground ?? {type: 'solid', color: bg},
     hostName: opts?.hostName?.trim().slice(0, 28) || undefined,
     fps: 30,
     isPublicLan: opts?.isPublicLan ?? true,
@@ -181,6 +186,7 @@ function getOrCreateRoom(
     title?: string;
     aspectRatio?: AspectRatio;
     backgroundColor?: string;
+    canvasBackground?: CanvasBackground;
     hostName?: string;
     isPublicLan?: boolean;
   }
@@ -215,6 +221,7 @@ function getPublicRoomSummaries(): RoomSummary[] {
       title: project.title,
       aspectRatio: project.aspectRatio,
       backgroundColor: project.backgroundColor || '#09090b',
+      canvasBackground: project.canvasBackground,
       hostName: project.hostName,
       collaboratorsCount: active.length,
       collaborators: active.slice(0, 5).map((u) => ({name: u.name, color: u.color})),
@@ -504,6 +511,10 @@ app.post('/api/rooms', (req, res) => {
     typeof req.body?.backgroundColor === 'string'
       ? req.body.backgroundColor
       : undefined;
+  const canvasBackground =
+    req.body?.canvasBackground && typeof req.body.canvasBackground === 'object'
+      ? (req.body.canvasBackground as CanvasBackground)
+      : undefined;
   const hostName =
     typeof req.body?.hostName === 'string' ? req.body.hostName : undefined;
   const isPublicLan =
@@ -517,6 +528,7 @@ app.post('/api/rooms', (req, res) => {
     title,
     aspectRatio,
     backgroundColor,
+    canvasBackground,
     hostName,
     isPublicLan,
   });
@@ -532,6 +544,7 @@ app.get('/api/rooms/:roomId', (req, res) => {
     title: project.title,
     aspectRatio: project.aspectRatio,
     backgroundColor: project.backgroundColor,
+    canvasBackground: project.canvasBackground,
     collaboratorsCount: roomConnections.get(safeId)?.size ?? 0,
   });
 });
@@ -748,7 +761,7 @@ wss.on('connection', (ws) => {
 
       case 'op:track_add': {
         if (project.tracks.some((t) => t.id === msg.track.id)) return;
-        project.tracks.push(msg.track);
+        project.tracks = insertTrackAt(project.tracks, msg.track, msg.insertAt);
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -757,6 +770,7 @@ wss.on('connection', (ws) => {
           {
             type: 'op:track_add',
             track: msg.track,
+            insertAt: msg.insertAt,
             revision: project.revision,
             senderId: session.user.id,
           },
@@ -832,11 +846,12 @@ wss.on('connection', (ws) => {
 
       case 'op:clip_add': {
         if (project.clips.some((c) => c.id === msg.clip.id)) return;
-        if (
-          msg.newTrack &&
-          !project.tracks.some((t) => t.id === msg.newTrack!.id)
-        ) {
-          project.tracks.push(msg.newTrack);
+        if (msg.newTrack) {
+          project.tracks = insertTrackAt(
+            project.tracks,
+            msg.newTrack,
+            msg.insertAt
+          );
         }
         project.clips.push(msg.clip);
         project.revision += 1;
@@ -848,6 +863,7 @@ wss.on('connection', (ws) => {
             type: 'op:clip_add',
             clip: msg.clip,
             newTrack: msg.newTrack,
+            insertAt: msg.insertAt,
             revision: project.revision,
             senderId: session.user.id,
           },
@@ -968,6 +984,9 @@ wss.on('connection', (ws) => {
         if (typeof msg.patch.backgroundColor === 'string') {
           project.backgroundColor = msg.patch.backgroundColor.slice(0, 32);
         }
+        if (msg.patch.canvasBackground && typeof msg.patch.canvasBackground === 'object') {
+          project.canvasBackground = msg.patch.canvasBackground;
+        }
         if (typeof msg.patch.hostName === 'string') {
           project.hostName = msg.patch.hostName.slice(0, 28);
         }
@@ -1002,6 +1021,9 @@ wss.on('connection', (ws) => {
         if (typeof msg.backgroundColor === 'string') {
           project.backgroundColor = msg.backgroundColor.slice(0, 32);
         }
+        if (msg.canvasBackground && typeof msg.canvasBackground === 'object') {
+          project.canvasBackground = msg.canvasBackground;
+        }
         if (Array.isArray(msg.customFonts)) {
           project.customFonts = msg.customFonts;
         }
@@ -1017,6 +1039,7 @@ wss.on('connection', (ws) => {
             aspectRatio: project.aspectRatio,
             title: project.title,
             backgroundColor: project.backgroundColor,
+            canvasBackground: project.canvasBackground,
             customFonts: project.customFonts,
             revision: project.revision,
             senderId: session.user.id,
@@ -1067,11 +1090,12 @@ wss.on('connection', (ws) => {
       }
 
       case 'LAYER_MEDIA_UPDATED': {
-        if (
-          msg.newTrack &&
-          !project.tracks.some((t) => t.id === msg.newTrack!.id)
-        ) {
-          project.tracks.push(msg.newTrack);
+        if (msg.newTrack) {
+          project.tracks = insertTrackAt(
+            project.tracks,
+            msg.newTrack,
+            msg.insertAt
+          );
         }
         const idx = project.clips.findIndex((c) => c.id === msg.layerId);
         if (idx !== -1) {
@@ -1121,6 +1145,7 @@ wss.on('connection', (ws) => {
             senderId: session.user.id,
             clip: msg.clip,
             newTrack: msg.newTrack,
+            insertAt: msg.insertAt,
             revision: project.revision,
           },
           ws

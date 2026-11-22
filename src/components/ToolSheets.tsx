@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Scissors,
   Send,
+  Settings,
   Sparkles,
   Trash2,
   Type,
@@ -27,6 +28,7 @@ import {ScrubNumberField} from './ScrubNumberField.tsx';
 import {
   EASING_OPTIONS,
   evaluateClipTransform,
+  generateAdjustmentKeyframePreset,
   generateKeyframePreset,
   upsertKeyframeAtTime,
 } from '../lib/keyframeEngine.ts';
@@ -68,6 +70,7 @@ export type ActiveToolTab =
   | 'text'
   | 'effects'
   | 'audio'
+  | 'settings'
   | 'team';
 
 async function uploadOrLocalMedia(
@@ -167,13 +170,34 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
     onUpdateClip(clip.id, {keyframes: next});
   };
 
+  const isAdjustment =
+    clip.track === 'adjustment' || clip.kind === 'adjustment';
+
   return (
-    <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+    <div
+      className={`space-y-3 rounded-xl border p-3 ${
+        isAdjustment
+          ? 'border-violet-500/35 bg-violet-500/10'
+          : 'border-amber-500/30 bg-amber-500/5'
+      }`}
+    >
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-1.5">
-          <Diamond className="h-3.5 w-3.5 fill-amber-400 text-amber-400" />
-          <span className="text-xs font-semibold text-amber-200">
-            Ключи движения ({keyframes.length})
+          <Diamond
+            className={`h-3.5 w-3.5 ${
+              isAdjustment
+                ? 'fill-violet-400 text-violet-400'
+                : 'fill-amber-400 text-amber-400'
+            }`}
+          />
+          <span
+            className={`text-xs font-semibold ${
+              isAdjustment ? 'text-violet-200' : 'text-amber-200'
+            }`}
+          >
+            {isAdjustment
+              ? `Ключи эффекта (${keyframes.length})`
+              : `Ключи движения (${keyframes.length})`}
           </span>
         </div>
         <span className="font-mono text-[10px] text-zinc-400 tabular-nums">
@@ -268,96 +292,158 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
 
       {/* Live Keyframed Values at Playhead */}
       {keyframes.length > 0 && (
-        <div className="grid grid-cols-2 gap-2 border-t border-white/10 pt-2 text-[11px] text-zinc-300">
-          <div className="space-y-1">
+        isAdjustment ? (
+          <div className="space-y-1.5 border-t border-white/10 pt-2 text-[11px] text-zinc-300">
             <div className="flex items-center justify-between gap-1">
-              <span>Масштаб (ключ)</span>
+              <span>Интенсивность эффекта (ключ)</span>
               <ScrubNumberField
                 compact
-                accent="amber"
-                value={Math.round(currentEval.scale * 100)}
-                min={15}
-                max={250}
+                accent="violet"
+                value={Math.round(currentEval.opacity * 100)}
+                min={0}
+                max={100}
                 step={1}
                 suffix="%"
-                ariaLabel="Масштаб ключа"
-                onChange={(pct) => handleUpdateActiveKfField({scale: pct / 100})}
+                ariaLabel="Интенсивность эффекта ключа"
+                onChange={(pct) =>
+                  handleUpdateActiveKfField({opacity: pct / 100})
+                }
               />
             </div>
             <input
               type="range"
-              min={0.15}
-              max={1.4}
-              step={0.05}
-              value={currentEval.scale}
+              min={0}
+              max={1}
+              step={0.01}
+              value={currentEval.opacity}
               onChange={(e) =>
-                handleUpdateActiveKfField({scale: Number(e.target.value)})
+                handleUpdateActiveKfField({opacity: Number(e.target.value)})
               }
-              className="w-full accent-amber-400"
+              className="w-full accent-violet-400"
             />
           </div>
-          <div className="space-y-1">
-            <div className="flex items-center justify-between gap-1">
-              <span>Поворот (ключ)</span>
-              <ScrubNumberField
-                compact
-                accent="amber"
-                value={Math.round(currentEval.rotation)}
+        ) : (
+          <div className="grid grid-cols-2 gap-2 border-t border-white/10 pt-2 text-[11px] text-zinc-300">
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-1">
+                <span>Масштаб (ключ)</span>
+                <ScrubNumberField
+                  compact
+                  accent="amber"
+                  value={Math.round(currentEval.scale * 100)}
+                  min={15}
+                  max={250}
+                  step={1}
+                  suffix="%"
+                  ariaLabel="Масштаб ключа"
+                  onChange={(pct) => handleUpdateActiveKfField({scale: pct / 100})}
+                />
+              </div>
+              <input
+                type="range"
+                min={0.15}
+                max={1.4}
+                step={0.05}
+                value={currentEval.scale}
+                onChange={(e) =>
+                  handleUpdateActiveKfField({scale: Number(e.target.value)})
+                }
+                className="w-full accent-amber-400"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-1">
+                <span>Поворот (ключ)</span>
+                <ScrubNumberField
+                  compact
+                  accent="amber"
+                  value={Math.round(currentEval.rotation)}
+                  min={-180}
+                  max={180}
+                  step={1}
+                  suffix="°"
+                  ariaLabel="Поворот ключа"
+                  onChange={(deg) => handleUpdateActiveKfField({rotation: deg})}
+                />
+              </div>
+              <input
+                type="range"
                 min={-180}
                 max={180}
-                step={1}
-                suffix="°"
-                ariaLabel="Поворот ключа"
-                onChange={(deg) => handleUpdateActiveKfField({rotation: deg})}
+                step={2}
+                value={currentEval.rotation}
+                onChange={(e) =>
+                  handleUpdateActiveKfField({rotation: Number(e.target.value)})
+                }
+                className="w-full accent-amber-400"
               />
             </div>
-            <input
-              type="range"
-              min={-180}
-              max={180}
-              step={2}
-              value={currentEval.rotation}
-              onChange={(e) =>
-                handleUpdateActiveKfField({rotation: Number(e.target.value)})
-              }
-              className="w-full accent-amber-400"
-            />
           </div>
-        </div>
+        )
       )}
 
-      {/* Quick Motion Presets */}
+      {/* Quick Presets */}
       <div>
         <p className="mb-1.5 text-[11px] font-medium text-zinc-400">
-          Готовая анимация по ключам:
+          {isAdjustment
+            ? 'Готовая анимация появления эффекта:'
+            : 'Готовая анимация по ключам:'}
         </p>
-        <div className="grid grid-cols-2 gap-1.5">
-          {(
-            [
-              {id: 'slide-in', label: 'Вылет слева'},
-              {id: 'spin-zoom', label: 'Зум + поворот'},
-              {id: 'float', label: 'Плавное парение'},
-              {id: 'bounce-in', label: 'Прыжок (Пружина)'},
-            ] as const
-          ).map((preset) => (
-            <button
-              key={preset.id}
-              type="button"
-              onClick={() =>
-                onUpdateClip(clip.id, {
-                  keyframes: generateKeyframePreset(clip, preset.id),
-                })
-              }
-              className="rounded-lg border border-white/10 bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-zinc-200 hover:border-amber-400/50"
-            >
-              {preset.label}
-            </button>
-          ))}
-        </div>
+        {isAdjustment ? (
+          <div className="grid grid-cols-2 gap-1.5">
+            {(
+              [
+                {id: 'fade-in', label: 'Плавный вход'},
+                {id: 'fade-out', label: 'Плавный выход'},
+                {id: 'fade-in-out', label: 'Вход и выход'},
+                {id: 'pulse', label: 'Пульсация'},
+              ] as const
+            ).map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() =>
+                  onUpdateClip(clip.id, {
+                    keyframes: generateAdjustmentKeyframePreset(clip, preset.id),
+                  })
+                }
+                className="rounded-lg border border-white/10 bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-zinc-200 hover:border-violet-400/50"
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-1.5">
+            {(
+              [
+                {id: 'slide-in', label: 'Вылет слева'},
+                {id: 'spin-zoom', label: 'Зум + поворот'},
+                {id: 'float', label: 'Плавное парение'},
+                {id: 'bounce-in', label: 'Прыжок (Пружина)'},
+              ] as const
+            ).map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() =>
+                  onUpdateClip(clip.id, {
+                    keyframes: generateKeyframePreset(clip, preset.id),
+                  })
+                }
+                className="rounded-lg border border-white/10 bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-zinc-200 hover:border-amber-400/50"
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <p className="text-[10px] text-zinc-400">
-        Подсказка: переместите линию времени и перетащите объект пальцем по экрану — ключ сохранит новую позицию.
+        {isAdjustment
+          ? 'Подсказка: задайте ключи интенсивности в разных точках слоя для плавного появления и затухания эффекта.'
+          : 'Подсказка: переместите линию времени и перетащите объект пальцем по экрану — ключ сохранит новую позицию.'}
       </p>
     </div>
   );
@@ -392,9 +478,7 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
   const [targetTrack, setTargetTrack] = useState<'video' | 'overlay'>(
     defaultTrack
   );
-  const [forceNewTrack, setForceNewTrack] = useState(
-    defaultTrack === 'overlay'
-  );
+  const [forceNewTrack, setForceNewTrack] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -461,7 +545,7 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
             type="button"
             onClick={() => {
               setTargetTrack('overlay');
-              setForceNewTrack(true);
+              setForceNewTrack(false);
             }}
             className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap ${
               targetTrack === 'overlay'
@@ -832,6 +916,7 @@ export type {TextColorField} from './TextPanel.tsx';
 interface EffectsPanelProps {
   selectedClip: Clip | null;
   onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+  onAddAdjustmentLayer?: () => void;
 }
 
 const FILTER_PRESETS: Array<{id: FilterPreset; label: string}> = [
@@ -841,6 +926,7 @@ const FILTER_PRESETS: Array<{id: FilterPreset; label: string}> = [
   {id: 'cool', label: 'Холодный'},
   {id: 'warm', label: 'Тёплый'},
   {id: 'cinema', label: 'Кино'},
+  {id: 'invert', label: 'Инверсия'},
 ];
 
 const TRANSITIONS: Array<{id: TransitionType; label: string}> = [
@@ -861,17 +947,51 @@ const MOTIONS: Array<{id: MotionEffect; label: string}> = [
 export const EffectsPanel: React.FC<EffectsPanelProps> = ({
   selectedClip,
   onUpdateClip,
+  onAddAdjustmentLayer,
 }) => {
   if (!selectedClip || selectedClip.track === 'audio') {
     return (
-      <div className="rounded-xl border border-white/10 bg-zinc-900/60 p-4 text-center text-xs text-zinc-400">
-        Выберите видео, фото, наложение или титр на таймлайне, чтобы настроить фильтры и анимацию.
+      <div className="space-y-3">
+        {onAddAdjustmentLayer && (
+          <button
+            type="button"
+            onClick={onAddAdjustmentLayer}
+            className="flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-violet-400/50 bg-violet-500/20 px-3 text-xs font-semibold text-violet-200 hover:bg-violet-500/30 active:scale-[0.99]"
+          >
+            <Sparkles className="h-4 w-4 text-violet-300" />
+            + Корректирующий слой (3с)
+          </button>
+        )}
+        <div className="rounded-xl border border-white/10 bg-zinc-900/60 p-4 text-center text-xs text-zinc-400">
+          Добавьте корректирующий слой или выберите клип на таймлайне, чтобы настроить фильтры и анимацию.
+        </div>
       </div>
     );
   }
 
+  const isAdjustment =
+    selectedClip.track === 'adjustment' || selectedClip.kind === 'adjustment';
+  const availTransitions = isAdjustment
+    ? TRANSITIONS.filter((t) => t.id === 'none' || t.id === 'fade')
+    : TRANSITIONS;
+
   return (
     <div className="space-y-4">
+      {onAddAdjustmentLayer && !isAdjustment && (
+        <button
+          type="button"
+          onClick={onAddAdjustmentLayer}
+          className="flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-violet-400/45 bg-violet-500/15 px-3 text-xs font-semibold text-violet-200 hover:bg-violet-500/25 active:scale-[0.99]"
+        >
+          <Sparkles className="h-4 w-4 text-violet-300" />
+          + Корректирующий слой (3с)
+        </button>
+      )}
+      {isAdjustment && (
+        <div className="rounded-xl border border-violet-400/35 bg-violet-500/10 p-2.5 text-[11px] text-violet-200">
+          Корректирующий слой применяет цвет, размытие и фильтры ко всем слоям выше на таймлайне, не затрагивая слои ниже.
+        </div>
+      )}
       <div>
         <p className="mb-2 text-xs font-medium text-zinc-400">Цветовой фильтр</p>
         <div className="flex flex-wrap gap-1.5">
@@ -903,9 +1023,15 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
       </div>
 
       <div>
-        <p className="mb-2 text-xs font-medium text-zinc-400">Переход в начале</p>
-        <div className="grid grid-cols-4 gap-1.5">
-          {TRANSITIONS.map((t) => (
+        <p className="mb-2 text-xs font-medium text-zinc-400">
+          {isAdjustment ? 'Плавное появление' : 'Переход в начале'}
+        </p>
+        <div
+          className={`grid gap-1.5 ${
+            availTransitions.length === 2 ? 'grid-cols-2' : 'grid-cols-4'
+          }`}
+        >
+          {availTransitions.map((t) => (
             <button
               key={t.id}
               type="button"
@@ -923,9 +1049,15 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
       </div>
 
       <div>
-        <p className="mb-2 text-xs font-medium text-zinc-400">Переход в конце</p>
-        <div className="grid grid-cols-4 gap-1.5">
-          {TRANSITIONS.map((t) => (
+        <p className="mb-2 text-xs font-medium text-zinc-400">
+          {isAdjustment ? 'Плавное затухание' : 'Переход в конце'}
+        </p>
+        <div
+          className={`grid gap-1.5 ${
+            availTransitions.length === 2 ? 'grid-cols-2' : 'grid-cols-4'
+          }`}
+        >
+          {availTransitions.map((t) => (
             <button
               key={t.id}
               type="button"
@@ -944,7 +1076,8 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
         </div>
       </div>
 
-      {(selectedClip.track === 'video' || selectedClip.track === 'overlay') && (
+      {!isAdjustment &&
+        (selectedClip.track === 'video' || selectedClip.track === 'overlay') && (
         <div>
           <p className="mb-2 text-xs font-medium text-zinc-400">Движение камеры</p>
           <div className="flex flex-wrap gap-1.5">
@@ -2000,5 +2133,6 @@ export const TOOL_TABS: Array<{
   {id: 'media', label: 'Медиа', icon: Plus},
   {id: 'overlay', label: 'Наложение', icon: Layers},
   {id: 'effects', label: 'Эффекты', icon: Sparkles},
+  {id: 'settings', label: 'Настройки', icon: Settings},
   {id: 'team', label: 'Чат/Сеть', icon: Users},
 ];

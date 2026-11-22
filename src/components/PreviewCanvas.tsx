@@ -7,18 +7,22 @@ import {
 import {ScrubNumberField} from './ScrubNumberField.tsx';
 import type {
   AspectRatio,
+  CanvasBackground,
   Clip,
   ClipMask,
+  ClipWarp,
   Collaborator,
   ProjectFont,
   TextCurvePoint,
   Track,
+  WarpPoint,
 } from '../shared/types.ts';
 import {preloadProjectFonts, subscribeFontLoads} from '../lib/fontLoader.ts';
 import {evaluateClipTransform} from '../lib/keyframeEngine.ts';
 import type {StudioAudioEngine} from '../lib/audioEngine.ts';
 import {
   getCanvasDimensions,
+  getClipLayerBox,
   MediaPool,
   renderCompositeFrame,
   sampleClipColorAtNormalizedPoint,
@@ -30,6 +34,15 @@ import {
   hitTestTextClip,
   normalizeTextStyle,
 } from '../lib/textRenderer.ts';
+import {
+  canvasPxToLayerUv,
+  evalMeshSplinePoint,
+  getWarpedOutlinePolygon,
+  isIdentityWarp,
+  layerUvToCanvasPx,
+  normalizeWarp,
+  pointInPolygon,
+} from '../lib/warpEngine.ts';
 
 export interface CanvasTransformPatch {
   x: number;
@@ -43,6 +56,7 @@ interface PreviewCanvasProps {
   clips: Clip[];
   aspectRatio: AspectRatio;
   backgroundColor?: string;
+  canvasBackground?: CanvasBackground;
   customFonts?: ProjectFont[];
   currentTime: number;
   isPlaying: boolean;
@@ -79,6 +93,8 @@ interface PreviewCanvasProps {
     points: TextCurvePoint[],
     commit: boolean
   ) => void;
+  warpEditActive?: boolean;
+  onUpdateWarp?: (clipId: string, warp: ClipWarp, commit: boolean) => void;
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onSelectClip: (clipId: string | null) => void;
   onDoubleClickTextClip?: (clipId: string) => void;
@@ -116,6 +132,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   clips,
   aspectRatio,
   backgroundColor,
+  canvasBackground,
   customFonts,
   currentTime,
   isPlaying,
@@ -140,6 +157,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   selectedCurvePointId = null,
   onSelectCurvePoint,
   onUpdateCurvePoints,
+  warpEditActive = false,
+  onUpdateWarp,
   onLockLayer,
   onSelectClip,
   onDoubleClickTextClip,
@@ -198,12 +217,74 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     pointId: string;
     points: TextCurvePoint[];
   } | null>(null);
+  const warpDragRef = useRef<
+    | {
+        clipId: string;
+        kind: 'corner';
+        index: number;
+        box: {
+          centerX: number;
+          centerY: number;
+          layerW: number;
+          layerH: number;
+          rotationDeg: number;
+        };
+        warp: ClipWarp;
+      }
+    | {
+        clipId: string;
+        kind: 'edge';
+        edgeIdx: number;
+        startUv: {u: number; v: number};
+        origCorners: [WarpPoint, WarpPoint, WarpPoint, WarpPoint];
+        box: {
+          centerX: number;
+          centerY: number;
+          layerW: number;
+          layerH: number;
+          rotationDeg: number;
+        };
+        warp: ClipWarp;
+      }
+    | {
+        clipId: string;
+        kind: 'mesh';
+        index: number;
+        box: {
+          centerX: number;
+          centerY: number;
+          layerW: number;
+          layerH: number;
+          rotationDeg: number;
+        };
+        warp: ClipWarp;
+      }
+    | null
+  >(null);
   const lastTextTapRef = useRef<{clipId: string; ts: number} | null>(null);
   const lastCurvePointTapRef = useRef<{pointId: string; ts: number} | null>(
     null
   );
 
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const [stageSize, setStageSize] = useState<{w: number; h: number}>({w: 0, h: 0});
   const {width, height} = getCanvasDimensions(aspectRatio);
+
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const updateSize = () => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width > 0 && rect.height > 0) {
+        setStageSize({w: rect.width, h: rect.height});
+      }
+    };
+    updateSize();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(updateSize);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   useEffect(() => {
     mediaPool.setOnAssetReady(() => {
@@ -279,13 +360,15 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       backgroundColor,
       effectiveSnapGuides,
       currentUserId,
-      maskEditClipId
+      maskEditClipId,
+      canvasBackground
     );
   }, [
     tracks,
     clips,
     aspectRatio,
     backgroundColor,
+    canvasBackground,
     currentTime,
     isPlaying,
     renderedSelectedId,
@@ -320,7 +403,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           backgroundColor,
           effectiveSnapGuides,
           currentUserId,
-          maskEditClipId
+          maskEditClipId,
+          canvasBackground
         );
       }
       raf = requestAnimationFrame(loop);
@@ -332,6 +416,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     tracks,
     clips,
     backgroundColor,
+    canvasBackground,
     currentTime,
     width,
     height,
@@ -353,6 +438,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       .filter(
         (c) =>
           c.track !== 'audio' &&
+          c.track !== 'adjustment' &&
+          c.kind !== 'adjustment' &&
           !hiddenIds.has(c.trackId) &&
           currentTime >= c.start &&
           currentTime < c.start + c.duration
@@ -371,11 +458,45 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           return c;
         }
       } else if (c.track === 'overlay') {
-        const tr = evaluateClipTransform(c, currentTime);
-        const halfW = Math.max(0.12, (tr.scale * (c.scaleX ?? 1)) / 2);
-        const halfH = Math.max(0.12, (tr.scale * (c.scaleY ?? 1)) / 2);
-        if (Math.abs(nx - tr.x) <= halfW && Math.abs(ny - tr.y) <= halfH) {
-          return c;
+        const box = getClipLayerBox(c, width, height, currentTime, mediaPool);
+        if (box) {
+          const px = nx * width;
+          const py = ny * height;
+          const tr = evaluateClipTransform(c, currentTime);
+          const warp = normalizeWarp(tr.warp ?? c.warp);
+          if (!isIdentityWarp(warp)) {
+            const poly = getWarpedOutlinePolygon(
+              box.centerX,
+              box.centerY,
+              box.layerW,
+              box.layerH,
+              box.rotationDeg,
+              warp
+            );
+            if (pointInPolygon(px, py, poly)) {
+              return c;
+            }
+          } else {
+            const {u, v} = canvasPxToLayerUv(
+              px,
+              py,
+              box.centerX,
+              box.centerY,
+              Math.max(48, box.layerW),
+              Math.max(48, box.layerH),
+              box.rotationDeg
+            );
+            if (u >= -0.05 && u <= 1.05 && v >= -0.05 && v <= 1.05) {
+              return c;
+            }
+          }
+        } else {
+          const tr = evaluateClipTransform(c, currentTime);
+          const halfW = Math.max(0.12, (tr.scale * (c.scaleX ?? 1)) / 2);
+          const halfH = Math.max(0.12, (tr.scale * (c.scaleY ?? 1)) / 2);
+          if (Math.abs(nx - tr.x) <= halfW && Math.abs(ny - tr.y) <= halfH) {
+            return c;
+          }
         }
       } else if (c.track === 'video') {
         return c;
@@ -545,6 +666,118 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       ? getTextCurveOverlayData(activeCurveClip, width, height, currentTime)
       : null;
 
+  const activeWarpClip = selectedClipId
+    ? clips.find(
+        (c) =>
+          c.id === selectedClipId &&
+          c.track !== 'audio' &&
+          c.track !== 'adjustment' &&
+          c.kind !== 'adjustment' &&
+          currentTime >= c.start &&
+          currentTime < c.start + c.duration
+      ) ?? null
+    : null;
+
+  const warpOverlay = (() => {
+    if (
+      !warpEditActive ||
+      !activeWarpClip ||
+      isPlaying ||
+      !showSelectionOutline ||
+      chromaKeyPickerActive ||
+      colorPickerActive ||
+      maskEditActive
+    ) {
+      return null;
+    }
+    const tr = evaluateClipTransform(activeWarpClip, currentTime);
+    const warp = normalizeWarp(tr.warp ?? activeWarpClip.warp);
+    if (warp.mode === 'none') return null;
+    const box = getClipLayerBox(
+      activeWarpClip,
+      width,
+      height,
+      currentTime,
+      mediaPool
+    );
+    if (!box) return null;
+
+    const toPx = (u: number, v: number) =>
+      layerUvToCanvasPx(
+        u,
+        v,
+        box.centerX,
+        box.centerY,
+        box.layerW,
+        box.layerH,
+        box.rotationDeg
+      );
+
+    if (warp.mode === 'perspective') {
+      const cornerPx = warp.corners.map((p) => toPx(p.x, p.y));
+      const edges: Array<[number, number]> = [
+        [0, 1],
+        [1, 2],
+        [2, 3],
+        [3, 0],
+      ];
+      const edgeMidPx = edges.map(([iA, iB]) => {
+        const a = cornerPx[iA];
+        const b = cornerPx[iB];
+        return {
+          x: (a.x + b.x) / 2,
+          y: (a.y + b.y) / 2,
+          angleDeg: (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI,
+        };
+      });
+      return {
+        clip: activeWarpClip,
+        box,
+        warp,
+        mode: 'perspective' as const,
+        cornerPx,
+        edgeMidPx,
+      };
+    }
+
+    const n = warp.meshSize;
+    const nodePx = warp.meshPoints.map((p) => toPx(p.x, p.y));
+    const gridLines: string[] = [];
+    const steps = 16;
+
+    for (let r = 0; r < n; r++) {
+      const v = r / (n - 1);
+      let d = '';
+      for (let s = 0; s <= steps; s++) {
+        const u = s / steps;
+        const uv = evalMeshSplinePoint(warp.meshPoints, n, u, v);
+        const p = toPx(uv.x, uv.y);
+        d += `${s === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)} `;
+      }
+      gridLines.push(d.trim());
+    }
+    for (let c = 0; c < n; c++) {
+      const u = c / (n - 1);
+      let d = '';
+      for (let s = 0; s <= steps; s++) {
+        const v = s / steps;
+        const uv = evalMeshSplinePoint(warp.meshPoints, n, u, v);
+        const p = toPx(uv.x, uv.y);
+        d += `${s === 0 ? 'M' : 'L'} ${p.x.toFixed(1)} ${p.y.toFixed(1)} `;
+      }
+      gridLines.push(d.trim());
+    }
+
+    return {
+      clip: activeWarpClip,
+      box,
+      warp,
+      mode: 'mesh' as const,
+      nodePx,
+      gridLines,
+    };
+  })();
+
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -560,6 +793,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           (c) =>
             c.id === selectedClipId &&
             c.track !== 'audio' &&
+            c.track !== 'adjustment' &&
+            c.kind !== 'adjustment' &&
             currentTime >= c.start &&
             currentTime < c.start + c.duration
         ) ?? null
@@ -567,10 +802,120 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
 
     if (activePointersRef.current.size >= 2) {
       curveDragRef.current = null;
+      warpDragRef.current = null;
       if (existingSelected) {
         beginGestureForClip(existingSelected, maskEditActive && existingSelected.mask ? 'mask' : 'clip');
       }
       return;
+    }
+
+    if (warpOverlay && onUpdateWarp) {
+      const pxPerCss = width / Math.max(1, rect.width);
+      const canvasX = nx * width;
+      const canvasY = ny * height;
+      const nodeHitR = 24 * pxPerCss;
+
+      if (warpOverlay.mode === 'perspective') {
+        let bestCorner = -1;
+        let bestCornerDist = Infinity;
+        warpOverlay.cornerPx.forEach((pt, idx) => {
+          const d = Math.hypot(canvasX - pt.x, canvasY - pt.y);
+          if (d <= nodeHitR && d < bestCornerDist) {
+            bestCornerDist = d;
+            bestCorner = idx;
+          }
+        });
+        if (bestCorner >= 0) {
+          if (
+            warpOverlay.clip.lockedByUserId &&
+            warpOverlay.clip.lockedByUserId !== currentUserId
+          ) {
+            onLockLayer?.(warpOverlay.clip.id, true);
+            return;
+          }
+          onLockLayer?.(warpOverlay.clip.id, true);
+          warpDragRef.current = {
+            clipId: warpOverlay.clip.id,
+            kind: 'corner',
+            index: bestCorner,
+            box: warpOverlay.box,
+            warp: warpOverlay.warp,
+          };
+          return;
+        }
+
+        let bestEdge = -1;
+        let bestEdgeDist = Infinity;
+        warpOverlay.edgeMidPx.forEach((pt, idx) => {
+          const d = Math.hypot(canvasX - pt.x, canvasY - pt.y);
+          if (d <= 21 * pxPerCss && d < bestEdgeDist) {
+            bestEdgeDist = d;
+            bestEdge = idx;
+          }
+        });
+        if (bestEdge >= 0) {
+          if (
+            warpOverlay.clip.lockedByUserId &&
+            warpOverlay.clip.lockedByUserId !== currentUserId
+          ) {
+            onLockLayer?.(warpOverlay.clip.id, true);
+            return;
+          }
+          onLockLayer?.(warpOverlay.clip.id, true);
+          const startUv = canvasPxToLayerUv(
+            canvasX,
+            canvasY,
+            warpOverlay.box.centerX,
+            warpOverlay.box.centerY,
+            warpOverlay.box.layerW,
+            warpOverlay.box.layerH,
+            warpOverlay.box.rotationDeg
+          );
+          warpDragRef.current = {
+            clipId: warpOverlay.clip.id,
+            kind: 'edge',
+            edgeIdx: bestEdge,
+            startUv,
+            origCorners: [
+              {...warpOverlay.warp.corners[0]},
+              {...warpOverlay.warp.corners[1]},
+              {...warpOverlay.warp.corners[2]},
+              {...warpOverlay.warp.corners[3]},
+            ],
+            box: warpOverlay.box,
+            warp: warpOverlay.warp,
+          };
+          return;
+        }
+      } else {
+        let bestNode = -1;
+        let bestNodeDist = Infinity;
+        warpOverlay.nodePx.forEach((pt, idx) => {
+          const d = Math.hypot(canvasX - pt.x, canvasY - pt.y);
+          if (d <= nodeHitR && d < bestNodeDist) {
+            bestNodeDist = d;
+            bestNode = idx;
+          }
+        });
+        if (bestNode >= 0) {
+          if (
+            warpOverlay.clip.lockedByUserId &&
+            warpOverlay.clip.lockedByUserId !== currentUserId
+          ) {
+            onLockLayer?.(warpOverlay.clip.id, true);
+            return;
+          }
+          onLockLayer?.(warpOverlay.clip.id, true);
+          warpDragRef.current = {
+            clipId: warpOverlay.clip.id,
+            kind: 'mesh',
+            index: bestNode,
+            box: warpOverlay.box,
+            warp: warpOverlay.warp,
+          };
+          return;
+        }
+      }
     }
 
     if (curveOverlay && activeCurveClip && onUpdateCurvePoints) {
@@ -727,6 +1072,62 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
 
+    if (warpDragRef.current && activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, {x: e.clientX, y: e.clientY});
+      const pointers = Array.from(activePointersRef.current.values());
+      if (pointers.length >= 2) {
+        warpDragRef.current = null;
+      } else if (onUpdateWarp) {
+        const drag = warpDragRef.current;
+        const nx = (e.clientX - rect.left) / rect.width;
+        const ny = (e.clientY - rect.top) / rect.height;
+        const rawUv = canvasPxToLayerUv(
+          nx * width,
+          ny * height,
+          drag.box.centerX,
+          drag.box.centerY,
+          drag.box.layerW,
+          drag.box.layerH,
+          drag.box.rotationDeg
+        );
+        const clampUv = (v: number) =>
+          Math.max(-1.6, Math.min(2.6, Math.round(v * 1000) / 1000));
+        const uv = {u: clampUv(rawUv.u), v: clampUv(rawUv.v)};
+
+        let nextWarp: ClipWarp = drag.warp;
+        if (drag.kind === 'corner') {
+          const corners = drag.warp.corners.map((pt, idx) =>
+            idx === drag.index ? {x: uv.u, y: uv.v} : {...pt}
+          ) as [WarpPoint, WarpPoint, WarpPoint, WarpPoint];
+          nextWarp = {...drag.warp, corners};
+        } else if (drag.kind === 'edge') {
+          const du = uv.u - drag.startUv.u;
+          const dv = uv.v - drag.startUv.v;
+          const edgePairs: Array<[number, number]> = [
+            [0, 1],
+            [1, 2],
+            [2, 3],
+            [3, 0],
+          ];
+          const [iA, iB] = edgePairs[drag.edgeIdx];
+          const corners = drag.origCorners.map((pt, idx) =>
+            idx === iA || idx === iB
+              ? {x: clampUv(pt.x + du), y: clampUv(pt.y + dv)}
+              : {...pt}
+          ) as [WarpPoint, WarpPoint, WarpPoint, WarpPoint];
+          nextWarp = {...drag.warp, corners};
+        } else if (drag.kind === 'mesh') {
+          const meshPoints = drag.warp.meshPoints.map((pt, idx) =>
+            idx === drag.index ? {x: uv.u, y: uv.v} : {...pt}
+          );
+          nextWarp = {...drag.warp, meshPoints};
+        }
+        drag.warp = nextWarp;
+        onUpdateWarp(drag.clipId, nextWarp, false);
+        return;
+      }
+    }
+
     if (curveDragRef.current && activePointersRef.current.has(e.pointerId)) {
       activePointersRef.current.set(e.pointerId, {x: e.clientX, y: e.clientY});
       const pointers = Array.from(activePointersRef.current.values());
@@ -859,6 +1260,14 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       // ignore
     }
 
+    if (warpDragRef.current) {
+      const drag = warpDragRef.current;
+      warpDragRef.current = null;
+      onUpdateWarp?.(drag.clipId, drag.warp, true);
+      onLockLayer?.(drag.clipId, false);
+      return;
+    }
+
     if (curveDragRef.current) {
       const drag = curveDragRef.current;
       curveDragRef.current = null;
@@ -942,7 +1351,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         currentTime,
         mediaPool,
         tracks,
-        backgroundColor
+        backgroundColor,
+        canvasBackground
       );
       if (hex) {
         onPickCanvasColor(hex, commit);
@@ -967,14 +1377,33 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     }
   };
 
-  const aspectClass =
-    aspectRatio === '9:16'
-      ? 'aspect-[9/16]'
-      : aspectRatio === '16:9'
-        ? 'aspect-video'
-        : aspectRatio === '4:5'
-          ? 'aspect-[4/5]'
-          : 'aspect-square';
+  const targetAspect = width / height;
+  const fittedSize =
+    stageSize.w > 0 && stageSize.h > 0
+      ? stageSize.w / stageSize.h > targetAspect
+        ? {
+            w: Math.max(40, Math.floor(stageSize.h * targetAspect)),
+            h: Math.max(40, Math.floor(stageSize.h)),
+          }
+        : {
+            w: Math.max(40, Math.floor(stageSize.w)),
+            h: Math.max(40, Math.floor(stageSize.w / targetAspect)),
+          }
+      : null;
+
+  const containerBgStyle: React.CSSProperties =
+    canvasBackground?.type === 'gradient'
+      ? {
+          backgroundImage: `linear-gradient(${canvasBackground.angle ?? 135}deg, ${canvasBackground.colors[0]}, ${canvasBackground.colors[1]})`,
+        }
+      : {
+          backgroundColor:
+            (canvasBackground?.type === 'solid'
+              ? canvasBackground.color
+              : undefined) ||
+            backgroundColor ||
+            '#09090b',
+        };
 
   const activeSelectedClip = selectedClipId
     ? clips.find((c) => c.id === selectedClipId) ?? null
@@ -1104,13 +1533,24 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       </div>
 
       <div
-        className={`relative max-h-full max-w-full ${aspectClass} overflow-hidden rounded-xl border border-white/10 shadow-2xl`}
-        style={{
-          backgroundColor: backgroundColor || '#09090b',
-          height: aspectRatio === '16:9' ? 'auto' : '100%',
-          width: aspectRatio === '16:9' ? '100%' : 'auto',
-        }}
+        ref={stageRef}
+        className="flex h-full w-full min-h-0 min-w-0 items-center justify-center"
       >
+        <div
+          className="relative overflow-hidden rounded-xl border border-white/10 shadow-2xl transition-[width,height] duration-300 ease-out"
+          style={{
+            ...containerBgStyle,
+            width: fittedSize ? `${fittedSize.w}px` : undefined,
+            height: fittedSize ? `${fittedSize.h}px` : undefined,
+            ...(fittedSize
+              ? {}
+              : {
+                  aspectRatio: `${width} / ${height}`,
+                  maxWidth: '100%',
+                  maxHeight: '100%',
+                }),
+          }}
+        >
         <canvas
           ref={canvasRef}
           width={width}
@@ -1203,6 +1643,128 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           </svg>
         )}
 
+        {warpOverlay && (
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            className="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible"
+          >
+            {warpOverlay.mode === 'perspective' ? (
+              <g>
+                {/* Perspective Quad Wireframe */}
+                <polygon
+                  points={warpOverlay.cornerPx
+                    .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+                    .join(' ')}
+                  fill="none"
+                  stroke="rgba(9, 9, 11, 0.72)"
+                  strokeWidth={Math.max(4, width * 0.0065)}
+                  strokeLinejoin="round"
+                />
+                <polygon
+                  points={warpOverlay.cornerPx
+                    .map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)
+                    .join(' ')}
+                  fill="none"
+                  stroke="#3b82f6"
+                  strokeWidth={Math.max(2, width * 0.0032)}
+                  strokeLinejoin="round"
+                />
+
+                {/* Edge Midpoint Handles */}
+                {warpOverlay.edgeMidPx.map((m, idx) => {
+                  const pw = Math.max(18, width * 0.026);
+                  const ph = Math.max(7, width * 0.01);
+                  return (
+                    <g
+                      key={`edge-${idx}`}
+                      transform={`translate(${m.x.toFixed(1)} ${m.y.toFixed(1)}) rotate(${m.angleDeg.toFixed(1)})`}
+                    >
+                      <rect
+                        x={-pw / 2}
+                        y={-ph / 2}
+                        width={pw}
+                        height={ph}
+                        rx={ph / 2}
+                        fill="#3b82f6"
+                        stroke="#ffffff"
+                        strokeWidth={Math.max(1.8, width * 0.003)}
+                      />
+                    </g>
+                  );
+                })}
+
+                {/* 4 Draggable Corner Handles */}
+                {warpOverlay.cornerPx.map((pt, idx) => {
+                  const r = Math.max(9, width * 0.0145);
+                  return (
+                    <g key={`corner-${idx}`}>
+                      <circle
+                        cx={pt.x}
+                        cy={pt.y}
+                        r={r + Math.max(3, width * 0.0045)}
+                        fill="rgba(9, 9, 11, 0.48)"
+                      />
+                      <circle
+                        cx={pt.x}
+                        cy={pt.y}
+                        r={r}
+                        fill="#3b82f6"
+                        stroke="#ffffff"
+                        strokeWidth={Math.max(2.2, width * 0.0036)}
+                      />
+                    </g>
+                  );
+                })}
+              </g>
+            ) : (
+              <g>
+                {/* Mesh Spline Grid Lines */}
+                {warpOverlay.gridLines.map((d, idx) => (
+                  <g key={`grid-${idx}`}>
+                    <path
+                      d={d}
+                      fill="none"
+                      stroke="rgba(9, 9, 11, 0.68)"
+                      strokeWidth={Math.max(3.6, width * 0.0055)}
+                      strokeLinecap="round"
+                    />
+                    <path
+                      d={d}
+                      fill="none"
+                      stroke="#60a5fa"
+                      strokeWidth={Math.max(1.8, width * 0.0028)}
+                      strokeLinecap="round"
+                    />
+                  </g>
+                ))}
+
+                {/* Mesh Draggable Nodes (9 or 16) */}
+                {warpOverlay.nodePx.map((pt, idx) => {
+                  const r = Math.max(8, width * 0.013);
+                  return (
+                    <g key={`mesh-${idx}`}>
+                      <circle
+                        cx={pt.x}
+                        cy={pt.y}
+                        r={r + Math.max(2.5, width * 0.004)}
+                        fill="rgba(9, 9, 11, 0.45)"
+                      />
+                      <circle
+                        cx={pt.x}
+                        cy={pt.y}
+                        r={r}
+                        fill="#3b82f6"
+                        stroke="#ffffff"
+                        strokeWidth={Math.max(2, width * 0.0032)}
+                      />
+                    </g>
+                  );
+                })}
+              </g>
+            )}
+          </svg>
+        )}
+
         {((chromaKeyPickerActive &&
           activeSelectedClip &&
           (activeSelectedClip.kind === 'image' ||
@@ -1287,6 +1849,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
             </p>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

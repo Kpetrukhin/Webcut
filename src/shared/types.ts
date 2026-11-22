@@ -1,8 +1,100 @@
-export type AspectRatio = '9:16' | '16:9' | '1:1' | '4:5';
+export type AspectRatio = '9:16' | '16:9' | '1:1' | '4:5' | '3:4' | '21:9';
 
-export type TrackType = 'video' | 'overlay' | 'text' | 'audio';
+export type CanvasBackground =
+  | {type: 'solid'; color: string}
+  | {type: 'gradient'; colors: [string, string]; angle?: number; label?: string}
+  | {type: 'blur'; blurAmount?: number};
 
-export type ClipKind = 'video' | 'image' | 'text' | 'audio' | 'synth';
+export const ASPECT_RATIO_PRESETS: Array<{
+  id: AspectRatio;
+  label: string;
+  hint: string;
+  width: number;
+  height: number;
+}> = [
+  {id: '9:16', label: '9:16', hint: 'TikTok / Reels', width: 720, height: 1280},
+  {id: '16:9', label: '16:9', hint: 'YouTube', width: 1280, height: 720},
+  {id: '1:1', label: '1:1', hint: 'Квадрат', width: 1080, height: 1080},
+  {id: '4:5', label: '4:5', hint: 'Лента', width: 1080, height: 1350},
+  {id: '3:4', label: '3:4', hint: 'Портрет', width: 960, height: 1280},
+  {id: '21:9', label: '21:9', hint: 'Кино', width: 1680, height: 720},
+];
+
+export const SOLID_BACKGROUND_PRESETS = [
+  '#09090b',
+  '#000000',
+  '#18181b',
+  '#1e1b4b',
+  '#064e3b',
+  '#450a0a',
+  '#0c4a6e',
+  '#3b0764',
+  '#ffffff',
+  '#f4f4f5',
+];
+
+export const GRADIENT_BACKGROUND_PRESETS: Array<{
+  id: string;
+  label: string;
+  colors: [string, string];
+  angle: number;
+}> = [
+  {id: 'obsidian', label: 'Графит', colors: ['#09090b', '#27272a'], angle: 135},
+  {id: 'cyber', label: 'Неон', colors: ['#0f172a', '#164e63'], angle: 135},
+  {id: 'sunset', label: 'Закат', colors: ['#7c2d12', '#be123c'], angle: 135},
+  {id: 'aurora', label: 'Аврора', colors: ['#064e3b', '#1e3a8a'], angle: 135},
+  {id: 'violet', label: 'Космос', colors: ['#3b0764', '#1e1b4b'], angle: 135},
+  {id: 'candy', label: 'Рассвет', colors: ['#ec4899', '#8b5cf6'], angle: 135},
+  {id: 'ocean', label: 'Океан', colors: ['#0284c7', '#1d4ed8'], angle: 135},
+  {id: 'gold', label: 'Янтарь', colors: ['#78350f', '#09090b'], angle: 160},
+];
+
+export type TrackType = 'video' | 'overlay' | 'text' | 'adjustment' | 'audio';
+
+export type ClipKind =
+  | 'video'
+  | 'image'
+  | 'text'
+  | 'shape'
+  | 'audio'
+  | 'synth'
+  | 'adjustment';
+
+export type ShapeType =
+  | 'circle'
+  | 'ellipse'
+  | 'rectangle'
+  | 'rounded_square'
+  | 'triangle'
+  | 'star'
+  | 'arrow'
+  | 'line';
+
+export interface ShapeStyle {
+  shapeType: ShapeType;
+  fillColor: string;
+  fillOpacity: number; // 0..1
+  strokeColor: string;
+  strokeWidth: number; // 0..32 px at 720w reference
+  cornerRadius?: number; // px at 720w reference
+}
+
+export type WarpMode = 'none' | 'perspective' | 'mesh';
+
+export interface WarpPoint {
+  x: number; // layer-local normalized coords: (0,0)=TL, (1,1)=BR
+  y: number;
+}
+
+export interface ClipWarp {
+  mode: WarpMode;
+  /** 4 corners [TL, TR, BR, BL] in layer-local space */
+  corners: [WarpPoint, WarpPoint, WarpPoint, WarpPoint];
+  /** Grid size per axis in mesh mode (3 -> 3x3=9 nodes, 4 -> 4x4=16 nodes) */
+  meshSize: 3 | 4;
+  /** Row-major meshSize * meshSize control points in layer-local space */
+  meshPoints: WarpPoint[];
+}
 
 export type BuiltinFilterPreset =
   | 'none'
@@ -35,6 +127,7 @@ export interface ColorAdjustments {
   temperature: number; // -100..100
   fade: number; // 0..100
   grain: number; // 0..100
+  invert?: number; // 0..100
   curves?: ColorCurves;
 }
 
@@ -108,6 +201,7 @@ export interface ClipKeyframe {
   scale: number;
   rotation: number; // degrees -180..180
   opacity: number; // 0..1
+  warp?: ClipWarp;
   easing: KeyframeEasing;
 }
 
@@ -223,6 +317,9 @@ export interface Clip {
   motionEffect: MotionEffect;
   text?: string;
   textStyle?: TextStyle;
+  shapeStyle?: ShapeStyle;
+  adjustmentMask?: boolean;
+  warp?: ClipWarp;
   mediaScale?: number;
   scaleX?: number;
   scaleY?: number;
@@ -298,6 +395,7 @@ export interface ProjectState {
   title: string;
   aspectRatio: AspectRatio;
   backgroundColor: string;
+  canvasBackground?: CanvasBackground;
   hostName?: string;
   fps: number;
   isPublicLan: boolean;
@@ -314,6 +412,7 @@ export interface RoomSummary {
   title: string;
   aspectRatio: AspectRatio;
   backgroundColor: string;
+  canvasBackground?: CanvasBackground;
   hostName?: string;
   collaboratorsCount: number;
   collaborators: Array<{name: string; color: string}>;
@@ -340,11 +439,11 @@ export type ClientWsMessage =
     }
   | {type: 'presence:profile'; name: string; color: string}
   | {type: 'lobby:get_rooms'}
-  | {type: 'op:track_add'; track: Track}
+  | {type: 'op:track_add'; track: Track; insertAt?: number}
   | {type: 'op:track_update'; trackId: string; patch: Partial<Track>}
   | {type: 'op:track_delete'; trackId: string}
   | {type: 'op:track_reorder'; trackIds: string[]}
-  | {type: 'op:clip_add'; clip: Clip; newTrack?: Track}
+  | {type: 'op:clip_add'; clip: Clip; newTrack?: Track; insertAt?: number}
   | {type: 'op:clip_update'; clipId: string; patch: Partial<Clip>}
   | {type: 'op:clip_delete'; clipId: string}
   | {type: 'op:clip_duplicate'; clipId: string; newClipId: string}
@@ -363,6 +462,7 @@ export type ClientWsMessage =
           | 'aspectRatio'
           | 'isPublicLan'
           | 'backgroundColor'
+          | 'canvasBackground'
           | 'hostName'
           | 'customFonts'
         >
@@ -375,6 +475,7 @@ export type ClientWsMessage =
       aspectRatio?: AspectRatio;
       title?: string;
       backgroundColor?: string;
+      canvasBackground?: CanvasBackground;
       customFonts?: ProjectFont[];
     }
   | {
@@ -396,6 +497,7 @@ export type ClientWsMessage =
       senderId: string;
       clip?: Clip;
       newTrack?: Track;
+      insertAt?: number;
     }
   | {
       type: 'LAYER_LOCK';
@@ -414,7 +516,13 @@ export type ServerWsMessage =
       rooms: RoomSummary[];
     }
   | {type: 'lobby:rooms_update'; rooms: RoomSummary[]}
-  | {type: 'op:track_add'; track: Track; revision: number; senderId: string}
+  | {
+      type: 'op:track_add';
+      track: Track;
+      insertAt?: number;
+      revision: number;
+      senderId: string;
+    }
   | {
       type: 'op:track_update';
       trackId: string;
@@ -433,6 +541,7 @@ export type ServerWsMessage =
       type: 'op:clip_add';
       clip: Clip;
       newTrack?: Track;
+      insertAt?: number;
       revision: number;
       senderId: string;
     }
@@ -468,6 +577,7 @@ export type ServerWsMessage =
           | 'aspectRatio'
           | 'isPublicLan'
           | 'backgroundColor'
+          | 'canvasBackground'
           | 'hostName'
           | 'customFonts'
         >
@@ -482,6 +592,7 @@ export type ServerWsMessage =
       aspectRatio: AspectRatio;
       title: string;
       backgroundColor?: string;
+      canvasBackground?: CanvasBackground;
       customFonts?: ProjectFont[];
       revision: number;
       senderId: string;
@@ -505,6 +616,7 @@ export type ServerWsMessage =
       senderId: string;
       clip?: Clip;
       newTrack?: Track;
+      insertAt?: number;
       revision?: number;
     }
   | {
@@ -601,6 +713,8 @@ export function getTrackLabelPrefix(type: TrackType): string {
       return 'Слой';
     case 'text':
       return 'Текст';
+    case 'adjustment':
+      return 'Эффект';
     case 'audio':
       return 'Аудио';
   }
@@ -618,10 +732,30 @@ export function createTrackOfType(
   };
 }
 
+export function insertTrackAt(
+  tracks: Track[],
+  newTrack: Track,
+  insertAt?: number
+): Track[] {
+  if (tracks.some((t) => t.id === newTrack.id)) return tracks;
+  if (
+    insertAt === undefined ||
+    insertAt < 0 ||
+    insertAt >= tracks.length
+  ) {
+    return [...tracks, newTrack];
+  }
+  const next = [...tracks];
+  next.splice(insertAt, 0, newTrack);
+  return next;
+}
+
 /**
  * Finds a track of the requested type where `[start, start + duration]` does not
- * collide with existing clips. If all existing tracks overlap (or forceNew is true),
- * creates a brand-new track so clips never stack on top of each other on one row.
+ * collide with existing clips. For overlay tracks, ensures the chosen track sits
+ * higher in Z-order (`index > minTrackIndex`) than the active/video track so the
+ * overlay visually covers it. If all matching tracks overlap (or forceNew is true),
+ * creates a brand-new track at the appropriate Z-order insertion index.
  */
 export function resolveTrackPlacement(
   tracks: Track[],
@@ -629,12 +763,27 @@ export function resolveTrackPlacement(
   type: TrackType,
   start: number,
   duration: number,
-  forceNew = false
-): {trackId: string; newTrack?: Track} {
-  const matching = tracks.filter((t) => t.type === type);
+  forceNew = false,
+  minTrackIndex = -1
+): {trackId: string; newTrack?: Track; insertAt?: number} {
+  let lastVideoIdx = -1;
+  tracks.forEach((t, i) => {
+    if (t.type === 'video') lastVideoIdx = i;
+  });
+
+  const floorIdx =
+    type === 'overlay'
+      ? minTrackIndex >= 0
+        ? minTrackIndex
+        : lastVideoIdx
+      : -1;
+
   if (!forceNew) {
     const end = start + duration;
-    for (const track of matching) {
+    for (let i = 0; i < tracks.length; i++) {
+      const track = tracks[i];
+      if (track.type !== type) continue;
+      if (type === 'overlay' && i <= floorIdx) continue;
       const overlaps = clips.some((c) => {
         if (c.trackId !== track.id) return false;
         const cEnd = c.start + c.duration;
@@ -645,8 +794,32 @@ export function resolveTrackPlacement(
       }
     }
   }
+
   const newTrack = createTrackOfType(tracks, type);
-  return {trackId: newTrack.id, newTrack};
+  let insertAt: number | undefined;
+
+  if (type === 'overlay') {
+    let lastOverlayAbove = -1;
+    tracks.forEach((t, i) => {
+      if (t.type === 'overlay' && i > floorIdx) {
+        lastOverlayAbove = i;
+      }
+    });
+    insertAt =
+      lastOverlayAbove !== -1
+        ? lastOverlayAbove + 1
+        : Math.max(0, Math.min(tracks.length, floorIdx + 1));
+  } else if (type === 'text') {
+    const firstPostTextIdx = tracks.findIndex(
+      (t) => t.type === 'adjustment' || t.type === 'audio'
+    );
+    if (firstPostTextIdx !== -1) insertAt = firstPostTextIdx;
+  } else if (type === 'adjustment') {
+    const firstAudioIdx = tracks.findIndex((t) => t.type === 'audio');
+    insertAt = firstAudioIdx !== -1 ? firstAudioIdx : tracks.length;
+  }
+
+  return {trackId: newTrack.id, newTrack, insertAt};
 }
 
 export function normalizeProjectTracks(project: ProjectState): ProjectState {
@@ -972,7 +1145,9 @@ export function applyClipSplit(
     start: Math.round(splitTime * 100) / 100,
     duration: Math.round((target.duration - relOffset) * 100) / 100,
     trimStart:
-      Math.round((target.trimStart + relOffset * target.speed) * 100) / 100,
+      target.kind === 'adjustment'
+        ? 0
+        : Math.round((target.trimStart + relOffset * target.speed) * 100) / 100,
     transitionIn: 'none',
     keyframes: target.keyframes
       ?.filter((k) => k.timeOffset >= relOffset)

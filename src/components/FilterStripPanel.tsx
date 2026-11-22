@@ -11,6 +11,7 @@ import {
 interface FilterStripPanelProps {
   clip: Clip;
   customPresets: ColorFilterPreset[];
+  previewFallbackSrc?: string;
   onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
   onOpenAdjust: () => void;
   onPresetsChanged: (next: ColorFilterPreset[]) => void;
@@ -19,6 +20,7 @@ interface FilterStripPanelProps {
 export const FilterStripPanel: React.FC<FilterStripPanelProps> = ({
   clip,
   customPresets,
+  previewFallbackSrc,
   onUpdateClip,
   onOpenAdjust,
   onPresetsChanged,
@@ -39,7 +41,7 @@ export const FilterStripPanel: React.FC<FilterStripPanelProps> = ({
   };
 
   const previewImgSrc =
-    clip.kind === 'image' && clip.src ? clip.src : undefined;
+    clip.kind === 'image' && clip.src ? clip.src : previewFallbackSrc;
 
   return (
     <div className="space-y-3">

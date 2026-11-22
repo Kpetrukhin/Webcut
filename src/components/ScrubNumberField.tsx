@@ -12,7 +12,7 @@ export interface ScrubNumberFieldProps {
   sensitivity?: number;
   suffix?: string;
   compact?: boolean;
-  accent?: 'cyan' | 'emerald' | 'amber' | 'indigo';
+  accent?: 'cyan' | 'emerald' | 'amber' | 'indigo' | 'violet';
   className?: string;
   ariaLabel?: string;
 }
@@ -45,6 +45,13 @@ const ACCENT_STYLES = {
     hoverBorder: 'hover:border-indigo-400/60',
     iconText: 'text-indigo-400',
     compactText: 'text-indigo-300',
+  },
+  violet: {
+    borderActive: 'border-violet-400',
+    scrubBg: 'border-violet-400 bg-violet-500/20 text-violet-200',
+    hoverBorder: 'hover:border-violet-400/60',
+    iconText: 'text-violet-400',
+    compactText: 'text-violet-300',
   },
 } as const;
 

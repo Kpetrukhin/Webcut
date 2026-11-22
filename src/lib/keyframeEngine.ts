@@ -1,4 +1,10 @@
-import type {Clip, ClipKeyframe, KeyframeEasing} from '../shared/types.ts';
+import type {
+  Clip,
+  ClipKeyframe,
+  ClipWarp,
+  KeyframeEasing,
+} from '../shared/types.ts';
+import {interpolateWarp} from './warpEngine.ts';
 
 export interface EvaluatedTransform {
   x: number;
@@ -6,6 +12,7 @@ export interface EvaluatedTransform {
   scale: number;
   rotation: number;
   opacity: number;
+  warp?: ClipWarp;
 }
 
 export function applyEasing(t: number, easing: KeyframeEasing): number {
@@ -48,6 +55,7 @@ export function getBaseClipTransform(clip: Clip): EvaluatedTransform {
       scale: clip.mediaScale ?? 1,
       rotation: clip.rotation ?? 0,
       opacity: clip.opacity ?? 1,
+      warp: clip.warp,
     };
   }
   return {
@@ -56,6 +64,7 @@ export function getBaseClipTransform(clip: Clip): EvaluatedTransform {
     scale: clip.mediaScale ?? (clip.track === 'overlay' ? 0.42 : 1),
     rotation: clip.rotation ?? 0,
     opacity: clip.opacity ?? 1,
+    warp: clip.warp,
   };
 }
 
@@ -83,6 +92,7 @@ export function evaluateClipTransform(
       scale: first.scale,
       rotation: first.rotation,
       opacity: first.opacity,
+      warp: first.warp ?? clip.warp,
     };
   }
 
@@ -94,6 +104,7 @@ export function evaluateClipTransform(
       scale: last.scale,
       rotation: last.rotation,
       opacity: last.opacity,
+      warp: last.warp ?? clip.warp,
     };
   }
 
@@ -104,12 +115,16 @@ export function evaluateClipTransform(
       const span = Math.max(0.001, b.timeOffset - a.timeOffset);
       const rawT = (localTime - a.timeOffset) / span;
       const easedT = applyEasing(rawT, b.easing || a.easing || 'ease-in-out');
+      const warpA = a.warp ?? clip.warp;
+      const warpB = b.warp ?? clip.warp;
       return {
         x: a.x + (b.x - a.x) * easedT,
         y: a.y + (b.y - a.y) * easedT,
         scale: a.scale + (b.scale - a.scale) * easedT,
         rotation: a.rotation + (b.rotation - a.rotation) * easedT,
         opacity: a.opacity + (b.opacity - a.opacity) * easedT,
+        warp:
+          warpA || warpB ? interpolateWarp(warpA, warpB, easedT) : undefined,
       };
     }
   }
@@ -139,6 +154,7 @@ export function upsertKeyframeAtTime(
       scale: override?.scale ?? current.scale,
       rotation: override?.rotation ?? current.rotation,
       opacity: override?.opacity ?? current.opacity,
+      warp: override?.warp ?? existing[nearIdx].warp ?? current.warp ?? clip.warp,
       easing: override?.easing ?? existing[nearIdx].easing,
     };
     existing[nearIdx] = updated;
@@ -156,6 +172,7 @@ export function upsertKeyframeAtTime(
     scale: override?.scale ?? current.scale,
     rotation: override?.rotation ?? current.rotation,
     opacity: override?.opacity ?? current.opacity,
+    warp: override?.warp ?? current.warp ?? clip.warp,
     easing: override?.easing ?? 'ease-in-out',
   };
   existing.push(created);
@@ -283,6 +300,144 @@ export function generateKeyframePreset(
           rotation: 0,
           opacity: 1,
           easing: 'bounce',
+        },
+      ];
+  }
+}
+
+export function generateAdjustmentKeyframePreset(
+  clip: Clip,
+  preset: 'fade-in' | 'fade-out' | 'fade-in-out' | 'pulse'
+): ClipKeyframe[] {
+  const base = getBaseClipTransform(clip);
+  const d = Math.max(0.4, clip.duration);
+  const fadeDur = Math.round(Math.min(0.8, d * 0.4) * 100) / 100;
+  const inOutDur = Math.round(Math.min(0.6, d * 0.25) * 100) / 100;
+
+  switch (preset) {
+    case 'fade-in':
+      return [
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: 0,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 0,
+          easing: 'linear',
+        },
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: fadeDur,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 1,
+          easing: 'ease-out',
+        },
+      ];
+    case 'fade-out':
+      return [
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: Math.max(0, Math.round((d - fadeDur) * 100) / 100),
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 1,
+          easing: 'linear',
+        },
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: Math.round(d * 100) / 100,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 0,
+          easing: 'ease-in',
+        },
+      ];
+    case 'fade-in-out':
+      return [
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: 0,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 0,
+          easing: 'linear',
+        },
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: inOutDur,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 1,
+          easing: 'ease-out',
+        },
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: Math.max(
+            inOutDur,
+            Math.round((d - inOutDur) * 100) / 100
+          ),
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 1,
+          easing: 'linear',
+        },
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: Math.round(d * 100) / 100,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 0,
+          easing: 'ease-in',
+        },
+      ];
+    case 'pulse':
+      return [
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: 0,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 0.2,
+          easing: 'linear',
+        },
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: Math.round(d * 0.5 * 100) / 100,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 1,
+          easing: 'ease-in-out',
+        },
+        {
+          id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+          timeOffset: Math.round(d * 100) / 100,
+          x: base.x,
+          y: base.y,
+          scale: base.scale,
+          rotation: base.rotation,
+          opacity: 0.2,
+          easing: 'ease-in-out',
         },
       ];
   }

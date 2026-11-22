@@ -53,6 +53,7 @@ export const DEFAULT_COLOR_ADJUSTMENTS: ColorAdjustments = {
   temperature: 0,
   fade: 0,
   grain: 0,
+  invert: 0,
   curves: createIdentityCurves(),
 };
 
@@ -232,6 +233,24 @@ export const BUILTIN_COLOR_PRESETS: ColorFilterPreset[] = [
       },
     },
   },
+  {
+    id: 'invert',
+    name: 'Инверсия',
+    isBuiltin: true,
+    brightness: 1,
+    contrast: 1,
+    saturate: 1,
+    adjustments: {
+      sharpness: 0,
+      shadows: 0,
+      hue: 0,
+      temperature: 0,
+      fade: 0,
+      grain: 0,
+      invert: 100,
+      curves: createIdentityCurves(),
+    },
+  },
 ];
 
 const LEGACY_PRESET_MAP: Record<string, ColorFilterPreset> = {
@@ -287,6 +306,7 @@ export interface EffectiveColorGrade {
   temperature: number; // -100..100
   fade: number; // 0..100
   grain: number; // 0..100
+  invert: number; // 0..100
   curves: ColorCurves;
 }
 
@@ -302,6 +322,7 @@ export function getClipEffectiveAdjustments(clip: Clip): EffectiveColorGrade {
       temperature: clip.colorAdjustments.temperature ?? 0,
       fade: clip.colorAdjustments.fade ?? 0,
       grain: clip.colorAdjustments.grain ?? 0,
+      invert: clip.colorAdjustments.invert ?? 0,
       curves: cloneCurves(clip.colorAdjustments.curves),
     };
   }
@@ -319,6 +340,7 @@ export function getClipEffectiveAdjustments(clip: Clip): EffectiveColorGrade {
       temperature: legacyPreset.adjustments.temperature,
       fade: legacyPreset.adjustments.fade,
       grain: legacyPreset.adjustments.grain,
+      invert: legacyPreset.adjustments.invert ?? 0,
       curves: cloneCurves(legacyPreset.adjustments.curves),
     };
   }
@@ -333,6 +355,7 @@ export function getClipEffectiveAdjustments(clip: Clip): EffectiveColorGrade {
     temperature: 0,
     fade: 0,
     grain: 0,
+    invert: 0,
     curves: createIdentityCurves(),
   };
 }
@@ -358,6 +381,7 @@ export function isNeutralColorGrade(g: EffectiveColorGrade): boolean {
     Math.abs(g.temperature) < 0.4 &&
     Math.abs(g.fade) < 0.4 &&
     Math.abs(g.grain) < 0.4 &&
+    Math.abs(g.invert) < 0.4 &&
     isIdentityCurve(g.curves.rgb) &&
     isIdentityCurve(g.curves.r) &&
     isIdentityCurve(g.curves.g) &&
@@ -380,6 +404,7 @@ export function applyFilterPresetToClipPatch(
       temperature: preset.adjustments.temperature,
       fade: preset.adjustments.fade,
       grain: preset.adjustments.grain,
+      invert: preset.adjustments.invert ?? 0,
       curves: cloneCurves(preset.adjustments.curves),
     },
   };
@@ -416,6 +441,7 @@ export function saveCustomColorPreset(
       temperature: grade.temperature,
       fade: grade.fade,
       grain: grade.grain,
+      invert: grade.invert,
       curves: cloneCurves(grade.curves),
     },
     createdAt: Date.now(),
@@ -588,6 +614,11 @@ export function buildCssFilterPreview(preset: ColorFilterPreset): string {
   if (preset.adjustments.temperature > 15) {
     parts.push(
       `sepia(${Math.min(0.85, preset.adjustments.temperature / 100).toFixed(2)})`
+    );
+  }
+  if ((preset.adjustments.invert ?? 0) > 1) {
+    parts.push(
+      `invert(${Math.min(1, (preset.adjustments.invert ?? 0) / 100).toFixed(2)})`
     );
   }
   return parts.length > 0 ? parts.join(' ') : 'none';

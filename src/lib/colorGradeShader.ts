@@ -29,6 +29,7 @@ const FRAGMENT_SHADER_SRC = `
   uniform float u_fade;
   uniform float u_grain;
   uniform float u_grainSeed;
+  uniform float u_invert;
 
   void main() {
     vec4 texel = texture2D(u_tex, v_uv);
@@ -106,6 +107,11 @@ const FRAGMENT_SHADER_SRC = `
       c = clamp(c + vec3(g), 0.0, 1.0);
     }
 
+    // 11. Color Inversion
+    if (u_invert > 0.001) {
+      c = mix(c, 1.0 - c, clamp(u_invert, 0.0, 1.0));
+    }
+
     gl_FragColor = vec4(c * texel.a, texel.a);
   }
 `;
@@ -133,6 +139,7 @@ class WebGLColorGradeProcessor {
   private uFadeLoc: WebGLUniformLocation | null = null;
   private uGrainLoc: WebGLUniformLocation | null = null;
   private uGrainSeedLoc: WebGLUniformLocation | null = null;
+  private uInvertLoc: WebGLUniformLocation | null = null;
 
   constructor() {
     this.canvas = document.createElement('canvas');
@@ -234,6 +241,7 @@ class WebGLColorGradeProcessor {
     this.uFadeLoc = gl.getUniformLocation(program, 'u_fade');
     this.uGrainLoc = gl.getUniformLocation(program, 'u_grain');
     this.uGrainSeedLoc = gl.getUniformLocation(program, 'u_grainSeed');
+    this.uInvertLoc = gl.getUniformLocation(program, 'u_invert');
 
     return true;
   }
@@ -256,7 +264,7 @@ class WebGLColorGradeProcessor {
     }
 
     const gl = this.gl;
-    const maxDim = 1280;
+    const maxDim = 1920;
     const scale = Math.min(1, maxDim / Math.max(mw, mh));
     const targetW = Math.max(2, Math.round(mw * scale));
     const targetH = Math.max(2, Math.round(mh * scale));
@@ -327,6 +335,7 @@ class WebGLColorGradeProcessor {
     gl.uniform1f(this.uFadeLoc, Math.max(0, Math.min(1, grade.fade / 100)));
     gl.uniform1f(this.uGrainLoc, Math.max(0, Math.min(1, grade.grain / 100)));
     gl.uniform1f(this.uGrainSeedLoc, Math.floor(timeSec * 24) * 0.17 + 1.3);
+    gl.uniform1f(this.uInvertLoc, Math.max(0, Math.min(1, grade.invert / 100)));
 
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     return this.canvas;

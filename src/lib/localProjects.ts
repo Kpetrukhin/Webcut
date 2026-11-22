@@ -1,10 +1,17 @@
-import type {AspectRatio, Clip, ProjectFont, Track} from '../shared/types.ts';
+import type {
+  AspectRatio,
+  CanvasBackground,
+  Clip,
+  ProjectFont,
+  Track,
+} from '../shared/types.ts';
 
 export interface LocalProjectRecord {
   roomId: string;
   title: string;
   aspectRatio: AspectRatio;
   backgroundColor: string;
+  canvasBackground?: CanvasBackground;
   updatedAt: number;
   clipsCount: number;
   tracksCount: number;

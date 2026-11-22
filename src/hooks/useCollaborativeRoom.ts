@@ -1,18 +1,18 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {
   applyClipDuplicate,
-  applyClipPatch,
   applyClipSplit,
   applyTrackReorder,
   createDefaultTracks,
   createStarterClips,
   createTrackOfType,
-  encodePatchForSync,
+  insertTrackAt,
   normalizeProjectTracks,
   resolveTrackPlacement,
 } from '../shared/types.ts';
 import type {
   AspectRatio,
+  CanvasBackground,
   ChatMessage,
   ClientWsMessage,
   Clip,
@@ -35,25 +35,12 @@ import {
 } from '../lib/serverConfig.ts';
 import {
   downloadMediaInBackground,
-  getKtorServerStatus,
   getP2PNetworkInfo,
   startHostLanServer,
   startUdpRoomDiscovery,
   stopHostLanServer,
   syncHostLanSnapshot,
 } from '../lib/lanSyncBridge.ts';
-import type {KtorServerStatus} from '../lib/lanSyncBridge.ts';
-import {loadCustomFont, preloadProjectFonts} from '../lib/fontLoader.ts';
-
-export interface DownloadQueueItem {
-  layerId: string;
-  fileName: string;
-  progress: number;
-  status: 'DOWNLOADING' | 'ERROR';
-  attempt?: number;
-  maxAttempts?: number;
-  error?: string;
-}
 
 export const USER_COLORS = [
   '#22d3ee',
@@ -131,14 +118,6 @@ export function useCollaborativeRoom() {
   );
   const [udpRooms, setUdpRooms] = useState<DiscoveredUdpRoom[]>([]);
   const [lockWarning, setLockWarning] = useState<string | null>(null);
-  const [pingMs, setPingMs] = useState<number | null>(null);
-  const [ktorStatus, setKtorStatus] = useState<KtorServerStatus>(() => ({
-    state: isNativeCapacitorApp() ? 'stopped' : 'web',
-    port: isNativeCapacitorApp() ? 8080 : 3000,
-    preferredPort: isNativeCapacitorApp() ? 8080 : 3000,
-    hosting: false,
-  }));
-  const [downloadQueue, setDownloadQueue] = useState<DownloadQueueItem[]>([]);
 
   const [status, setStatus] = useState<
     'connecting' | 'connected' | 'reconnecting' | 'offline'
@@ -148,6 +127,7 @@ export function useCollaborativeRoom() {
     title: 'Ночной ролик',
     aspectRatio: '9:16',
     backgroundColor: '#09090b',
+    canvasBackground: {type: 'solid', color: '#09090b'},
     fps: 30,
     isPublicLan: true,
     customFonts: [],
@@ -167,43 +147,16 @@ export function useCollaborativeRoom() {
   const projectRef = useRef(project);
   projectRef.current = project;
   const activeDownloadsRef = useRef<Set<string>>(new Set());
-  const localLockTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
-    new Map()
-  );
 
   const lastPresenceSentRef = useRef(0);
   const pendingPresenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
     null
   );
 
-  const upsertDownloadQueue = useCallback((item: DownloadQueueItem) => {
-    setDownloadQueue((prev) => {
-      const idx = prev.findIndex((x) => x.layerId === item.layerId);
-      if (idx === -1) return [...prev, item];
-      const next = [...prev];
-      next[idx] = item;
-      return next;
-    });
-  }, []);
-
-  const removeDownloadQueueItem = useCallback((layerId: string) => {
-    setDownloadQueue((prev) => prev.filter((x) => x.layerId !== layerId));
-  }, []);
-
-  const refreshServerStatus = useCallback(async () => {
-    const s = await getKtorServerStatus();
-    setKtorStatus(s);
-    return s;
-  }, []);
-
   const refreshNetworkInfo = useCallback(async () => {
-    const [info, srvStatus] = await Promise.all([
-      getP2PNetworkInfo(),
-      getKtorServerStatus(),
-    ]);
+    const info = await getP2PNetworkInfo();
     setNetworkInterfaces(info.interfaces);
     setHostPort(info.port);
-    setKtorStatus(srvStatus);
   }, []);
 
   useEffect(() => {
@@ -220,12 +173,7 @@ export function useCollaborativeRoom() {
   }, [refreshNetworkInfo]);
 
   const triggerBackgroundDownload = useCallback(
-    (
-      layerId: string,
-      remoteUrl: string,
-      fileName: string,
-      opts?: {expectedSize?: number; expectedHash?: string}
-    ) => {
+    (layerId: string, remoteUrl: string, fileName: string) => {
       if (!remoteUrl || remoteUrl.startsWith('synth:')) return;
       if (
         remoteUrl.startsWith('http://127.0.0.1') &&
@@ -237,42 +185,14 @@ export function useCollaborativeRoom() {
       if (activeDownloadsRef.current.has(key)) return;
       activeDownloadsRef.current.add(key);
 
-      upsertDownloadQueue({
-        layerId,
-        fileName: fileName || `${layerId}.bin`,
-        progress: 0,
-        status: 'DOWNLOADING',
-        attempt: 1,
-        maxAttempts: 3,
-      });
-
       let lastPct = -1;
       downloadMediaInBackground({
         layerId,
         remoteUrl,
         fileName: fileName || `${layerId}.bin`,
-        expectedSize: opts?.expectedSize,
-        expectedHash: opts?.expectedHash,
-        maxAttempts: 3,
-        onAttempt: (attempt, maxAttempts) => {
-          upsertDownloadQueue({
-            layerId,
-            fileName: fileName || `${layerId}.bin`,
-            progress: Math.max(0, lastPct),
-            status: 'DOWNLOADING',
-            attempt,
-            maxAttempts,
-          });
-        },
         onProgress: (pct) => {
           if (pct - lastPct < 5 && pct < 99) return;
           lastPct = pct;
-          upsertDownloadQueue({
-            layerId,
-            fileName: fileName || `${layerId}.bin`,
-            progress: pct,
-            status: 'DOWNLOADING',
-          });
           setProject((prev) => ({
             ...prev,
             clips: prev.clips.map((c) =>
@@ -280,7 +200,6 @@ export function useCollaborativeRoom() {
                 ? {
                     ...c,
                     mediaStatus: 'DOWNLOADING',
-                    mediaError: undefined,
                     downloadProgress: pct,
                   }
                 : c
@@ -290,7 +209,6 @@ export function useCollaborativeRoom() {
       })
         .then((localUrl) => {
           activeDownloadsRef.current.delete(key);
-          removeDownloadQueueItem(layerId);
           setProject((prev) => ({
             ...prev,
             clips: prev.clips.map((c) =>
@@ -299,41 +217,29 @@ export function useCollaborativeRoom() {
                     ...c,
                     src: localUrl,
                     mediaStatus: 'READY',
-                    mediaError: undefined,
                     downloadProgress: 100,
                   }
                 : c
             ),
           }));
         })
-        .catch((err) => {
+        .catch(() => {
           activeDownloadsRef.current.delete(key);
-          const message =
-            err instanceof Error ? err.message : 'Ошибка скачивания по сети';
-          upsertDownloadQueue({
-            layerId,
-            fileName: fileName || `${layerId}.bin`,
-            progress: 0,
-            status: 'ERROR',
-            error: message,
-          });
           setProject((prev) => ({
             ...prev,
             clips: prev.clips.map((c) =>
               c.id === layerId
                 ? {
                     ...c,
-                    mediaRemoteUrl: remoteUrl,
+                    src: remoteUrl,
                     mediaStatus: 'ERROR',
-                    mediaError: message,
-                    downloadProgress: 0,
                   }
                 : c
             ),
           }));
         });
     },
-    [removeDownloadQueueItem, upsertDownloadQueue]
+    []
   );
 
   const sendRaw = useCallback((msg: ClientWsMessage) => {
@@ -368,79 +274,6 @@ export function useCollaborativeRoom() {
     return () => clearTimeout(t);
   }, [p2pMode, project]);
 
-  const hydrateProjectState = useCallback(
-    (rawProject: ProjectState, existingClips: Clip[]): ProjectState => {
-      const normalized = normalizeProjectTracks(rawProject);
-      void preloadProjectFonts(normalized.customFonts);
-
-      const existingMap = new Map(existingClips.map((c) => [c.id, c]));
-      const hydratedClips = normalized.clips.map((c) => {
-        if (c.textStyle?.fontFamily && c.textStyle?.fontSrc) {
-          const fontMeta = normalized.customFonts?.find(
-            (f) => f.fontFamily === c.textStyle?.fontFamily
-          );
-          void loadCustomFont(c.textStyle.fontFamily, c.textStyle.fontSrc, {
-            fileName: fontMeta?.fileName,
-            fileSize: fontMeta?.fileSize,
-            fileHash: fontMeta?.fileHash,
-          });
-        }
-
-        const remote = c.mediaRemoteUrl || c.src;
-        const prev = existingMap.get(c.id);
-        const prevRemote = prev?.mediaRemoteUrl || prev?.src;
-        if (
-          prev &&
-          prev.mediaStatus === 'READY' &&
-          prev.src &&
-          (prev.src.startsWith('blob:') ||
-            prev.src.startsWith('http://127.0.0.1')) &&
-          prevRemote === remote
-        ) {
-          return {
-            ...c,
-            src: prev.src,
-            mediaStatus: 'READY' as const,
-            downloadProgress: 100,
-            mediaError: undefined,
-          };
-        }
-
-        if (
-          remote &&
-          (remote.includes('/media/') ||
-            remote.includes('/uploads/') ||
-            c.mediaFileName) &&
-          !remote.startsWith('blob:') &&
-          !remote.startsWith('http://127.0.0.1') &&
-          c.kind !== 'text' &&
-          c.kind !== 'synth'
-        ) {
-          triggerBackgroundDownload(
-            c.id,
-            remote,
-            c.mediaFileName || `${c.id}.bin`,
-            {
-              expectedSize: c.mediaFileSize,
-              expectedHash: c.mediaFileHash,
-            }
-          );
-          return {
-            ...c,
-            mediaRemoteUrl: remote,
-            mediaStatus: 'DOWNLOADING' as const,
-            downloadProgress: 0,
-            mediaError: undefined,
-          };
-        }
-        return c;
-      });
-
-      return {...normalized, clips: hydratedClips};
-    },
-    [triggerBackgroundDownload]
-  );
-
   useEffect(() => {
     let closedByEffect = false;
     let attempt = 0;
@@ -457,21 +290,8 @@ export function useCollaborativeRoom() {
       const ws = new WebSocket(wsEndpoint);
       wsRef.current = ws;
 
-      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-      let lastPongAt = Date.now();
-      let awaitingPong = false;
-
-      const clearHeartbeat = () => {
-        if (heartbeatTimer) {
-          clearInterval(heartbeatTimer);
-          heartbeatTimer = null;
-        }
-      };
-
       ws.onopen = () => {
         attempt = 0;
-        lastPongAt = Date.now();
-        awaitingPong = false;
         setStatus('connected');
         ws.send(
           JSON.stringify({
@@ -480,30 +300,6 @@ export function useCollaborativeRoom() {
             user: userRef.current,
           } satisfies ClientWsMessage)
         );
-        ws.send(
-          JSON.stringify({
-            type: 'ping',
-            ts: Date.now(),
-          } satisfies ClientWsMessage)
-        );
-        awaitingPong = true;
-
-        clearHeartbeat();
-        heartbeatTimer = setInterval(() => {
-          if (ws.readyState !== WebSocket.OPEN) return;
-          if (awaitingPong && Date.now() - lastPongAt > 7500) {
-            clearHeartbeat();
-            ws.close();
-            return;
-          }
-          awaitingPong = true;
-          ws.send(
-            JSON.stringify({
-              type: 'ping',
-              ts: Date.now(),
-            } satisfies ClientWsMessage)
-          );
-        }, 3000);
       };
 
       ws.onmessage = (event) => {
@@ -515,22 +311,35 @@ export function useCollaborativeRoom() {
         }
 
         switch (msg.type) {
-          case 'pong': {
-            lastPongAt = Date.now();
-            awaitingPong = false;
-            if (typeof msg.ts === 'number') {
-              setPingMs(Math.max(1, Date.now() - msg.ts));
-            }
-            break;
-          }
-
-          case 'room:init':
-          case 'SYNC_FULL_STATE': {
-            const hydrated = hydrateProjectState(
-              msg.project,
-              projectRef.current.clips
-            );
-            setProject(hydrated);
+          case 'room:init': {
+            const normalized = normalizeProjectTracks(msg.project);
+            // If joining an existing peer session with remote /media/ clips, cache them smoothly
+            const hydratedClips = normalized.clips.map((c) => {
+              const remote = c.mediaRemoteUrl || c.src;
+              if (
+                remote &&
+                (remote.includes('/media/') || c.mediaFileName) &&
+                !remote.startsWith('blob:') &&
+                !remote.startsWith('http://127.0.0.1') &&
+                c.kind !== 'text' &&
+                c.kind !== 'synth' &&
+                c.kind !== 'adjustment'
+              ) {
+                triggerBackgroundDownload(
+                  c.id,
+                  remote,
+                  c.mediaFileName || `${c.id}.bin`
+                );
+                return {
+                  ...c,
+                  mediaRemoteUrl: remote,
+                  mediaStatus: 'DOWNLOADING' as const,
+                  downloadProgress: 0,
+                };
+              }
+              return c;
+            });
+            setProject({...normalized, clips: hydratedClips});
             setCollaborators(msg.collaborators);
             if (Array.isArray(msg.rooms)) {
               setAvailableRooms(msg.rooms);
@@ -547,7 +356,7 @@ export function useCollaborativeRoom() {
               if (prev.tracks.some((t) => t.id === msg.track.id)) return prev;
               return {
                 ...prev,
-                tracks: [...prev.tracks, msg.track],
+                tracks: insertTrackAt(prev.tracks, msg.track, msg.insertAt),
                 revision: msg.revision,
               };
             });
@@ -580,20 +389,12 @@ export function useCollaborativeRoom() {
             }));
             break;
 
-          case 'op:clip_add': {
-            if (msg.clip.textStyle?.fontFamily && msg.clip.textStyle?.fontSrc) {
-              void loadCustomFont(
-                msg.clip.textStyle.fontFamily,
-                msg.clip.textStyle.fontSrc
-              );
-            }
+          case 'op:clip_add':
             setProject((prev) => {
               if (prev.clips.some((c) => c.id === msg.clip.id)) return prev;
-              const nextTracks =
-                msg.newTrack &&
-                !prev.tracks.some((t) => t.id === msg.newTrack!.id)
-                  ? [...prev.tracks, msg.newTrack]
-                  : prev.tracks;
+              const nextTracks = msg.newTrack
+                ? insertTrackAt(prev.tracks, msg.newTrack, msg.insertAt)
+                : prev.tracks;
               return {
                 ...prev,
                 tracks: nextTracks,
@@ -602,28 +403,16 @@ export function useCollaborativeRoom() {
               };
             });
             break;
-          }
 
-          case 'op:clip_update': {
-            const patchObj = msg.patch as Record<string, unknown>;
-            const nextTextStyle = patchObj.textStyle as
-              | {fontFamily?: string; fontSrc?: string}
-              | undefined;
-            if (nextTextStyle?.fontFamily && nextTextStyle?.fontSrc) {
-              void loadCustomFont(
-                nextTextStyle.fontFamily,
-                nextTextStyle.fontSrc
-              );
-            }
+          case 'op:clip_update':
             setProject((prev) => ({
               ...prev,
               revision: msg.revision,
               clips: prev.clips.map((c) =>
-                c.id === msg.clipId ? applyClipPatch(c, patchObj) : c
+                c.id === msg.clipId ? {...c, ...msg.patch, id: c.id} : c
               ),
             }));
             break;
-          }
 
           case 'op:clip_delete':
             setProject((prev) => ({
@@ -659,9 +448,6 @@ export function useCollaborativeRoom() {
             break;
 
           case 'op:project_meta':
-            if (Array.isArray(msg.patch.customFonts)) {
-              void preloadProjectFonts(msg.patch.customFonts);
-            }
             setProject((prev) => ({
               ...prev,
               ...msg.patch,
@@ -669,34 +455,27 @@ export function useCollaborativeRoom() {
             }));
             break;
 
-          case 'op:project_replace': {
-            const hydrated = hydrateProjectState(
-              {
-                ...projectRef.current,
-                clips: msg.clips,
-                tracks: msg.tracks || projectRef.current.tracks,
-                aspectRatio: msg.aspectRatio,
-                title: msg.title,
-                backgroundColor:
-                  msg.backgroundColor || projectRef.current.backgroundColor,
-                customFonts:
-                  msg.customFonts || projectRef.current.customFonts,
-                revision: msg.revision,
-              },
-              projectRef.current.clips
-            );
-            setProject(hydrated);
+          case 'op:project_replace':
+            setProject((prev) => ({
+              ...prev,
+              clips: msg.clips,
+              tracks: msg.tracks || prev.tracks,
+              aspectRatio: msg.aspectRatio,
+              title: msg.title,
+              backgroundColor: msg.backgroundColor || prev.backgroundColor,
+              canvasBackground:
+                msg.canvasBackground ?? prev.canvasBackground,
+              customFonts: msg.customFonts || prev.customFonts,
+              revision: msg.revision,
+            }));
             break;
-          }
 
           case 'LAYER_MEDIA_UPDATED': {
             const isFromSelf = msg.senderId === userRef.current.id;
             setProject((prev) => {
-              const nextTracks =
-                msg.newTrack &&
-                !prev.tracks.some((t) => t.id === msg.newTrack!.id)
-                  ? [...prev.tracks, msg.newTrack]
-                  : prev.tracks;
+              const nextTracks = msg.newTrack
+                ? insertTrackAt(prev.tracks, msg.newTrack, msg.insertAt)
+                : prev.tracks;
               const exists = prev.clips.some((c) => c.id === msg.layerId);
               if (exists) {
                 return {
@@ -709,9 +488,6 @@ export function useCollaborativeRoom() {
                           ...c,
                           mediaFileName: msg.fileName,
                           mediaRemoteUrl: msg.mediaUrl,
-                          mediaFileSize: msg.fileSize ?? c.mediaFileSize,
-                          mediaFileHash: msg.fileHash ?? c.mediaFileHash,
-                          mediaError: undefined,
                           mediaStatus: isFromSelf ? 'READY' : 'DOWNLOADING',
                           downloadProgress: isFromSelf ? 100 : 0,
                           ...(msg.clip
@@ -734,9 +510,6 @@ export function useCollaborativeRoom() {
                 src: isFromSelf ? msg.clip.src || msg.mediaUrl : undefined,
                 mediaFileName: msg.fileName,
                 mediaRemoteUrl: msg.mediaUrl,
-                mediaFileSize: msg.fileSize ?? msg.clip.mediaFileSize,
-                mediaFileHash: msg.fileHash ?? msg.clip.mediaFileHash,
-                mediaError: undefined,
                 mediaStatus: isFromSelf ? 'READY' : 'DOWNLOADING',
                 downloadProgress: isFromSelf ? 100 : 0,
               };
@@ -752,11 +525,7 @@ export function useCollaborativeRoom() {
               triggerBackgroundDownload(
                 msg.layerId,
                 msg.mediaUrl,
-                msg.fileName,
-                {
-                  expectedSize: msg.fileSize,
-                  expectedHash: msg.fileHash,
-                }
+                msg.fileName
               );
             }
             break;
@@ -796,8 +565,6 @@ export function useCollaborativeRoom() {
       };
 
       ws.onclose = () => {
-        clearHeartbeat();
-        setPingMs(null);
         if (closedByEffect) return;
         setStatus('reconnecting');
         attempt += 1;
@@ -819,7 +586,7 @@ export function useCollaborativeRoom() {
         clearTimeout(pendingPresenceTimerRef.current);
       wsRef.current?.close();
     };
-  }, [roomId, serverUrl, hydrateProjectState, triggerBackgroundDownload]);
+  }, [roomId, serverUrl, triggerBackgroundDownload]);
 
   const showLockWarning = useCallback((ownerName: string) => {
     setLockWarning(`Слой редактирует ${ownerName}`);
@@ -842,12 +609,28 @@ export function useCollaborativeRoom() {
   const addTrack = useCallback(
     (type: TrackType): Track => {
       pushUndo();
-      const newTrack = createTrackOfType(projectRef.current.tracks, type);
+      const curTracks = projectRef.current.tracks;
+      const newTrack = createTrackOfType(curTracks, type);
+      let insertAt: number | undefined;
+      if (type === 'adjustment') {
+        const firstAudio = curTracks.findIndex((t) => t.type === 'audio');
+        insertAt = firstAudio !== -1 ? firstAudio : curTracks.length;
+      } else if (type === 'overlay') {
+        const firstPostOverlay = curTracks.findIndex(
+          (t) => t.type === 'text' || t.type === 'adjustment' || t.type === 'audio'
+        );
+        if (firstPostOverlay !== -1) insertAt = firstPostOverlay;
+      } else if (type === 'text') {
+        const firstPostText = curTracks.findIndex(
+          (t) => t.type === 'adjustment' || t.type === 'audio'
+        );
+        if (firstPostText !== -1) insertAt = firstPostText;
+      }
       setProject((prev) => ({
         ...prev,
-        tracks: [...prev.tracks, newTrack],
+        tracks: insertTrackAt(prev.tracks, newTrack, insertAt),
       }));
-      sendRaw({type: 'op:track_add', track: newTrack});
+      sendRaw({type: 'op:track_add', track: newTrack, insertAt});
       return newTrack;
     },
     [pushUndo, sendRaw]
@@ -908,14 +691,15 @@ export function useCollaborativeRoom() {
   const addClip = useCallback(
     (
       clipInput: Omit<Clip, 'trackId'> & {trackId?: string},
-      opts?: {forceNewTrack?: boolean; skipWs?: boolean}
-    ): {clip: Clip; newTrack?: Track} => {
+      opts?: {forceNewTrack?: boolean; minTrackIndex?: number; skipWs?: boolean}
+    ): {clip: Clip; newTrack?: Track; insertAt?: number} => {
       pushUndo();
       const curTracks = projectRef.current.tracks;
       const curClips = projectRef.current.clips;
 
       let resolvedTrackId = clipInput.trackId;
       let newTrack: Track | undefined;
+      let insertAt: number | undefined;
 
       if (!resolvedTrackId || opts?.forceNewTrack) {
         const placed = resolveTrackPlacement(
@@ -924,10 +708,12 @@ export function useCollaborativeRoom() {
           clipInput.track,
           clipInput.start,
           clipInput.duration,
-          Boolean(opts?.forceNewTrack)
+          Boolean(opts?.forceNewTrack),
+          opts?.minTrackIndex ?? -1
         );
         resolvedTrackId = placed.trackId;
         newTrack = placed.newTrack;
+        insertAt = placed.insertAt;
       }
 
       const clip: Clip = {
@@ -937,10 +723,9 @@ export function useCollaborativeRoom() {
 
       setProject((prev) => {
         if (prev.clips.some((c) => c.id === clip.id)) return prev;
-        const nextTracks =
-          newTrack && !prev.tracks.some((t) => t.id === newTrack!.id)
-            ? [...prev.tracks, newTrack]
-            : prev.tracks;
+        const nextTracks = newTrack
+          ? insertTrackAt(prev.tracks, newTrack, insertAt)
+          : prev.tracks;
         return {
           ...prev,
           tracks: nextTracks,
@@ -948,9 +733,9 @@ export function useCollaborativeRoom() {
         };
       });
       if (!opts?.skipWs) {
-        sendRaw({type: 'op:clip_add', clip, newTrack});
+        sendRaw({type: 'op:clip_add', clip, newTrack, insertAt});
       }
-      return {clip, newTrack};
+      return {clip, newTrack, insertAt};
     },
     [pushUndo, sendRaw]
   );
@@ -961,10 +746,9 @@ export function useCollaborativeRoom() {
       fileName: string;
       mediaUrl: string;
       localSrc?: string;
-      fileSize?: number;
-      fileHash?: string;
       clip?: Clip;
       newTrack?: Track;
+      insertAt?: number;
     }) => {
       const localUrl = opts.localSrc || opts.mediaUrl;
       const alreadyExists = projectRef.current.clips.some(
@@ -974,11 +758,9 @@ export function useCollaborativeRoom() {
         pushUndo();
       }
       setProject((prev) => {
-        const nextTracks =
-          opts.newTrack &&
-          !prev.tracks.some((t) => t.id === opts.newTrack!.id)
-            ? [...prev.tracks, opts.newTrack]
-            : prev.tracks;
+        const nextTracks = opts.newTrack
+          ? insertTrackAt(prev.tracks, opts.newTrack, opts.insertAt)
+          : prev.tracks;
         const exists = prev.clips.some((c) => c.id === opts.layerId);
         if (exists) {
           return {
@@ -991,9 +773,6 @@ export function useCollaborativeRoom() {
                     src: localUrl,
                     mediaFileName: opts.fileName,
                     mediaRemoteUrl: opts.mediaUrl,
-                    mediaFileSize: opts.fileSize ?? c.mediaFileSize,
-                    mediaFileHash: opts.fileHash ?? c.mediaFileHash,
-                    mediaError: undefined,
                     mediaStatus: 'READY',
                     downloadProgress: 100,
                     ...(opts.clip
@@ -1018,8 +797,6 @@ export function useCollaborativeRoom() {
             src: opts.mediaUrl,
             mediaFileName: opts.fileName,
             mediaRemoteUrl: opts.mediaUrl,
-            mediaFileSize: opts.fileSize ?? opts.clip.mediaFileSize,
-            mediaFileHash: opts.fileHash ?? opts.clip.mediaFileHash,
             mediaStatus: 'DOWNLOADING' as const,
             downloadProgress: 0,
           }
@@ -1030,23 +807,14 @@ export function useCollaborativeRoom() {
         layerId: opts.layerId,
         fileName: opts.fileName,
         mediaUrl: opts.mediaUrl,
-        fileSize: opts.fileSize,
-        fileHash: opts.fileHash,
         senderId: userRef.current.id,
         clip: remoteClip,
         newTrack: opts.newTrack,
+        insertAt: opts.insertAt,
       });
     },
     [pushUndo, sendRaw]
   );
-
-  const clearLocalLockTimer = useCallback((layerId: string) => {
-    const existing = localLockTimersRef.current.get(layerId);
-    if (existing) {
-      clearTimeout(existing);
-      localLockTimersRef.current.delete(layerId);
-    }
-  }, []);
 
   const sendLayerLock = useCallback(
     (layerId: string, locked: boolean) => {
@@ -1059,8 +827,6 @@ export function useCollaborativeRoom() {
         showLockWarning(target.lockedByUserName || 'другой участник');
         return false;
       }
-
-      clearLocalLockTimer(layerId);
 
       setProject((prev) => ({
         ...prev,
@@ -1084,98 +850,10 @@ export function useCollaborativeRoom() {
         userColor: locked ? userRef.current.color : '',
         locked,
       });
-
-      if (locked) {
-        const timer = setTimeout(() => {
-          localLockTimersRef.current.delete(layerId);
-          const current = projectRef.current.clips.find((c) => c.id === layerId);
-          if (current?.lockedByUserId === userRef.current.id) {
-            setProject((prev) => ({
-              ...prev,
-              clips: prev.clips.map((c) =>
-                c.id === layerId
-                  ? {
-                      ...c,
-                      lockedByUserId: null,
-                      lockedByUserName: null,
-                      lockedByUserColor: null,
-                    }
-                  : c
-              ),
-            }));
-            sendRaw({
-              type: 'LAYER_LOCK',
-              layerId,
-              userId: userRef.current.id,
-              userName: '',
-              userColor: '',
-              locked: false,
-            });
-          }
-        }, 5000);
-        localLockTimersRef.current.set(layerId, timer);
-      }
       return true;
     },
-    [clearLocalLockTimer, sendRaw, showLockWarning]
+    [sendRaw, showLockWarning]
   );
-
-  const releaseAllLocalLocks = useCallback(() => {
-    for (const timer of localLockTimersRef.current.values()) {
-      clearTimeout(timer);
-    }
-    localLockTimersRef.current.clear();
-
-    const lockedByMe = projectRef.current.clips.filter(
-      (c) => c.lockedByUserId === userRef.current.id
-    );
-    if (lockedByMe.length === 0) return;
-
-    setProject((prev) => ({
-      ...prev,
-      clips: prev.clips.map((c) =>
-        c.lockedByUserId === userRef.current.id
-          ? {
-              ...c,
-              lockedByUserId: null,
-              lockedByUserName: null,
-              lockedByUserColor: null,
-            }
-          : c
-      ),
-    }));
-
-    for (const c of lockedByMe) {
-      sendRaw({
-        type: 'LAYER_LOCK',
-        layerId: c.id,
-        userId: userRef.current.id,
-        userName: '',
-        userColor: '',
-        locked: false,
-      });
-    }
-  }, [sendRaw]);
-
-  useEffect(() => {
-    const onVisibility = () => {
-      if (document.visibilityState === 'hidden') {
-        releaseAllLocalLocks();
-      }
-    };
-    const onBlurOrHide = () => {
-      releaseAllLocalLocks();
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('pagehide', onBlurOrHide);
-    window.addEventListener('blur', onBlurOrHide);
-    return () => {
-      document.removeEventListener('visibilitychange', onVisibility);
-      window.removeEventListener('pagehide', onBlurOrHide);
-      window.removeEventListener('blur', onBlurOrHide);
-      releaseAllLocalLocks();
-    };
-  }, [releaseAllLocalLocks]);
 
   const updateClip = useCallback(
     (
@@ -1191,27 +869,18 @@ export function useCollaborativeRoom() {
         showLockWarning(target.lockedByUserName || 'другой участник');
         return;
       }
-      if (target?.lockedByUserId === userRef.current.id) {
-        // Refresh 5s inactivity timer while user is actively dragging/editing
-        sendLayerLock(clipId, true);
-      }
       if (!opts?.skipUndo) pushUndo();
-      const encodedPatch = encodePatchForSync(patch);
       setProject((prev) => ({
         ...prev,
         clips: prev.clips.map((c) =>
-          c.id === clipId ? applyClipPatch(c, encodedPatch) : c
+          c.id === clipId ? {...c, ...patch, id: c.id} : c
         ),
       }));
       if (!opts?.skipSync) {
-        sendRaw({
-          type: 'op:clip_update',
-          clipId,
-          patch: encodedPatch as Partial<Clip>,
-        });
+        sendRaw({type: 'op:clip_update', clipId, patch});
       }
     },
-    [pushUndo, sendLayerLock, sendRaw, showLockWarning]
+    [pushUndo, sendRaw, showLockWarning]
   );
 
   const deleteClip = useCallback(
@@ -1331,30 +1000,27 @@ export function useCollaborativeRoom() {
               borderRadius: 0,
             };
 
-      const encodedPatch = encodePatchForSync(patch);
       setProject((prev) => {
-        const nextTracks =
-          placed.newTrack &&
-          !prev.tracks.some((t) => t.id === placed.newTrack!.id)
-            ? [...prev.tracks, placed.newTrack]
-            : prev.tracks;
+        const nextTracks = placed.newTrack
+          ? insertTrackAt(prev.tracks, placed.newTrack, placed.insertAt)
+          : prev.tracks;
         return {
           ...prev,
           tracks: nextTracks,
           clips: prev.clips.map((c) =>
-            c.id === clipId ? applyClipPatch(c, encodedPatch) : c
+            c.id === clipId ? {...c, ...patch, id: c.id} : c
           ),
         };
       });
 
       if (placed.newTrack) {
-        sendRaw({type: 'op:track_add', track: placed.newTrack});
+        sendRaw({
+          type: 'op:track_add',
+          track: placed.newTrack,
+          insertAt: placed.insertAt,
+        });
       }
-      sendRaw({
-        type: 'op:clip_update',
-        clipId,
-        patch: encodedPatch as Partial<Clip>,
-      });
+      sendRaw({type: 'op:clip_update', clipId, patch});
     },
     [pushUndo, sendRaw, showLockWarning]
   );
@@ -1368,13 +1034,17 @@ export function useCollaborativeRoom() {
           | 'aspectRatio'
           | 'isPublicLan'
           | 'backgroundColor'
+          | 'canvasBackground'
           | 'hostName'
           | 'customFonts'
         >
-      >
+      >,
+      options?: {skipSync?: boolean}
     ) => {
       setProject((prev) => ({...prev, ...patch}));
-      sendRaw({type: 'op:project_meta', patch});
+      if (!options?.skipSync) {
+        sendRaw({type: 'op:project_meta', patch});
+      }
     },
     [sendRaw]
   );
@@ -1395,6 +1065,7 @@ export function useCollaborativeRoom() {
         title?: string;
         aspectRatio?: AspectRatio;
         backgroundColor?: string;
+        canvasBackground?: CanvasBackground;
         customFonts?: ProjectFont[];
         tracks?: Track[];
       }
@@ -1410,6 +1081,9 @@ export function useCollaborativeRoom() {
         ...(meta?.backgroundColor
           ? {backgroundColor: meta.backgroundColor}
           : {}),
+        ...(meta?.canvasBackground
+          ? {canvasBackground: meta.canvasBackground}
+          : {}),
         ...(meta?.customFonts ? {customFonts: meta.customFonts} : {}),
       }));
       sendRaw({
@@ -1419,6 +1093,7 @@ export function useCollaborativeRoom() {
         title: meta?.title,
         aspectRatio: meta?.aspectRatio,
         backgroundColor: meta?.backgroundColor,
+        canvasBackground: meta?.canvasBackground,
         customFonts: meta?.customFonts,
       });
     },
@@ -1564,7 +1239,6 @@ export function useCollaborativeRoom() {
       setNetworkInterfaces(res.interfaces);
       setHostPort(res.port);
       setP2pMode('host');
-      void refreshServerStatus();
 
       if (isNativeCapacitorApp()) {
         const localUrl = `http://127.0.0.1:${res.port}`;
@@ -1576,14 +1250,13 @@ export function useCollaborativeRoom() {
       }
       return res;
     },
-    [refreshServerStatus]
+    []
   );
 
   const stopHostRoom = useCallback(async () => {
     await stopHostLanServer();
     setP2pMode('idle');
-    void refreshServerStatus();
-  }, [refreshServerStatus]);
+  }, []);
 
   const connectToHostIp = useCallback(
     (ipOrUrl: string, targetRoomId?: string) => {
@@ -1594,48 +1267,8 @@ export function useCollaborativeRoom() {
       if (targetRoomId) {
         switchRoom(targetRoomId);
       }
-      void refreshServerStatus();
     },
-    [refreshServerStatus, switchRoom]
-  );
-
-  const forceSyncProject = useCallback(() => {
-    sendRaw({type: 'SYNC_FULL_STATE'});
-    void refreshNetworkInfo();
-  }, [refreshNetworkInfo, sendRaw]);
-
-  const retryMediaDownload = useCallback(
-    (clipId: string) => {
-      const clip = projectRef.current.clips.find((c) => c.id === clipId);
-      if (!clip) return;
-      const remote = clip.mediaRemoteUrl || clip.src;
-      if (!remote || remote.startsWith('synth:')) return;
-      const key = `${clip.id}:${remote}`;
-      activeDownloadsRef.current.delete(key);
-      setProject((prev) => ({
-        ...prev,
-        clips: prev.clips.map((c) =>
-          c.id === clipId
-            ? {
-                ...c,
-                mediaStatus: 'DOWNLOADING',
-                mediaError: undefined,
-                downloadProgress: 0,
-              }
-            : c
-        ),
-      }));
-      triggerBackgroundDownload(
-        clip.id,
-        remote,
-        clip.mediaFileName || `${clip.id}.bin`,
-        {
-          expectedSize: clip.mediaFileSize,
-          expectedHash: clip.mediaFileHash,
-        }
-      );
-    },
-    [triggerBackgroundDownload]
+    [switchRoom]
   );
 
   return {
@@ -1647,9 +1280,6 @@ export function useCollaborativeRoom() {
     hostPort,
     udpRooms,
     lockWarning,
-    pingMs,
-    ktorStatus,
-    downloadQueue,
     status,
     project,
     collaborators: collaborators.filter((c) => c.id !== user.id),
@@ -1676,8 +1306,6 @@ export function useCollaborativeRoom() {
     sendChatMessage,
     sendLayerMediaUpdated,
     sendLayerLock,
-    forceSyncProject,
-    retryMediaDownload,
     switchRoom,
     updateUserProfile,
     updateServerConnection,

@@ -49,9 +49,11 @@ const PROFILE_COLOR_PRESETS = [
 
 const ASPECT_OPTIONS: Array<{id: AspectRatio; label: string; hint: string}> = [
   {id: '9:16', label: '9:16', hint: 'Reels / Shorts'},
-  {id: '16:9', label: '16:9', hint: 'YouTube / Горизонт'},
+  {id: '16:9', label: '16:9', hint: 'YouTube'},
   {id: '1:1', label: '1:1', hint: 'Квадрат'},
-  {id: '4:5', label: '4:5', hint: 'Портрет'},
+  {id: '4:5', label: '4:5', hint: 'Лента'},
+  {id: '3:4', label: '3:4', hint: 'Портрет'},
+  {id: '21:9', label: '21:9', hint: 'Кино'},
 ];
 
 interface HomeScreenProps {
@@ -559,7 +561,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       <p className="mb-1.5 text-[11px] font-medium text-zinc-400">
                         Соотношение сторон
                       </p>
-                      <div className="grid grid-cols-4 gap-1.5">
+                      <div className="grid grid-cols-3 gap-1.5">
                         {ASPECT_OPTIONS.map((opt) => (
                           <button
                             key={opt.id}
@@ -950,7 +952,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               <label className="text-xs font-medium text-zinc-400">
                 Соотношение сторон
               </label>
-              <div className="grid grid-cols-4 gap-2">
+              <div className="grid grid-cols-3 gap-2">
                 {ASPECT_OPTIONS.map((opt) => (
                   <button
                     key={opt.id}

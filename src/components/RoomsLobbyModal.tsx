@@ -275,14 +275,14 @@ export const RoomsLobbyModal: React.FC<RoomsLobbyModalProps> = ({
                 className="h-10 w-full rounded-lg border border-white/15 bg-zinc-950 px-3 text-xs text-white placeholder:text-zinc-500 focus:border-emerald-400 focus:outline-none"
               />
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex gap-1">
-                  {(['9:16', '16:9', '1:1', '4:5'] as AspectRatio[]).map(
+                <div className="flex flex-wrap gap-1">
+                  {(['9:16', '16:9', '1:1', '4:5', '3:4', '21:9'] as AspectRatio[]).map(
                     (ar) => (
                       <button
                         key={ar}
                         type="button"
                         onClick={() => setNewAspect(ar)}
-                        className={`rounded-lg px-2.5 py-1.5 font-mono text-[11px] font-medium ${
+                        className={`rounded-lg px-2 py-1.5 font-mono text-[11px] font-medium ${
                           newAspect === ar
                             ? 'bg-emerald-500 text-zinc-950'
                             : 'bg-zinc-900 text-zinc-300 border border-white/10'

@@ -3,16 +3,20 @@ import {
   ChevronLeft,
   CopyPlus,
   Crop,
+  Diamond,
   Download,
   Droplet,
   FlipHorizontal2,
   Gauge,
+  Grid3X3,
   Home,
+  ImagePlus,
   Layers,
   MessageSquare,
   Minimize2,
   Move,
   Music,
+  PaintBucket,
   Palette,
   Pause,
   Pipette,
@@ -42,7 +46,9 @@ import type {
   AspectRatio,
   Clip,
   ClipMask,
+  ClipWarp,
   ColorFilterPreset,
+  ShapeType,
   TextCurvePoint,
 } from './shared/types.ts';
 import {StudioAudioEngine} from './lib/audioEngine.ts';
@@ -59,7 +65,11 @@ import {
   upsertLocalProject,
 } from './lib/localProjects.ts';
 import type {LocalProjectRecord} from './lib/localProjects.ts';
-import {exportProjectToVideo, MediaPool} from './lib/renderEngine.ts';
+import {
+  exportProjectToVideo,
+  getCanvasDimensions,
+  MediaPool,
+} from './lib/renderEngine.ts';
 import {getApiUrl, isNativeCapacitorApp} from './lib/serverConfig.ts';
 import {
   colorToHex,
@@ -67,6 +77,12 @@ import {
   measureBaseTextHalfWidth,
   normalizeTextStyle,
 } from './lib/textRenderer.ts';
+import {getDefaultShapeStyle, getShapeCatalogItem} from './lib/shapeEngine.ts';
+import {
+  createDefaultWarp,
+  isIdentityWarp,
+  normalizeWarp,
+} from './lib/warpEngine.ts';
 import {
   hasExplicitRoomInUrl,
   useCollaborativeRoom,
@@ -81,7 +97,9 @@ import {HomeScreen} from './components/HomeScreen.tsx';
 import {MaskPanel} from './components/MaskPanel.tsx';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
 import type {CanvasTransformPatch} from './components/PreviewCanvas.tsx';
+import {ProjectSettingsPanel} from './components/ProjectSettingsPanel.tsx';
 import {ScrubNumberField} from './components/ScrubNumberField.tsx';
+import {ShapesPanel} from './components/ShapesPanel.tsx';
 import {StickersSheet} from './components/StickersSheet.tsx';
 import {Timeline} from './components/Timeline.tsx';
 import {TransformPanel} from './components/TransformPanel.tsx';
@@ -112,8 +130,6 @@ function formatTimecode(sec: number): string {
   const tenths = Math.floor((clamped % 1) * 10);
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${tenths}`;
 }
-
-const ASPECT_OPTIONS: AspectRatio[] = ['9:16', '16:9', '1:1', '4:5'];
 
 export default function App() {
   const {
@@ -177,7 +193,11 @@ export default function App() {
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [pxPerSec, setPxPerSec] = useState(64);
   const [desktopTab, setDesktopTab] = useState<ActiveToolTab>('media');
-  const [mobileSheet, setMobileSheet] = useState<ActiveToolTab | null>(null);
+  const [desktopOverlayView, setDesktopOverlayView] = useState<'media' | 'shapes'>('shapes');
+  const [mobileSheet, setMobileSheet] = useState<
+    ActiveToolTab | 'shapes' | null
+  >(null);
+  const [showOverlayChooser, setShowOverlayChooser] = useState(false);
   const [showOpacitySlider, setShowOpacitySlider] = useState(false);
   const [showChromaKeyPanel, setShowChromaKeyPanel] = useState(false);
   const [showTrackpad, setShowTrackpad] = useState(false);
@@ -186,27 +206,33 @@ export default function App() {
   const [editSubMode, setEditSubMode] = useState<
     | 'menu'
     | 'transform'
+    | 'shape'
     | 'opacity'
     | 'mask'
     | 'chromakey'
     | 'adjust'
     | 'filters'
+    | 'keyframes'
   >('menu');
   const [mobileEditTool, setMobileEditTool] = useState<
     | 'transform'
+    | 'shape'
     | 'mask'
     | 'adjust'
     | 'filters'
+    | 'keyframes'
     | 'audio_speed'
     | 'audio_fx'
     | 'text'
     | null
   >(null);
+  const overlayFileInputRef = useRef<HTMLInputElement | null>(null);
   const [textFocusTrigger, setTextFocusTrigger] = useState(0);
   const [textColorPicker, setTextColorPicker] = useState<{
     clipId: string;
     field: TextColorField;
   } | null>(null);
+  const [bgColorPickerActive, setBgColorPickerActive] = useState(false);
   const [curveEditActive, setCurveEditActive] = useState(true);
   const [selectedCurvePointId, setSelectedCurvePointId] = useState<string | null>(
     null
@@ -301,6 +327,32 @@ export default function App() {
         cur === 'audio_speed' || cur === 'audio_fx' ? cur : null
       );
       setEditSubMode('menu');
+      return;
+    }
+
+    if (
+      selectedClip.track === 'adjustment' ||
+      selectedClip.kind === 'adjustment'
+    ) {
+      setShowChromaKeyPanel(false);
+      setShowCompressModal(false);
+      setShowCropModal(false);
+      setShowTrackpad(false);
+      setTrackpadSnapGuides({x: false, y: false});
+      setMobileEditTool((cur) =>
+        cur === 'adjust' || cur === 'filters' || cur === 'keyframes'
+          ? cur
+          : null
+      );
+      setEditSubMode((cur) =>
+        cur === 'opacity' ||
+        cur === 'adjust' ||
+        cur === 'filters' ||
+        cur === 'keyframes'
+          ? cur
+          : 'menu'
+      );
+      return;
     }
 
     if (selectedClip.kind !== 'image' && selectedClip.kind !== 'video') {
@@ -309,6 +361,11 @@ export default function App() {
       setShowCropModal(false);
       setMobileEditTool((cur) =>
         cur === 'transform' ||
+        cur === 'mask' ||
+        cur === 'adjust' ||
+        cur === 'filters' ||
+        cur === 'keyframes' ||
+        (cur === 'shape' && selectedClip.kind === 'shape') ||
         cur === 'audio_speed' ||
         cur === 'audio_fx' ||
         (cur === 'text' && selectedClip.track === 'text')
@@ -316,7 +373,15 @@ export default function App() {
           : null
       );
       setEditSubMode((cur) =>
-        cur === 'transform' || cur === 'opacity' ? cur : 'menu'
+        cur === 'transform' ||
+        cur === 'mask' ||
+        cur === 'adjust' ||
+        cur === 'filters' ||
+        cur === 'opacity' ||
+        cur === 'keyframes' ||
+        (cur === 'shape' && selectedClip.kind === 'shape')
+          ? cur
+          : 'menu'
       );
     }
   }, [selectedClip]);
@@ -328,6 +393,7 @@ export default function App() {
       title: project.title,
       aspectRatio: project.aspectRatio,
       backgroundColor: project.backgroundColor || '#09090b',
+      canvasBackground: project.canvasBackground,
       updatedAt: Date.now(),
       clipsCount: project.clips.length,
       tracksCount: project.tracks.length,
@@ -516,6 +582,7 @@ export default function App() {
       duration: number;
       track: 'video' | 'overlay';
       forceNewTrack?: boolean;
+      minTrackIndex?: number;
       isSticker?: boolean;
     }) => {
       const sameTrack = project.clips.filter((c) => c.track === opts.track);
@@ -560,14 +627,18 @@ export default function App() {
             opts.kind === 'image' && opts.track === 'video'
               ? 'kenburns-in'
               : 'none',
-          mediaScale: isSticker ? 0.36 : opts.track === 'overlay' ? 0.42 : 1,
-          mediaX: isSticker ? 0.5 : opts.track === 'overlay' ? 0.72 : 0.5,
-          mediaY: isSticker ? 0.5 : opts.track === 'overlay' ? 0.26 : 0.5,
+          mediaScale: isSticker ? 0.36 : opts.track === 'overlay' ? 0.55 : 1,
+          mediaX: isSticker ? 0.5 : opts.track === 'overlay' ? 0.5 : 0.5,
+          mediaY: isSticker ? 0.5 : opts.track === 'overlay' ? 0.5 : 0.5,
           rotation: 0,
-          borderRadius: isSticker ? 0 : opts.track === 'overlay' ? 20 : 0,
+          borderRadius: 0,
           blendMode: 'source-over',
         },
-        {forceNewTrack: opts.forceNewTrack, skipWs: hasRemoteMedia}
+        {
+          forceNewTrack: opts.forceNewTrack,
+          minTrackIndex: opts.minTrackIndex,
+          skipWs: hasRemoteMedia,
+        }
       );
 
       if (hasRemoteMedia && opts.remoteUrl) {
@@ -588,6 +659,200 @@ export default function App() {
     },
     [project.clips, currentTime, addClip, sendLayerMediaUpdated]
   );
+
+  const handleOverlayPickerChange = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const files = e.target.files;
+      if (!files || files.length === 0) return;
+
+      const selectedTrackIdx =
+        selectedClip && selectedClip.track !== 'audio'
+          ? project.tracks.findIndex((t) => t.id === selectedClip.trackId)
+          : -1;
+
+      try {
+        for (const file of Array.from(files)) {
+          const fallbackKind = file.type.startsWith('video/')
+            ? 'video'
+            : 'image';
+          const prepared = await uploadFileForP2P(file, fallbackKind);
+          const mediaKind = prepared.kind === 'video' ? 'video' : 'image';
+          let dur = 4.5;
+          if (mediaKind === 'video') {
+            dur = await new Promise<number>((resolve) => {
+              const v = document.createElement('video');
+              v.preload = 'metadata';
+              v.onloadedmetadata = () => {
+                resolve(
+                  Number.isFinite(v.duration) && v.duration > 0
+                    ? Math.min(60, Math.round(v.duration * 10) / 10)
+                    : 5
+                );
+              };
+              v.onerror = () => resolve(5);
+              v.src = prepared.localSrc;
+            });
+          }
+          handleAddMediaClip({
+            name: prepared.name,
+            kind: mediaKind,
+            src: prepared.localSrc,
+            fileName: prepared.fileName,
+            remoteUrl: prepared.shareUrl,
+            duration: dur,
+            track: 'overlay',
+            forceNewTrack: false,
+            minTrackIndex: selectedTrackIdx,
+          });
+        }
+        setMobileSheet(null);
+        setShowTrackpad(false);
+        setShowOpacitySlider(false);
+        setShowChromaKeyPanel(false);
+        setMobileEditTool(null);
+        setDesktopTab('edit');
+        setEditSubMode('menu');
+        showTransientNotice('Наложение добавлено — доступны все инструменты');
+      } catch (err) {
+        showTransientNotice(
+          err instanceof Error ? err.message : 'Не удалось добавить наложение'
+        );
+      } finally {
+        e.target.value = '';
+      }
+    },
+    [selectedClip, project.tracks, handleAddMediaClip, showTransientNotice]
+  );
+
+  const handleAddShapeClip = useCallback(
+    (shapeType: ShapeType) => {
+      const start = Math.round(currentTime * 100) / 100;
+      const meta = getShapeCatalogItem(shapeType);
+      const selectedTrackIdx =
+        selectedClip && selectedClip.track !== 'audio'
+          ? project.tracks.findIndex((t) => t.id === selectedClip.trackId)
+          : -1;
+
+      const {clip} = addClip(
+        {
+          id: `clip-${Math.random().toString(36).slice(2, 9)}`,
+          track: 'overlay',
+          kind: 'shape',
+          name: meta.label,
+          start,
+          duration: 4.5,
+          trimStart: 0,
+          sourceDuration: 3600,
+          speed: 1,
+          volume: 0,
+          opacity: 1,
+          filter: 'none',
+          brightness: 1,
+          contrast: 1,
+          saturate: 1,
+          transitionIn: 'none',
+          motionEffect: 'none',
+          mediaScale: shapeType === 'line' ? 0.62 : 0.42,
+          mediaX: 0.5,
+          mediaY: 0.5,
+          rotation: 0,
+          blendMode: 'source-over',
+          shapeStyle: getDefaultShapeStyle(shapeType),
+        },
+        {forceNewTrack: false, minTrackIndex: selectedTrackIdx}
+      );
+
+      setSelectedClipId(clip.id);
+      setMobileSheet(null);
+      setShowOverlayChooser(false);
+      setShowTrackpad(false);
+      setShowOpacitySlider(false);
+      setShowChromaKeyPanel(false);
+      setDesktopTab('edit');
+      setEditSubMode('shape');
+      setMobileEditTool('shape');
+      showTransientNotice(`Фигура «${meta.label}» добавлена`);
+    },
+    [
+      currentTime,
+      selectedClip,
+      project.tracks,
+      addClip,
+      showTransientNotice,
+    ]
+  );
+
+  const handleToggleAdjustmentMask = useCallback(
+    (clip: Clip) => {
+      const next = !clip.adjustmentMask;
+      updateClip(clip.id, {adjustmentMask: next});
+      if (next) {
+        showTransientNotice(
+          'Корр. маска включена — настройте размытие, цвет или инверсию в «Настроить»'
+        );
+      } else {
+        showTransientNotice('Корректирующая маска отключена');
+      }
+    },
+    [updateClip, showTransientNotice]
+  );
+
+  const handleUpdateClipWarp = useCallback(
+    (clipId: string, warp: ClipWarp, commit: boolean) => {
+      const target = project.clips.find((c) => c.id === clipId);
+      if (!target) return;
+      if (target.keyframes && target.keyframes.length > 0) {
+        const {keyframes} = upsertKeyframeAtTime(target, currentTime, {warp});
+        updateClip(
+          clipId,
+          {warp, keyframes},
+          {skipUndo: !commit, skipSync: !commit}
+        );
+        return;
+      }
+      updateClip(
+        clipId,
+        {warp},
+        {skipUndo: !commit, skipSync: !commit}
+      );
+    },
+    [project.clips, currentTime, updateClip]
+  );
+
+  const handleAddAdjustmentLayer = useCallback(() => {
+    const start = Math.round(currentTime * 100) / 100;
+    const {clip} = addClip(
+      {
+        id: `clip-${Math.random().toString(36).slice(2, 9)}`,
+        track: 'adjustment',
+        kind: 'adjustment',
+        name: 'Корр. слой',
+        start,
+        duration: 3.0,
+        trimStart: 0,
+        sourceDuration: 3600,
+        speed: 1,
+        volume: 0,
+        opacity: 1,
+        filter: 'none',
+        brightness: 1,
+        contrast: 1,
+        saturate: 1,
+        transitionIn: 'none',
+        motionEffect: 'none',
+      },
+      {forceNewTrack: false}
+    );
+    setSelectedClipId(clip.id);
+    setMobileSheet(null);
+    setShowTrackpad(false);
+    setShowOpacitySlider(false);
+    setShowChromaKeyPanel(false);
+    setDesktopTab('edit');
+    setEditSubMode('adjust');
+    setMobileEditTool('adjust');
+    showTransientNotice('Корректирующий слой (3с) добавлен');
+  }, [currentTime, addClip, showTransientNotice]);
 
   const handleOpenStickers = useCallback(() => {
     setMobileSheet(null);
@@ -785,6 +1050,19 @@ export default function App() {
       );
     },
     [textColorPicker, project.clips, updateClip]
+  );
+
+  const handlePickCanvasBackgroundColor = useCallback(
+    (hexColor: string, commit: boolean) => {
+      updateProjectMeta(
+        {
+          backgroundColor: hexColor,
+          canvasBackground: {type: 'solid', color: hexColor},
+        },
+        {skipSync: !commit}
+      );
+    },
+    [updateProjectMeta]
   );
 
   const handleUpdateCurvePoints = useCallback(
@@ -1103,6 +1381,7 @@ export default function App() {
           title: opts.title,
           aspectRatio: opts.aspectRatio,
           backgroundColor: opts.backgroundColor,
+          canvasBackground: {type: 'solid', color: opts.backgroundColor},
           tracks: localTracks,
         });
       }
@@ -1119,6 +1398,7 @@ export default function App() {
         title: record.title,
         aspectRatio: record.aspectRatio,
         backgroundColor: record.backgroundColor,
+        canvasBackground: record.canvasBackground,
         customFonts: record.snapshot.customFonts,
         tracks: record.snapshot.tracks,
       });
@@ -1142,6 +1422,7 @@ export default function App() {
         tracks: project.tracks,
         aspectRatio: project.aspectRatio,
         backgroundColor: project.backgroundColor,
+        canvasBackground: project.canvasBackground,
         customFonts: project.customFonts,
         duration,
         pool: mediaPoolRef.current!,
@@ -1170,12 +1451,6 @@ export default function App() {
     }
   };
 
-  const cycleAspectRatio = () => {
-    const idx = ASPECT_OPTIONS.indexOf(project.aspectRatio);
-    const next = ASPECT_OPTIONS[(idx + 1) % ASPECT_OPTIONS.length];
-    updateProjectMeta({aspectRatio: next});
-  };
-
   const canSplitNow = Boolean(
     selectedClip
       ? currentTime > selectedClip.start + 0.15 &&
@@ -1201,15 +1476,33 @@ export default function App() {
 
   const isMaskEditActive = Boolean(
     selectedClip &&
-      (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+      selectedClip.track !== 'audio' &&
+      selectedClip.track !== 'adjustment' &&
+      selectedClip.kind !== 'adjustment' &&
       ((desktopTab === 'edit' && editSubMode === 'mask') ||
         mobileEditTool === 'mask')
   );
+
+  const isWarpEditActive = Boolean(
+    selectedClip &&
+      selectedClip.track !== 'audio' &&
+      selectedClip.track !== 'adjustment' &&
+      selectedClip.kind !== 'adjustment' &&
+      ((desktopTab === 'edit' && editSubMode === 'transform') ||
+        mobileEditTool === 'transform')
+  );
+
+  const activeWarpState = useMemo(() => {
+    if (!selectedClip) return null;
+    const tr = evaluateClipTransform(selectedClip, currentTime);
+    return normalizeWarp(tr.warp ?? selectedClip.warp);
+  }, [selectedClip, currentTime]);
 
   const isChromaKeyPickerActive = Boolean(
     selectedClip &&
       (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
       !textColorPicker &&
+      !bgColorPickerActive &&
       (showChromaKeyPanel ||
         (desktopTab === 'edit' && editSubMode === 'chromakey'))
   );
@@ -1230,6 +1523,7 @@ export default function App() {
       showSelectionOutline &&
       !isChromaKeyPickerActive &&
       !isTextColorPickerActive &&
+      !bgColorPickerActive &&
       currentTime >= selectedClip.start &&
       currentTime < selectedClip.start + selectedClip.duration
   );
@@ -1430,35 +1724,24 @@ export default function App() {
           </button>
         </div>
 
-        {/* Right: Background Color, Aspect Ratio, PWA Install, Export */}
+        {/* Right: PWA Install, Settings Shortcut, Export */}
         <div className="flex shrink-0 items-center gap-1 sm:gap-2">
-          <input
-            type="color"
-            value={project.backgroundColor || '#09090b'}
-            onChange={(e) =>
-              updateProjectMeta({backgroundColor: e.target.value})
-            }
-            title="Цвет фона холста"
-            className="h-8 w-7 cursor-pointer rounded-md border border-white/15 bg-transparent p-0.5 sm:h-9 sm:w-8"
-          />
-
-          <button
-            type="button"
-            onClick={cycleAspectRatio}
-            className="flex h-8 items-center justify-center rounded-lg border border-white/10 bg-zinc-900 px-2 font-mono text-[11px] font-medium text-zinc-200 hover:border-white/25 whitespace-nowrap sm:h-9"
-            title="Сменить формат кадра"
-          >
-            {project.aspectRatio}
-          </button>
-
           <PWAInstallButton />
 
           <button
             type="button"
-            onClick={() => setShowAppSettings(true)}
-            title="Настройки приложения (Giphy API ключ)"
-            aria-label="Настройки приложения"
-            className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-zinc-300 hover:border-cyan-400 hover:text-white active:scale-95 sm:h-9 sm:w-9"
+            onClick={() => {
+              setSelectedClipId(null);
+              setDesktopTab('settings');
+              setMobileSheet('settings');
+            }}
+            title="Настройки проекта, фона и API"
+            aria-label="Настройки проекта"
+            className={`flex h-8 w-8 items-center justify-center rounded-lg border transition active:scale-95 sm:h-9 sm:w-9 ${
+              desktopTab === 'settings' || mobileSheet === 'settings'
+                ? 'border-cyan-400 bg-cyan-500/15 text-cyan-300'
+                : 'border-white/10 bg-zinc-900 text-zinc-300 hover:border-cyan-400 hover:text-white'
+            }`}
           >
             <Settings className="h-4 w-4" />
           </button>
@@ -1479,7 +1762,7 @@ export default function App() {
       <div className="flex flex-1 min-h-0 flex-col lg:grid lg:grid-cols-[360px_1fr_310px]">
         {/* Desktop Left Sidebar */}
         <aside className="hidden border-r border-white/10 bg-[#111114] lg:flex lg:min-h-0 lg:flex-col">
-          <div className="grid grid-cols-7 gap-0.5 border-b border-white/10 p-1.5">
+          <div className="grid grid-cols-4 gap-1 border-b border-white/10 p-1.5">
             {TOOL_TABS.map((tab) => {
               const Icon = tab.icon;
               const active = desktopTab === tab.id;
@@ -1488,6 +1771,14 @@ export default function App() {
                   key={tab.id}
                   type="button"
                   onClick={() => {
+                    if (tab.id === 'overlay') {
+                      setShowOverlayChooser(true);
+                      return;
+                    }
+                    if (tab.id === 'effects') {
+                      handleAddAdjustmentLayer();
+                      return;
+                    }
                     if (tab.id === 'edit') {
                       handleOpenEditTab();
                     }
@@ -1521,7 +1812,9 @@ export default function App() {
                             ? 'Дорожка наложения'
                             : selectedClip.track === 'text'
                               ? 'Текстовый титр'
-                              : 'Аудиодорожка'}
+                              : selectedClip.track === 'adjustment'
+                                ? 'Корректирующий слой (Эффект)'
+                                : 'Аудиодорожка'}
                       </p>
                     </div>
                     <div className="grid grid-cols-2 gap-2">
@@ -1630,6 +1923,60 @@ export default function App() {
                     {selectedClip.track !== 'audio' && (
                       <>
                         {editSubMode === 'menu' ? (
+                          selectedClip.track === 'adjustment' ||
+                          selectedClip.kind === 'adjustment' ? (
+                            <div className="space-y-3 border-t border-white/10 pt-3">
+                              <div className="rounded-xl border border-violet-400/35 bg-violet-500/10 p-2.5 text-[11px] text-violet-200">
+                                Корректирующий слой действует на все слои выше него в таймлайне, не затрагивая слои ниже.
+                              </div>
+                              <div className="grid grid-cols-2 gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('adjust')}
+                                  className="flex h-16 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
+                                >
+                                  <Sliders className="h-4 w-4 text-cyan-400" />
+                                  <span>Настроить</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('filters')}
+                                  className="flex h-16 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
+                                >
+                                  <Palette className="h-4 w-4 text-cyan-400" />
+                                  <span>Фильтры</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('opacity')}
+                                  className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-2 text-[11px] font-medium transition ${
+                                    selectedOpacityValue < 0.99
+                                      ? 'border-violet-400/60 bg-violet-500/15 text-violet-200'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-violet-400'
+                                  }`}
+                                >
+                                  <Droplet className="h-4 w-4 text-violet-400" />
+                                  <span>
+                                    Интенсивность {Math.round(selectedOpacityValue * 100)}%
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('keyframes')}
+                                  className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-2 text-[11px] font-medium transition ${
+                                    (selectedClip.keyframes?.length ?? 0) > 0
+                                      ? 'border-violet-400/60 bg-violet-500/15 text-violet-200'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-violet-400'
+                                  }`}
+                                >
+                                  <Diamond className="h-4 w-4 text-violet-400" />
+                                  <span>
+                                    Ключи ({selectedClip.keyframes?.length ?? 0})
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
                           <div className="space-y-3 border-t border-white/10 pt-3">
                             {/* Section 1: Geometry, Trackpad, Opacity */}
                             <div className="space-y-2">
@@ -1646,7 +1993,8 @@ export default function App() {
                                     Math.abs((selectedClip.scaleX ?? 1) - 1) >
                                       0.01 ||
                                     Math.abs((selectedClip.scaleY ?? 1) - 1) >
-                                      0.01
+                                      0.01 ||
+                                    !isIdentityWarp(selectedClip.warp)
                                       ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
                                       : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
                                   }`}
@@ -1685,86 +2033,167 @@ export default function App() {
                               </div>
                             </div>
 
-                            {/* Section 2: Mask & Chroma Key (for image/video) */}
-                            {(selectedClip.kind === 'image' ||
-                              selectedClip.kind === 'video') && (
-                              <>
-                                <div className="space-y-2 border-t border-white/10 pt-3">
-                                  <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
-                                    Маска и вырезка фона
-                                  </p>
-                                  <div className="grid grid-cols-2 gap-2">
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setShowChromaKeyPanel(false);
-                                        setEditSubMode('mask');
-                                      }}
-                                      className={`flex h-14 items-center justify-center gap-2 rounded-xl border px-2.5 text-xs font-medium transition ${
-                                        selectedClip.mask
-                                          ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
-                                          : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
-                                      }`}
-                                    >
-                                      <Shapes className="h-4 w-4 text-cyan-400" />
-                                      <span>Маска</span>
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setShowChromaKeyPanel(true);
-                                        setEditSubMode('chromakey');
-                                      }}
-                                      className={`flex h-14 items-center justify-center gap-2 rounded-xl border px-2.5 text-xs font-medium transition ${
-                                        selectedClip.chromaKeyEnabled
-                                          ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-200'
-                                          : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-emerald-400'
-                                      }`}
-                                    >
-                                      <Pipette className="h-4 w-4 text-emerald-400" />
-                                      <span>Удалить фон</span>
-                                    </button>
-                                  </div>
-                                </div>
+                            {/* Section: Shape Styling & Adjustment Mask */}
+                            <div className="space-y-2 border-t border-white/10 pt-3">
+                              <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                                Фигура и корректирующая маска
+                              </p>
+                              <div className="space-y-2">
+                                {selectedClip.kind === 'shape' && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setEditSubMode('shape')}
+                                    className="flex h-11 w-full items-center justify-center gap-2 rounded-xl border border-cyan-400/40 bg-cyan-500/10 px-3 text-xs font-semibold text-cyan-200 hover:bg-cyan-500/20"
+                                  >
+                                    <PaintBucket className="h-4 w-4 text-cyan-400" />
+                                    <span>Стиль фигуры (цвет, обводка, углы)</span>
+                                  </button>
+                                )}
 
-                                <div className="space-y-2 border-t border-white/10 pt-3">
-                                  <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
-                                    Цвет и кадрирование
-                                  </p>
-                                  <div className="grid grid-cols-3 gap-2">
-                                    <button
-                                      type="button"
-                                      onClick={() => setEditSubMode('adjust')}
-                                      className="flex h-16 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
-                                    >
-                                      <Sliders className="h-4 w-4 text-cyan-400" />
-                                      <span>Настроить</span>
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => setEditSubMode('filters')}
-                                      className="flex h-16 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
-                                    >
-                                      <Palette className="h-4 w-4 text-cyan-400" />
-                                      <span>Фильтры</span>
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => setShowCropModal(true)}
-                                      className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-2 text-[11px] font-medium transition ${
-                                        selectedClip.crop
-                                          ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
-                                          : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
-                                      }`}
-                                    >
-                                      <Crop className="h-4 w-4 text-cyan-400" />
-                                      <span>Кадрировать</span>
-                                    </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleToggleAdjustmentMask(selectedClip)
+                                  }
+                                  className={`flex w-full items-center justify-between gap-2 rounded-xl border px-3 py-2.5 text-left transition ${
+                                    selectedClip.adjustmentMask
+                                      ? 'border-violet-400 bg-violet-500/20 text-violet-100'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-violet-400/60'
+                                  }`}
+                                >
+                                  <div className="min-w-0">
+                                    <p className="flex items-center gap-1.5 text-xs font-semibold">
+                                      <Sparkles className="h-3.5 w-3.5 text-violet-300" />
+                                      <span>Корректирующая маска</span>
+                                    </p>
+                                    <p className="mt-0.5 text-[10px] text-zinc-400">
+                                      {selectedClip.adjustmentMask
+                                        ? 'Объект скрыт и фильтрует слои под собой'
+                                        : 'Применять цвет/размытие только под границей слоя'}
+                                    </p>
                                   </div>
-                                </div>
-                              </>
-                            )}
+                                  <span
+                                    className={`shrink-0 rounded-md px-2 py-0.5 text-[10px] font-bold ${
+                                      selectedClip.adjustmentMask
+                                        ? 'bg-violet-500 text-white'
+                                        : 'bg-white/10 text-zinc-400'
+                                    }`}
+                                  >
+                                    {selectedClip.adjustmentMask ? 'ВКЛ' : 'ВЫКЛ'}
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Section 2: Mask & Chroma Key */}
+                            <div className="space-y-2 border-t border-white/10 pt-3">
+                              <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                                Маска {(selectedClip.kind === 'image' || selectedClip.kind === 'video') ? 'и вырезка фона' : 'вырезания'}
+                              </p>
+                              <div
+                                className={`grid gap-2 ${
+                                  selectedClip.kind === 'image' ||
+                                  selectedClip.kind === 'video'
+                                    ? 'grid-cols-2'
+                                    : 'grid-cols-1'
+                                }`}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setShowChromaKeyPanel(false);
+                                    setEditSubMode('mask');
+                                  }}
+                                  className={`flex h-14 items-center justify-center gap-2 rounded-xl border px-2.5 text-xs font-medium transition ${
+                                    selectedClip.mask
+                                      ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
+                                  }`}
+                                >
+                                  <Shapes className="h-4 w-4 text-cyan-400" />
+                                  <span>Маска</span>
+                                </button>
+                                {(selectedClip.kind === 'image' ||
+                                  selectedClip.kind === 'video') && (
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setShowChromaKeyPanel(true);
+                                      setEditSubMode('chromakey');
+                                    }}
+                                    className={`flex h-14 items-center justify-center gap-2 rounded-xl border px-2.5 text-xs font-medium transition ${
+                                      selectedClip.chromaKeyEnabled
+                                        ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-200'
+                                        : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-emerald-400'
+                                    }`}
+                                  >
+                                    <Pipette className="h-4 w-4 text-emerald-400" />
+                                    <span>Удалить фон</span>
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Section 3: Color, Crop & Keyframes */}
+                            <div className="space-y-2 border-t border-white/10 pt-3">
+                              <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                                Цвет, эффекты и анимация
+                              </p>
+                              <div className="grid grid-cols-2 gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('adjust')}
+                                  className="flex h-14 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
+                                >
+                                  <Sliders className="h-4 w-4 text-cyan-400" />
+                                  <span>Настроить</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('filters')}
+                                  className="flex h-14 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
+                                >
+                                  <Palette className="h-4 w-4 text-cyan-400" />
+                                  <span>Фильтры</span>
+                                </button>
+                                {(selectedClip.kind === 'image' ||
+                                  selectedClip.kind === 'video') && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setShowCropModal(true)}
+                                    className={`flex h-14 flex-col items-center justify-center gap-1 rounded-xl border px-2 text-[11px] font-medium transition ${
+                                      selectedClip.crop
+                                        ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
+                                        : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
+                                    }`}
+                                  >
+                                    <Crop className="h-4 w-4 text-cyan-400" />
+                                    <span>Кадрировать</span>
+                                  </button>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('keyframes')}
+                                  className={`flex h-14 flex-col items-center justify-center gap-1 rounded-xl border px-2 text-[11px] font-medium transition ${
+                                    (selectedClip.keyframes?.length ?? 0) > 0
+                                      ? 'border-amber-400/60 bg-amber-500/15 text-amber-200'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-amber-400'
+                                  } ${
+                                    selectedClip.kind === 'image' ||
+                                    selectedClip.kind === 'video'
+                                      ? ''
+                                      : 'col-span-2'
+                                  }`}
+                                >
+                                  <Diamond className="h-4 w-4 text-amber-400" />
+                                  <span>
+                                    Ключи ({selectedClip.keyframes?.length ?? 0})
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
                           </div>
+                          )
                         ) : (
                           <div className="space-y-3 border-t border-white/10 pt-3">
                             <div className="flex items-center justify-between">
@@ -1784,22 +2213,31 @@ export default function App() {
                               <span className="text-xs font-semibold text-white">
                                 {editSubMode === 'transform'
                                   ? 'Трансформация'
-                                  : editSubMode === 'opacity'
-                                    ? 'Прозрачность'
-                                    : editSubMode === 'mask'
-                                      ? 'Маска'
-                                      : editSubMode === 'chromakey'
-                                        ? 'Удалить фон (Хромакей)'
-                                        : editSubMode === 'adjust'
-                                          ? 'Цветокоррекция'
-                                          : 'Фильтры'}
+                                  : editSubMode === 'shape'
+                                    ? 'Фигура и стиль'
+                                    : editSubMode === 'opacity'
+                                      ? selectedClip.track === 'adjustment' ||
+                                        selectedClip.kind === 'adjustment'
+                                        ? 'Интенсивность эффекта'
+                                        : 'Прозрачность'
+                                      : editSubMode === 'mask'
+                                        ? 'Маска'
+                                        : editSubMode === 'chromakey'
+                                          ? 'Удалить фон (Хромакей)'
+                                          : editSubMode === 'adjust'
+                                            ? 'Цветокоррекция'
+                                            : editSubMode === 'keyframes'
+                                              ? 'Ключевые кадры'
+                                              : 'Фильтры'}
                               </span>
                             </div>
 
                             {editSubMode === 'transform' && (
                               <TransformPanel
                                 clip={selectedClip}
+                                currentTime={currentTime}
                                 onUpdateClip={updateClip}
+                                onUpdateWarp={handleUpdateClipWarp}
                                 onOpenTrackpad={() =>
                                   setShowTrackpad((v) => !v)
                                 }
@@ -1807,10 +2245,25 @@ export default function App() {
                               />
                             )}
 
+                            {editSubMode === 'shape' &&
+                              selectedClip.kind === 'shape' && (
+                                <ShapesPanel
+                                  selectedClip={selectedClip}
+                                  onAddShape={handleAddShapeClip}
+                                  onUpdateClip={updateClip}
+                                  onOpenAdjust={() => setEditSubMode('adjust')}
+                                />
+                              )}
+
                             {editSubMode === 'opacity' && (
                               <div className="space-y-3 rounded-xl border border-white/10 bg-zinc-900/60 p-3">
                                 <div className="flex items-center justify-between text-xs text-zinc-300">
-                                  <span>Прозрачность слоя</span>
+                                  <span>
+                                    {selectedClip.track === 'adjustment' ||
+                                    selectedClip.kind === 'adjustment'
+                                      ? 'Интенсивность эффекта'
+                                      : 'Прозрачность слоя'}
+                                  </span>
                                   <ScrubNumberField
                                     compact
                                     accent="cyan"
@@ -1905,11 +2358,32 @@ export default function App() {
                               <FilterStripPanel
                                 clip={selectedClip}
                                 customPresets={customColorPresets}
+                                previewFallbackSrc={
+                                  project.clips.find(
+                                    (c) =>
+                                      c.kind === 'image' &&
+                                      c.src &&
+                                      currentTime >= c.start &&
+                                      currentTime < c.start + c.duration
+                                  )?.src ??
+                                  project.clips.find(
+                                    (c) => c.kind === 'image' && c.src
+                                  )?.src
+                                }
                                 onUpdateClip={(id, patch) =>
                                   updateClip(id, patch)
                                 }
                                 onOpenAdjust={() => setEditSubMode('adjust')}
                                 onPresetsChanged={setCustomColorPresets}
+                              />
+                            )}
+
+                            {editSubMode === 'keyframes' && (
+                              <KeyframeControls
+                                clip={selectedClip}
+                                currentTime={currentTime}
+                                onSeek={handleSeek}
+                                onUpdateClip={(id, patch) => updateClip(id, patch)}
                               />
                             )}
                           </div>
@@ -1938,13 +2412,53 @@ export default function App() {
               <MediaPanel onAddMediaClip={handleAddMediaClip} />
             )}
             {desktopTab === 'overlay' && (
-              <OverlayPanel
-                selectedClip={selectedClip}
-                currentTime={currentTime}
-                onSeek={handleSeek}
-                onAddMediaClip={handleAddMediaClip}
-                onUpdateClip={(id, patch) => updateClip(id, patch)}
-              />
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-zinc-900 p-1">
+                  <button
+                    type="button"
+                    onClick={() => setDesktopOverlayView('shapes')}
+                    className={`flex h-8 items-center justify-center gap-1.5 rounded-lg text-xs font-medium transition ${
+                      desktopOverlayView === 'shapes'
+                        ? 'bg-cyan-500 text-zinc-950'
+                        : 'text-zinc-300 hover:text-white'
+                    }`}
+                  >
+                    <Shapes className="h-3.5 w-3.5" />
+                    Фигуры
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDesktopOverlayView('media')}
+                    className={`flex h-8 items-center justify-center gap-1.5 rounded-lg text-xs font-medium transition ${
+                      desktopOverlayView === 'media'
+                        ? 'bg-indigo-500 text-white'
+                        : 'text-zinc-300 hover:text-white'
+                    }`}
+                  >
+                    <ImagePlus className="h-3.5 w-3.5" />
+                    Фото / Видео
+                  </button>
+                </div>
+                {desktopOverlayView === 'shapes' ? (
+                  <ShapesPanel
+                    selectedClip={selectedClip}
+                    onAddShape={handleAddShapeClip}
+                    onUpdateClip={updateClip}
+                    onOpenAdjust={() => {
+                      setDesktopTab('edit');
+                      setEditSubMode('adjust');
+                    }}
+                  />
+                ) : (
+                  <OverlayPanel
+                    selectedClip={selectedClip}
+                    currentTime={currentTime}
+                    onSeek={handleSeek}
+                    onAddMediaClip={handleAddMediaClip}
+                    onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  />
+                )}
+              </div>
             )}
             {desktopTab === 'text' && (
               <TextPanel
@@ -1964,6 +2478,7 @@ export default function App() {
                     return;
                   }
                   setShowChromaKeyPanel(false);
+                  setBgColorPickerActive(false);
                   setTextColorPicker({clipId: selectedClip.id, field});
                 }}
                 curveEditActive={curveEditActive}
@@ -1987,6 +2502,7 @@ export default function App() {
               <EffectsPanel
                 selectedClip={selectedClip}
                 onUpdateClip={(id, patch) => updateClip(id, patch)}
+                onAddAdjustmentLayer={handleAddAdjustmentLayer}
               />
             )}
             {desktopTab === 'audio' && (
@@ -2002,6 +2518,26 @@ export default function App() {
                   setMobileEditTool(null);
                   setShowVoiceRecorder(true);
                 }}
+                onNotify={showTransientNotice}
+              />
+            )}
+            {desktopTab === 'settings' && (
+              <ProjectSettingsPanel
+                aspectRatio={project.aspectRatio}
+                backgroundColor={project.backgroundColor}
+                canvasBackground={project.canvasBackground}
+                user={user}
+                bgColorPickerActive={bgColorPickerActive}
+                onToggleBgColorPicker={(active) => {
+                  if (active) {
+                    setTextColorPicker(null);
+                    setShowChromaKeyPanel(false);
+                  }
+                  setBgColorPickerActive(active);
+                }}
+                onUpdateProjectMeta={updateProjectMeta}
+                onUpdateProfile={updateUserProfile}
+                onGiphyKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
                 onNotify={showTransientNotice}
               />
             )}
@@ -2044,6 +2580,24 @@ export default function App() {
           {(lockWarning || noticeMsg) && (
             <div className="pointer-events-none absolute top-3 left-1/2 z-30 -translate-x-1/2 rounded-full border border-amber-400/50 bg-zinc-950/90 px-3.5 py-1.5 text-xs font-semibold text-amber-300 shadow-lg backdrop-blur-xs">
               {lockWarning || noticeMsg}
+            </div>
+          )}
+          {bgColorPickerActive && (
+            <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-2 rounded-full border border-cyan-400/60 bg-zinc-950/90 px-3 py-1.5 shadow-xl backdrop-blur-xs">
+              <span
+                className="h-4 w-4 shrink-0 rounded-full border border-white/40"
+                style={{backgroundColor: project.backgroundColor || '#09090b'}}
+              />
+              <span className="whitespace-nowrap text-[11px] font-medium text-cyan-200">
+                Пипетка (Фон холста): ведите по холсту
+              </span>
+              <button
+                type="button"
+                onClick={() => setBgColorPickerActive(false)}
+                className="rounded-full bg-cyan-500 px-2.5 py-0.5 text-[10px] font-bold text-zinc-950 hover:bg-cyan-400"
+              >
+                Готово
+              </button>
             </div>
           )}
           {isTextColorPickerActive && (
@@ -2136,12 +2690,57 @@ export default function App() {
               </button>
             </div>
           )}
+          {isWarpEditActive &&
+            selectedClip &&
+            activeWarpState &&
+            activeWarpState.mode !== 'none' &&
+            !isPlaying &&
+            !isCurveEditOverlayActive &&
+            !isChromaKeyPickerActive &&
+            !isTextColorPickerActive &&
+            !bgColorPickerActive && (
+              <div className="absolute top-3 left-1/2 z-30 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-blue-400/60 bg-zinc-950/90 px-2.5 py-1 shadow-xl backdrop-blur-xs">
+                <Grid3X3 className="h-3.5 w-3.5 shrink-0 text-blue-400" />
+                <span className="whitespace-nowrap text-[11px] font-medium text-blue-100">
+                  {activeWarpState.mode === 'perspective'
+                    ? 'Перспектива (4 угла)'
+                    : `Сетка ${activeWarpState.meshSize}×${activeWarpState.meshSize}`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    handleUpdateClipWarp(
+                      selectedClip.id,
+                      createDefaultWarp(
+                        activeWarpState.mode,
+                        activeWarpState.meshSize
+                      ),
+                      true
+                    )
+                  }
+                  className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] font-semibold text-zinc-200 hover:bg-white/20"
+                >
+                  Сброс
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditSubMode('menu');
+                    setMobileEditTool(null);
+                  }}
+                  className="rounded-full bg-blue-500 px-2.5 py-0.5 text-[10px] font-bold text-white hover:bg-blue-400"
+                >
+                  Готово
+                </button>
+              </div>
+            )}
           <div className="flex-1 min-h-0">
             <PreviewCanvas
               tracks={project.tracks}
               clips={project.clips}
               aspectRatio={project.aspectRatio}
               backgroundColor={project.backgroundColor}
+              canvasBackground={project.canvasBackground}
               customFonts={project.customFonts}
               currentTime={currentTime}
               isPlaying={isPlaying}
@@ -2159,15 +2758,25 @@ export default function App() {
               externalSnapGuides={trackpadSnapGuides}
               chromaKeyPickerActive={isChromaKeyPickerActive}
               onPickChromaKeyColor={handlePickChromaKeyColor}
-              colorPickerActive={isTextColorPickerActive}
-              colorPickerPreviewHex={textColorPickerHex}
-              onPickCanvasColor={handlePickTextCanvasColor}
+              colorPickerActive={isTextColorPickerActive || bgColorPickerActive}
+              colorPickerPreviewHex={
+                bgColorPickerActive
+                  ? project.backgroundColor || '#09090b'
+                  : textColorPickerHex
+              }
+              onPickCanvasColor={
+                bgColorPickerActive
+                  ? handlePickCanvasBackgroundColor
+                  : handlePickTextCanvasColor
+              }
               maskEditActive={isMaskEditActive}
               onTransformMask={handleTransformMaskOnCanvas}
               curveEditActive={isCurveEditOverlayActive}
               selectedCurvePointId={selectedCurvePointId}
               onSelectCurvePoint={setSelectedCurvePointId}
               onUpdateCurvePoints={handleUpdateCurvePoints}
+              warpEditActive={isWarpEditActive}
+              onUpdateWarp={handleUpdateClipWarp}
               onLockLayer={sendLayerLock}
               onSelectClip={setSelectedClipId}
               onDoubleClickTextClip={handleDoubleClickTextClip}
@@ -2300,7 +2909,14 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="grid grid-cols-3 gap-2">
+              <div
+                className={`grid gap-2 ${
+                  selectedClip.track === 'adjustment' ||
+                  selectedClip.kind === 'adjustment'
+                    ? 'grid-cols-2'
+                    : 'grid-cols-3'
+                }`}
+              >
                 <button
                   type="button"
                   onClick={handleSplitSelectedOrCurrent}
@@ -2318,14 +2934,17 @@ export default function App() {
                   <CopyPlus className="mb-0.5 h-3.5 w-3.5 text-cyan-400" />
                   Копия
                 </button>
-                <button
-                  type="button"
-                  onClick={handleCycleSpeed}
-                  className="flex h-10 flex-col items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-[11px] text-zinc-200 hover:border-cyan-400"
-                >
-                  <Gauge className="mb-0.5 h-3.5 w-3.5 text-cyan-400" />
-                  {selectedClip.speed}x
-                </button>
+                {selectedClip.track !== 'adjustment' &&
+                  selectedClip.kind !== 'adjustment' && (
+                    <button
+                      type="button"
+                      onClick={handleCycleSpeed}
+                      className="flex h-10 flex-col items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-[11px] text-zinc-200 hover:border-cyan-400"
+                    >
+                      <Gauge className="mb-0.5 h-3.5 w-3.5 text-cyan-400" />
+                      {selectedClip.speed}x
+                    </button>
+                  )}
               </div>
 
               {(selectedClip.track === 'video' ||
@@ -2362,7 +2981,9 @@ export default function App() {
                 </div>
               )}
 
-              {selectedClip.track !== 'audio' && (
+              {selectedClip.track !== 'audio' &&
+                selectedClip.track !== 'adjustment' &&
+                selectedClip.kind !== 'adjustment' && (
                 <div className="space-y-2">
                   <div className="flex gap-2">
                     <button
@@ -2451,7 +3072,9 @@ export default function App() {
               )}
 
               {(selectedClip.track === 'overlay' ||
-                selectedClip.track === 'text') && (
+                selectedClip.track === 'text' ||
+                selectedClip.track === 'adjustment' ||
+                selectedClip.kind === 'adjustment') && (
                 <KeyframeControls
                   clip={selectedClip}
                   currentTime={currentTime}
@@ -2506,6 +3129,7 @@ export default function App() {
                 <EffectsPanel
                   selectedClip={selectedClip}
                   onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  onAddAdjustmentLayer={handleAddAdjustmentLayer}
                 />
               )}
             </div>
@@ -2538,10 +3162,14 @@ export default function App() {
       {/* Multi-Track Dynamic Timeline OR Alight Motion Trackpad / Mobile Tool Overlays */}
       <div
         className={`relative shrink-0 ${
-          selectedClip?.track === 'text' &&
-          mobileEditTool === 'text' &&
-          !isTextColorPickerActive
-            ? 'h-[310px] sm:h-[330px] lg:h-[260px]'
+          (selectedClip?.track === 'text' &&
+            mobileEditTool === 'text' &&
+            !isTextColorPickerActive) ||
+          mobileEditTool === 'shape' ||
+          mobileEditTool === 'adjust' ||
+          mobileEditTool === 'filters' ||
+          mobileEditTool === 'keyframes'
+            ? 'h-[305px] sm:h-[330px] lg:h-[260px]'
             : 'h-[220px] sm:h-[245px] lg:h-[260px]'
         }`}
       >
@@ -2603,7 +3231,9 @@ export default function App() {
               <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
                 <TransformPanel
                   clip={selectedClip}
+                  currentTime={currentTime}
                   onUpdateClip={updateClip}
+                  onUpdateWarp={handleUpdateClipWarp}
                   onOpenTrackpad={() => {
                     setMobileEditTool(null);
                     setShowTrackpad(true);
@@ -2615,7 +3245,36 @@ export default function App() {
           )}
 
         {selectedClip &&
-          (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+          selectedClip.kind === 'shape' &&
+          mobileEditTool === 'shape' && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <span className="truncate text-xs font-semibold text-white">
+                  Фигура · {selectedClip.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-cyan-500 px-2.5 py-1 text-[11px] font-bold text-zinc-950 hover:bg-cyan-400 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <ShapesPanel
+                  selectedClip={selectedClip}
+                  onAddShape={handleAddShapeClip}
+                  onUpdateClip={updateClip}
+                  onOpenAdjust={() => setMobileEditTool('adjust')}
+                />
+              </div>
+            </div>
+          )}
+
+        {selectedClip &&
+          selectedClip.track !== 'audio' &&
+          selectedClip.track !== 'adjustment' &&
+          selectedClip.kind !== 'adjustment' &&
           mobileEditTool === 'mask' && (
             <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
               <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
@@ -2747,6 +3406,97 @@ export default function App() {
             </div>
           )}
 
+        {selectedClip &&
+          selectedClip.track !== 'audio' &&
+          mobileEditTool === 'filters' && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <span className="truncate text-xs font-semibold text-white">
+                  Фильтры · {selectedClip.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/15 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <FilterStripPanel
+                  clip={selectedClip}
+                  customPresets={customColorPresets}
+                  previewFallbackSrc={
+                    project.clips.find(
+                      (c) =>
+                        c.kind === 'image' &&
+                        c.src &&
+                        currentTime >= c.start &&
+                        currentTime < c.start + c.duration
+                    )?.src ??
+                    project.clips.find((c) => c.kind === 'image' && c.src)?.src
+                  }
+                  onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  onOpenAdjust={() => setMobileEditTool('adjust')}
+                  onPresetsChanged={setCustomColorPresets}
+                />
+              </div>
+            </div>
+          )}
+
+        {selectedClip &&
+          selectedClip.track !== 'audio' &&
+          mobileEditTool === 'adjust' && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <span className="truncate text-xs font-semibold text-white">
+                  Настроить · {selectedClip.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/15 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <ColorAdjustPanel
+                  clip={selectedClip}
+                  onUpdateClip={updateClip}
+                  onPresetsChanged={setCustomColorPresets}
+                />
+              </div>
+            </div>
+          )}
+
+        {selectedClip &&
+          selectedClip.track !== 'audio' &&
+          mobileEditTool === 'keyframes' && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <span className="truncate text-xs font-semibold text-white">
+                  Ключи · {selectedClip.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/15 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <KeyframeControls
+                  clip={selectedClip}
+                  currentTime={currentTime}
+                  onSeek={handleSeek}
+                  onUpdateClip={(id, patch) => updateClip(id, patch)}
+                />
+              </div>
+            </div>
+          )}
+
         {showVoiceRecorder && (
           <VoiceRecorderOverlay
             currentTime={currentTime}
@@ -2784,7 +3534,10 @@ export default function App() {
         {selectedClip && selectedClip.track !== 'audio' && showOpacitySlider && (
           <div className="flex items-center gap-3 border-b border-white/10 bg-[#15151a] px-3 py-2">
             <span className="shrink-0 text-[11px] font-medium text-cyan-300">
-              Прозрачность
+              {selectedClip.track === 'adjustment' ||
+              selectedClip.kind === 'adjustment'
+                ? 'Интенсивность'
+                : 'Прозрачность'}
             </span>
             <input
               type="range"
@@ -2838,54 +3591,6 @@ export default function App() {
                 clip={selectedClip}
                 onUpdateChromaKey={handleUpdateChromaKey}
                 onDone={() => setShowChromaKeyPanel(false)}
-              />
-            </div>
-          )}
-        {selectedClip &&
-          (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
-          mobileEditTool === 'filters' && (
-            <div className="border-b border-white/10 bg-[#141418] px-3 py-2.5">
-              <div className="mb-2 flex items-center justify-between">
-                <span className="text-xs font-semibold text-white">
-                  Фильтры
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setMobileEditTool(null)}
-                  className="rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-zinc-200"
-                >
-                  Готово
-                </button>
-              </div>
-              <FilterStripPanel
-                clip={selectedClip}
-                customPresets={customColorPresets}
-                onUpdateClip={(id, patch) => updateClip(id, patch)}
-                onOpenAdjust={() => setMobileEditTool('adjust')}
-                onPresetsChanged={setCustomColorPresets}
-              />
-            </div>
-          )}
-        {selectedClip &&
-          (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
-          mobileEditTool === 'adjust' && (
-            <div className="studio-scrollbar max-h-[45dvh] overflow-y-auto border-b border-white/10 bg-[#141418] px-3 py-3">
-              <div className="mb-2.5 flex items-center justify-between">
-                <span className="text-xs font-semibold text-white">
-                  Настроить (Цветокоррекция)
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setMobileEditTool(null)}
-                  className="rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-zinc-200"
-                >
-                  Готово
-                </button>
-              </div>
-              <ColorAdjustPanel
-                clip={selectedClip}
-                onUpdateClip={updateClip}
-                onPresetsChanged={setCustomColorPresets}
               />
             </div>
           )}
@@ -2976,7 +3681,9 @@ export default function App() {
                 <span>Сжать</span>
               </button>
             )}
-            {selectedClip.track !== 'audio' && (
+            {selectedClip.track !== 'audio' &&
+              selectedClip.track !== 'adjustment' &&
+              selectedClip.kind !== 'adjustment' && (
               <button
                 type="button"
                 onClick={() => {
@@ -3003,7 +3710,9 @@ export default function App() {
                 <span>Трансформ.</span>
               </button>
             )}
-            {selectedClip.track !== 'audio' && (
+            {selectedClip.track !== 'audio' &&
+              selectedClip.track !== 'adjustment' &&
+              selectedClip.kind !== 'adjustment' && (
               <button
                 type="button"
                 onClick={() => {
@@ -3035,12 +3744,54 @@ export default function App() {
                 }`}
               >
                 <Droplet className="h-4 w-4 text-cyan-400" />
-                <span>Прозрачность</span>
+                <span>
+                  {selectedClip.track === 'adjustment' ||
+                  selectedClip.kind === 'adjustment'
+                    ? 'Интенсивность'
+                    : 'Прозрачность'}
+                </span>
               </button>
             )}
-            {(selectedClip.kind === 'image' ||
-              selectedClip.kind === 'video') && (
-              <>
+            {selectedClip.kind === 'shape' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOpacitySlider(false);
+                  setShowChromaKeyPanel(false);
+                  setShowTrackpad(false);
+                  setMobileEditTool((cur) =>
+                    cur === 'shape' ? null : 'shape'
+                  );
+                }}
+                className={`flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  mobileEditTool === 'shape'
+                    ? 'bg-cyan-500/20 text-cyan-300'
+                    : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <PaintBucket className="h-4 w-4 text-cyan-400" />
+                <span>Фигура</span>
+              </button>
+            )}
+            {selectedClip.track !== 'audio' &&
+              selectedClip.track !== 'adjustment' &&
+              selectedClip.kind !== 'adjustment' && (
+                <button
+                  type="button"
+                  onClick={() => handleToggleAdjustmentMask(selectedClip)}
+                  className={`flex h-11 min-w-[78px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    selectedClip.adjustmentMask
+                      ? 'bg-violet-500/25 text-violet-200'
+                      : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Sparkles className="h-4 w-4 text-violet-300" />
+                  <span>Корр. маска</span>
+                </button>
+              )}
+            {selectedClip.track !== 'audio' &&
+              selectedClip.track !== 'adjustment' &&
+              selectedClip.kind !== 'adjustment' && (
                 <button
                   type="button"
                   onClick={() => {
@@ -3063,24 +3814,30 @@ export default function App() {
                   <Shapes className="h-4 w-4 text-cyan-400" />
                   <span>Маска</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowOpacitySlider(false);
-                    setMobileEditTool(null);
-                    setShowChromaKeyPanel((v) => !v);
-                  }}
-                  className={`flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
-                    showChromaKeyPanel
-                      ? 'bg-emerald-500/20 text-emerald-300'
-                      : selectedClip.chromaKeyEnabled
-                        ? 'text-emerald-300 hover:bg-white/5'
-                        : 'text-zinc-200 hover:bg-white/5'
-                  }`}
-                >
-                  <Pipette className="h-4 w-4 text-emerald-400" />
-                  <span>Удалить фон</span>
-                </button>
+              )}
+            {(selectedClip.kind === 'image' ||
+              selectedClip.kind === 'video') && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOpacitySlider(false);
+                  setMobileEditTool(null);
+                  setShowChromaKeyPanel((v) => !v);
+                }}
+                className={`flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  showChromaKeyPanel
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : selectedClip.chromaKeyEnabled
+                      ? 'text-emerald-300 hover:bg-white/5'
+                      : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <Pipette className="h-4 w-4 text-emerald-400" />
+                <span>Удалить фон</span>
+              </button>
+            )}
+            {selectedClip.track !== 'audio' && (
+              <>
                 <button
                   type="button"
                   onClick={() => {
@@ -3117,24 +3874,50 @@ export default function App() {
                   <Palette className="h-4 w-4 text-cyan-400" />
                   <span>Фильтры</span>
                 </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowOpacitySlider(false);
-                    setShowChromaKeyPanel(false);
-                    setMobileEditTool(null);
-                    setShowCropModal(true);
-                  }}
-                  className={`flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
-                    selectedClip.crop
-                      ? 'text-cyan-300 hover:bg-white/5'
-                      : 'text-zinc-200 hover:bg-white/5'
-                  }`}
-                >
-                  <Crop className="h-4 w-4 text-cyan-400" />
-                  <span>Кадрировать</span>
-                </button>
               </>
+            )}
+            {(selectedClip.kind === 'image' ||
+              selectedClip.kind === 'video') && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOpacitySlider(false);
+                  setShowChromaKeyPanel(false);
+                  setMobileEditTool(null);
+                  setShowCropModal(true);
+                }}
+                className={`flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  selectedClip.crop
+                    ? 'text-cyan-300 hover:bg-white/5'
+                    : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <Crop className="h-4 w-4 text-cyan-400" />
+                <span>Кадрировать</span>
+              </button>
+            )}
+            {selectedClip.track !== 'audio' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOpacitySlider(false);
+                  setShowChromaKeyPanel(false);
+                  setShowTrackpad(false);
+                  setMobileEditTool((cur) =>
+                    cur === 'keyframes' ? null : 'keyframes'
+                  );
+                }}
+                className={`flex h-11 min-w-[60px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  mobileEditTool === 'keyframes'
+                    ? 'bg-amber-500/20 text-amber-300'
+                    : (selectedClip.keyframes?.length ?? 0) > 0
+                      ? 'text-amber-300 hover:bg-white/5'
+                      : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <Diamond className="h-4 w-4 text-amber-400" />
+                <span>Ключи</span>
+              </button>
             )}
             {selectedClip.track === 'overlay' && (
               <button
@@ -3143,7 +3926,7 @@ export default function App() {
                 className="flex h-11 min-w-[72px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-amber-300 hover:bg-white/5"
               >
                 <Layers className="h-4 w-4 text-amber-400" />
-                <span>PIP/Ключи</span>
+                <span>PIP/Стиль</span>
               </button>
             )}
             {(selectedClip.track === 'audio' ||
@@ -3263,7 +4046,7 @@ export default function App() {
             </button>
           </div>
         ) : (
-          <div className="grid h-14 grid-cols-7 items-center px-0.5">
+          <div className="no-scrollbar flex h-14 items-center overflow-x-auto px-1">
             {TOOL_TABS.map((tab) => {
               const Icon = tab.icon;
               const isOpen = mobileSheet === tab.id;
@@ -3274,11 +4057,15 @@ export default function App() {
                   onClick={() => {
                     if (tab.id === 'edit') {
                       handleOpenEditTab();
+                    } else if (tab.id === 'overlay') {
+                      setShowOverlayChooser(true);
+                    } else if (tab.id === 'effects') {
+                      handleAddAdjustmentLayer();
                     } else {
                       setMobileSheet(tab.id);
                     }
                   }}
-                  className={`flex h-12 flex-col items-center justify-center gap-0.5 rounded-lg text-[10px] font-medium transition ${
+                  className={`flex h-12 min-w-[54px] flex-1 shrink-0 flex-col items-center justify-center gap-0.5 rounded-lg px-1 text-[10px] font-medium transition ${
                     isOpen
                       ? 'text-cyan-400'
                       : 'text-zinc-300 active:bg-white/5'
@@ -3293,6 +4080,63 @@ export default function App() {
         )}
       </nav>
 
+      {/* Compact Overlay Chooser ("Фото / Видео" vs "Фигуры") */}
+      {showOverlayChooser && (
+        <div
+          onClick={() => setShowOverlayChooser(false)}
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/55 p-3 pb-20 backdrop-blur-xs sm:items-center sm:p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-sm space-y-3 rounded-2xl border border-white/15 bg-[#141418] p-4 shadow-2xl"
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Layers className="h-4 w-4 text-indigo-400" />
+                <h3 className="text-sm font-semibold text-white">
+                  Добавить наложение
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowOverlayChooser(false)}
+                className="rounded-lg bg-zinc-800 px-2.5 py-1 text-[11px] font-medium text-zinc-300 hover:text-white"
+              >
+                Отмена
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOverlayChooser(false);
+                  overlayFileInputRef.current?.click();
+                }}
+                className="flex h-24 flex-col items-center justify-center gap-2 rounded-xl border border-indigo-400/35 bg-indigo-500/10 p-3 text-center transition hover:border-indigo-400 hover:bg-indigo-500/20 active:scale-95"
+              >
+                <ImagePlus className="h-6 w-6 text-indigo-300" />
+                <span className="text-xs font-semibold text-white">
+                  Фото / Видео
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOverlayChooser(false);
+                  setDesktopTab('overlay');
+                  setDesktopOverlayView('shapes');
+                  setMobileSheet('shapes');
+                }}
+                className="flex h-24 flex-col items-center justify-center gap-2 rounded-xl border border-cyan-400/35 bg-cyan-500/10 p-3 text-center transition hover:border-cyan-400 hover:bg-cyan-500/20 active:scale-95"
+              >
+                <Shapes className="h-6 w-6 text-cyan-300" />
+                <span className="text-xs font-semibold text-white">Фигуры</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Mobile Bottom Sheets */}
       {mobileSheet === 'media' && (
         <BottomSheet
@@ -3301,6 +4145,23 @@ export default function App() {
         >
           <MediaPanel
             onAddMediaClip={handleAddMediaClip}
+            onClose={() => setMobileSheet(null)}
+          />
+        </BottomSheet>
+      )}
+      {mobileSheet === 'shapes' && (
+        <BottomSheet
+          title="Фигуры и свойства"
+          onClose={() => setMobileSheet(null)}
+        >
+          <ShapesPanel
+            selectedClip={selectedClip}
+            onAddShape={handleAddShapeClip}
+            onUpdateClip={updateClip}
+            onOpenAdjust={() => {
+              setMobileSheet(null);
+              setMobileEditTool('adjust');
+            }}
             onClose={() => setMobileSheet(null)}
           />
         </BottomSheet>
@@ -3340,6 +4201,7 @@ export default function App() {
               }
               setMobileSheet(null);
               setMobileEditTool('text');
+              setBgColorPickerActive(false);
               setTextColorPicker({clipId: selectedClip.id, field});
             }}
             curveEditActive={curveEditActive}
@@ -3373,6 +4235,7 @@ export default function App() {
           <EffectsPanel
             selectedClip={selectedClip}
             onUpdateClip={(id, patch) => updateClip(id, patch)}
+            onAddAdjustmentLayer={handleAddAdjustmentLayer}
           />
         </BottomSheet>
       )}
@@ -3396,6 +4259,32 @@ export default function App() {
             }}
             onNotify={showTransientNotice}
             onClose={() => setMobileSheet(null)}
+          />
+        </BottomSheet>
+      )}
+      {mobileSheet === 'settings' && (
+        <BottomSheet
+          title="Настройки проекта и сети"
+          onClose={() => setMobileSheet(null)}
+        >
+          <ProjectSettingsPanel
+            aspectRatio={project.aspectRatio}
+            backgroundColor={project.backgroundColor}
+            canvasBackground={project.canvasBackground}
+            user={user}
+            bgColorPickerActive={bgColorPickerActive}
+            onToggleBgColorPicker={(active) => {
+              if (active) {
+                setTextColorPicker(null);
+                setShowChromaKeyPanel(false);
+                setMobileSheet(null);
+              }
+              setBgColorPickerActive(active);
+            }}
+            onUpdateProjectMeta={updateProjectMeta}
+            onUpdateProfile={updateUserProfile}
+            onGiphyKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
+            onNotify={showTransientNotice}
           />
         </BottomSheet>
       )}
@@ -3500,7 +4389,11 @@ export default function App() {
                   />
                 </div>
                 <div className="flex items-center justify-between text-xs text-zinc-400">
-                  <span>Формат {project.aspectRatio} · 30 fps</span>
+                  <span>
+                    Формат {project.aspectRatio} (
+                    {getCanvasDimensions(project.aspectRatio).width}×
+                    {getCanvasDimensions(project.aspectRatio).height}) · 30 fps
+                  </span>
                   <span className="font-mono tabular-nums text-white">
                     {exportProgress}%
                   </span>
@@ -3585,6 +4478,14 @@ export default function App() {
         />
       )}
 
+      <input
+        ref={overlayFileInputRef}
+        type="file"
+        accept="video/*,image/*"
+        multiple
+        onChange={handleOverlayPickerChange}
+        className="hidden"
+      />
       <OfflineIndicator />
     </div>
   );

@@ -78,7 +78,9 @@ interface SliderSpec {
     | 'hue'
     | 'temperature'
     | 'fade'
-    | 'grain';
+    | 'grain'
+    | 'blur'
+    | 'invert';
   label: string;
   min: number;
   max: number;
@@ -91,6 +93,8 @@ const SLIDER_SPECS: SliderSpec[] = [
   {key: 'brightness', label: 'Яркость', min: -100, max: 100, step: 1},
   {key: 'contrast', label: 'Контрастность', min: -100, max: 100, step: 1},
   {key: 'saturate', label: 'Насыщенность', min: -100, max: 100, step: 1},
+  {key: 'blur', label: 'Размытие (Blur)', min: 0, max: 60, step: 1, suffix: 'px'},
+  {key: 'invert', label: 'Инверсия цвета', min: 0, max: 100, step: 1, suffix: '%'},
   {key: 'sharpness', label: 'Резкость', min: 0, max: 100, step: 1},
   {key: 'shadows', label: 'Тени', min: -100, max: 100, step: 1},
   {
@@ -145,6 +149,10 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
         return Math.round((effective.contrast - 1) * 100);
       case 'saturate':
         return Math.round((effective.saturate - 1) * 100);
+      case 'blur':
+        return Math.round(clip.blur ?? 0);
+      case 'invert':
+        return Math.round(effective.invert ?? 0);
       case 'sharpness':
         return Math.round(effective.sharpness);
       case 'shadows':
@@ -173,6 +181,7 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
       temperature: effective.temperature,
       fade: effective.fade,
       grain: effective.grain,
+      invert: effective.invert,
       curves: cloneCurves(effective.curves),
     };
 
@@ -182,6 +191,8 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
       patch.contrast = Math.max(0, Math.min(2, 1 + uiVal / 100));
     } else if (key === 'saturate') {
       patch.saturate = Math.max(0, Math.min(2, 1 + uiVal / 100));
+    } else if (key === 'blur') {
+      patch.blur = Math.max(0, Math.min(60, Math.round(uiVal)));
     } else {
       nextAdj[key] = uiVal;
     }
@@ -199,6 +210,8 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
       brightness: 1,
       contrast: 1,
       saturate: 1,
+      blur: 0,
+      vignette: 0,
       colorAdjustments: {
         sharpness: 0,
         shadows: 0,
@@ -206,6 +219,7 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
         temperature: 0,
         fade: 0,
         grain: 0,
+        invert: 0,
         curves: createIdentityCurves(),
       },
     });
@@ -232,6 +246,7 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
           temperature: effective.temperature,
           fade: effective.fade,
           grain: effective.grain,
+          invert: effective.invert,
           curves: nextCurves,
         },
       },
