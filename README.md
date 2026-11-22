@@ -1,3 +1,5 @@
+https://github.com/user-attachments/assets/38d62424-1dbf-488e-9078-64442cbb5f7f
+
 <div align="center">
 
 # 🎬 CutSync
