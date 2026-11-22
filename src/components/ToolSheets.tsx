@@ -1,4 +1,4 @@
-import React, {useEffect, useState} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
   AlignCenter,
   AlignLeft,
@@ -9,8 +9,10 @@ import {
   Film,
   FlipHorizontal,
   Layers,
+  Minimize2,
   Music,
   Plus,
+  Scissors,
   Send,
   Sparkles,
   Trash2,
@@ -20,6 +22,7 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
+import {ScrubNumberField} from './ScrubNumberField.tsx';
 import {
   BUILTIN_FONTS,
   loadCustomFont,
@@ -31,7 +34,13 @@ import {
   generateKeyframePreset,
   upsertKeyframeAtTime,
 } from '../lib/keyframeEngine.ts';
-import {uploadFileForP2P} from '../lib/lanSyncBridge.ts';
+import {
+  cancelNativeVideoCompression,
+  compressClipMedia,
+  isNativeMedia3Available,
+  uploadFileForP2P,
+} from '../lib/lanSyncBridge.ts';
+import type {CompressedMediaResult} from '../lib/lanSyncBridge.ts';
 import {
   SAMPLE_MEDIA_ASSETS,
   SYNTH_AUDIO_PRESETS,
@@ -256,12 +265,20 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
       {/* Live Keyframed Values at Playhead */}
       {keyframes.length > 0 && (
         <div className="grid grid-cols-2 gap-2 border-t border-white/10 pt-2 text-[11px] text-zinc-300">
-          <label className="space-y-1">
-            <div className="flex justify-between">
+          <div className="space-y-1">
+            <div className="flex items-center justify-between gap-1">
               <span>Масштаб (ключ)</span>
-              <span className="font-mono">
-                {Math.round(currentEval.scale * 100)}%
-              </span>
+              <ScrubNumberField
+                compact
+                accent="amber"
+                value={Math.round(currentEval.scale * 100)}
+                min={15}
+                max={250}
+                step={1}
+                suffix="%"
+                ariaLabel="Масштаб ключа"
+                onChange={(pct) => handleUpdateActiveKfField({scale: pct / 100})}
+              />
             </div>
             <input
               type="range"
@@ -274,13 +291,21 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
               }
               className="w-full accent-amber-400"
             />
-          </label>
-          <label className="space-y-1">
-            <div className="flex justify-between">
+          </div>
+          <div className="space-y-1">
+            <div className="flex items-center justify-between gap-1">
               <span>Поворот (ключ)</span>
-              <span className="font-mono">
-                {Math.round(currentEval.rotation)}°
-              </span>
+              <ScrubNumberField
+                compact
+                accent="amber"
+                value={Math.round(currentEval.rotation)}
+                min={-180}
+                max={180}
+                step={1}
+                suffix="°"
+                ariaLabel="Поворот ключа"
+                onChange={(deg) => handleUpdateActiveKfField({rotation: deg})}
+              />
             </div>
             <input
               type="range"
@@ -293,7 +318,7 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
               }
               className="w-full accent-amber-400"
             />
-          </label>
+          </div>
         </div>
       )}
 
@@ -601,12 +626,22 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
               </div>
             </div>
 
-            <label className="block space-y-1 text-xs text-zinc-300">
-              <div className="flex justify-between">
+            <div className="space-y-1 text-xs text-zinc-300">
+              <div className="flex items-center justify-between">
                 <span>Размер (PIP)</span>
-                <span className="font-mono tabular-nums">
-                  {Math.round((selectedClip.mediaScale ?? 0.42) * 100)}%
-                </span>
+                <ScrubNumberField
+                  compact
+                  accent="indigo"
+                  value={Math.round((selectedClip.mediaScale ?? 0.42) * 100)}
+                  min={10}
+                  max={250}
+                  step={1}
+                  suffix="%"
+                  ariaLabel="Размер PIP"
+                  onChange={(pct) =>
+                    onUpdateClip(selectedClip.id, {mediaScale: pct / 100})
+                  }
+                />
               </div>
               <input
                 type="range"
@@ -621,15 +656,25 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                 }
                 className="w-full accent-indigo-400"
               />
-            </label>
+            </div>
 
             <div className="grid grid-cols-2 gap-3">
-              <label className="block space-y-1 text-xs text-zinc-300">
-                <div className="flex justify-between">
+              <div className="space-y-1 text-xs text-zinc-300">
+                <div className="flex items-center justify-between">
                   <span>Поворот</span>
-                  <span className="font-mono tabular-nums">
-                    {selectedClip.rotation ?? 0}°
-                  </span>
+                  <ScrubNumberField
+                    compact
+                    accent="indigo"
+                    value={Math.round(selectedClip.rotation ?? 0)}
+                    min={-180}
+                    max={180}
+                    step={1}
+                    suffix="°"
+                    ariaLabel="Поворот PIP"
+                    onChange={(deg) =>
+                      onUpdateClip(selectedClip.id, {rotation: deg})
+                    }
+                  />
                 </div>
                 <input
                   type="range"
@@ -644,14 +689,24 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   }
                   className="w-full accent-indigo-400"
                 />
-              </label>
+              </div>
 
-              <label className="block space-y-1 text-xs text-zinc-300">
-                <div className="flex justify-between">
+              <div className="space-y-1 text-xs text-zinc-300">
+                <div className="flex items-center justify-between">
                   <span>Скругление</span>
-                  <span className="font-mono tabular-nums">
-                    {selectedClip.borderRadius ?? 20}px
-                  </span>
+                  <ScrubNumberField
+                    compact
+                    accent="indigo"
+                    value={selectedClip.borderRadius ?? 20}
+                    min={0}
+                    max={120}
+                    step={1}
+                    suffix="px"
+                    ariaLabel="Скругление углов"
+                    onChange={(px) =>
+                      onUpdateClip(selectedClip.id, {borderRadius: px})
+                    }
+                  />
                 </div>
                 <input
                   type="range"
@@ -666,14 +721,24 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   }
                   className="w-full accent-indigo-400"
                 />
-              </label>
+              </div>
 
-              <label className="block space-y-1 text-xs text-zinc-300">
-                <div className="flex justify-between">
+              <div className="space-y-1 text-xs text-zinc-300">
+                <div className="flex items-center justify-between">
                   <span>Рамка</span>
-                  <span className="font-mono tabular-nums">
-                    {selectedClip.borderWidth ?? 0}px
-                  </span>
+                  <ScrubNumberField
+                    compact
+                    accent="indigo"
+                    value={selectedClip.borderWidth ?? 0}
+                    min={0}
+                    max={24}
+                    step={1}
+                    suffix="px"
+                    ariaLabel="Толщина рамки"
+                    onChange={(px) =>
+                      onUpdateClip(selectedClip.id, {borderWidth: px})
+                    }
+                  />
                 </div>
                 <input
                   type="range"
@@ -688,7 +753,7 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   }
                   className="w-full accent-indigo-400"
                 />
-              </label>
+              </div>
 
               <div className="flex items-end justify-between gap-2 pb-0.5">
                 <span className="text-xs text-zinc-300">Цвет рамки</span>
@@ -1024,11 +1089,23 @@ export const TextPanel: React.FC<TextPanelProps> = ({
           </div>
 
           <div>
-            <div className="mb-1.5 flex justify-between text-xs text-zinc-400">
+            <div className="mb-1.5 flex items-center justify-between text-xs text-zinc-400">
               <span>Размер шрифта</span>
-              <span className="font-mono tabular-nums text-zinc-200">
-                {style.fontSize}px
-              </span>
+              <ScrubNumberField
+                compact
+                accent="cyan"
+                value={style.fontSize}
+                min={16}
+                max={160}
+                step={1}
+                suffix="px"
+                ariaLabel="Размер шрифта"
+                onChange={(px) =>
+                  onUpdateClip(selectedClip.id, {
+                    textStyle: {...style, fontSize: px},
+                  })
+                }
+              />
             </div>
             <input
               type="range"
@@ -1246,12 +1323,22 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
       )}
 
       <div className="grid grid-cols-2 gap-3 border-t border-white/10 pt-3">
-        <label className="space-y-1 text-xs text-zinc-400">
-          <div className="flex justify-between">
+        <div className="space-y-1 text-xs text-zinc-400">
+          <div className="flex items-center justify-between gap-1">
             <span>Яркость</span>
-            <span className="font-mono tabular-nums text-zinc-200">
-              {Math.round(selectedClip.brightness * 100)}%
-            </span>
+            <ScrubNumberField
+              compact
+              accent="cyan"
+              value={Math.round(selectedClip.brightness * 100)}
+              min={25}
+              max={200}
+              step={1}
+              suffix="%"
+              ariaLabel="Яркость"
+              onChange={(pct) =>
+                onUpdateClip(selectedClip.id, {brightness: pct / 100})
+              }
+            />
           </div>
           <input
             type="range"
@@ -1266,14 +1353,24 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             }
             className="w-full accent-cyan-400"
           />
-        </label>
+        </div>
 
-        <label className="space-y-1 text-xs text-zinc-400">
-          <div className="flex justify-between">
+        <div className="space-y-1 text-xs text-zinc-400">
+          <div className="flex items-center justify-between gap-1">
             <span>Контраст</span>
-            <span className="font-mono tabular-nums text-zinc-200">
-              {Math.round(selectedClip.contrast * 100)}%
-            </span>
+            <ScrubNumberField
+              compact
+              accent="cyan"
+              value={Math.round(selectedClip.contrast * 100)}
+              min={25}
+              max={200}
+              step={1}
+              suffix="%"
+              ariaLabel="Контраст"
+              onChange={(pct) =>
+                onUpdateClip(selectedClip.id, {contrast: pct / 100})
+              }
+            />
           </div>
           <input
             type="range"
@@ -1286,14 +1383,24 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             }
             className="w-full accent-cyan-400"
           />
-        </label>
+        </div>
 
-        <label className="space-y-1 text-xs text-zinc-400">
-          <div className="flex justify-between">
+        <div className="space-y-1 text-xs text-zinc-400">
+          <div className="flex items-center justify-between gap-1">
             <span>Насыщенность</span>
-            <span className="font-mono tabular-nums text-zinc-200">
-              {Math.round(selectedClip.saturate * 100)}%
-            </span>
+            <ScrubNumberField
+              compact
+              accent="cyan"
+              value={Math.round(selectedClip.saturate * 100)}
+              min={0}
+              max={250}
+              step={1}
+              suffix="%"
+              ariaLabel="Насыщенность"
+              onChange={(pct) =>
+                onUpdateClip(selectedClip.id, {saturate: pct / 100})
+              }
+            />
           </div>
           <input
             type="range"
@@ -1306,14 +1413,24 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             }
             className="w-full accent-cyan-400"
           />
-        </label>
+        </div>
 
-        <label className="space-y-1 text-xs text-zinc-400">
-          <div className="flex justify-between">
+        <div className="space-y-1 text-xs text-zinc-400">
+          <div className="flex items-center justify-between gap-1">
             <span>Прозрачность</span>
-            <span className="font-mono tabular-nums text-zinc-200">
-              {Math.round(selectedClip.opacity * 100)}%
-            </span>
+            <ScrubNumberField
+              compact
+              accent="cyan"
+              value={Math.round(selectedClip.opacity * 100)}
+              min={0}
+              max={100}
+              step={1}
+              suffix="%"
+              ariaLabel="Прозрачность"
+              onChange={(pct) =>
+                onUpdateClip(selectedClip.id, {opacity: pct / 100})
+              }
+            />
           </div>
           <input
             type="range"
@@ -1326,14 +1443,22 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             }
             className="w-full accent-cyan-400"
           />
-        </label>
+        </div>
 
-        <label className="space-y-1 text-xs text-zinc-400">
-          <div className="flex justify-between">
+        <div className="space-y-1 text-xs text-zinc-400">
+          <div className="flex items-center justify-between gap-1">
             <span>Размытие</span>
-            <span className="font-mono tabular-nums text-zinc-200">
-              {selectedClip.blur ?? 0}px
-            </span>
+            <ScrubNumberField
+              compact
+              accent="cyan"
+              value={selectedClip.blur ?? 0}
+              min={0}
+              max={32}
+              step={1}
+              suffix="px"
+              ariaLabel="Размытие"
+              onChange={(px) => onUpdateClip(selectedClip.id, {blur: px})}
+            />
           </div>
           <input
             type="range"
@@ -1346,14 +1471,24 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             }
             className="w-full accent-cyan-400"
           />
-        </label>
+        </div>
 
-        <label className="space-y-1 text-xs text-zinc-400">
-          <div className="flex justify-between">
+        <div className="space-y-1 text-xs text-zinc-400">
+          <div className="flex items-center justify-between gap-1">
             <span>Виньетка</span>
-            <span className="font-mono tabular-nums text-zinc-200">
-              {Math.round((selectedClip.vignette ?? 0) * 100)}%
-            </span>
+            <ScrubNumberField
+              compact
+              accent="cyan"
+              value={Math.round((selectedClip.vignette ?? 0) * 100)}
+              min={0}
+              max={100}
+              step={1}
+              suffix="%"
+              ariaLabel="Виньетка"
+              onChange={(pct) =>
+                onUpdateClip(selectedClip.id, {vignette: pct / 100})
+              }
+            />
           </div>
           <input
             type="range"
@@ -1366,7 +1501,7 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             }
             className="w-full accent-cyan-400"
           />
-        </label>
+        </div>
       </div>
     </div>
   );
@@ -1439,11 +1574,21 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
       {selectedClip &&
         (selectedClip.track === 'audio' || selectedClip.kind === 'video') && (
           <div className="rounded-xl border border-white/10 bg-zinc-900/70 p-3">
-            <div className="mb-1 flex justify-between text-xs text-zinc-300">
-              <span>Громкость: {selectedClip.name}</span>
-              <span className="font-mono tabular-nums">
-                {Math.round(selectedClip.volume * 100)}%
-              </span>
+            <div className="mb-1 flex items-center justify-between gap-2 text-xs text-zinc-300">
+              <span className="truncate">Громкость: {selectedClip.name}</span>
+              <ScrubNumberField
+                compact
+                accent="emerald"
+                value={Math.round(selectedClip.volume * 100)}
+                min={0}
+                max={100}
+                step={1}
+                suffix="%"
+                ariaLabel="Громкость клипа"
+                onChange={(pct) =>
+                  onUpdateClip(selectedClip.id, {volume: pct / 100})
+                }
+              />
             </div>
             <input
               type="range"
@@ -1940,12 +2085,296 @@ export const BottomSheet: React.FC<BottomSheetProps> = ({
   );
 };
 
+interface CompressPreset {
+  id: string;
+  label: string;
+  desc: string;
+  height: number;
+  bitrate: number;
+}
+
+const COMPRESS_PRESETS: CompressPreset[] = [
+  {
+    id: '720p',
+    label: '720p (HD)',
+    desc: '2.2 Мбит/с · Хорошее качество',
+    height: 720,
+    bitrate: 2_200_000,
+  },
+  {
+    id: '480p',
+    label: '480p (SD)',
+    desc: '1.1 Мбит/с · Оптимально для сети',
+    height: 480,
+    bitrate: 1_100_000,
+  },
+  {
+    id: '360p-low',
+    label: '360p · Низкий битрейт',
+    desc: '550 кбит/с · Минимальный вес для P2P',
+    height: 360,
+    bitrate: 550_000,
+  },
+];
+
+function formatBytes(bytes: number): string {
+  if (!bytes || bytes <= 0) return '—';
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} КБ`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+interface CompressMediaModalProps {
+  clip: Clip;
+  onApplyCompressed: (result: CompressedMediaResult) => void;
+  onClose: () => void;
+}
+
+export const CompressMediaModal: React.FC<CompressMediaModalProps> = ({
+  clip,
+  onApplyCompressed,
+  onClose,
+}) => {
+  const [selectedPresetId, setSelectedPresetId] = useState<string>('480p');
+  const [customBitrateKbps, setCustomBitrateKbps] = useState<number>(1100);
+  const [compressing, setCompressing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [result, setResult] = useState<CompressedMediaResult | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  const selectedPreset =
+    COMPRESS_PRESETS.find((p) => p.id === selectedPresetId) ??
+    COMPRESS_PRESETS[1];
+  const isNativeMedia3 = isNativeMedia3Available() && clip.kind === 'video';
+
+  useEffect(() => {
+    setCustomBitrateKbps(Math.round(selectedPreset.bitrate / 1000));
+  }, [selectedPreset.id, selectedPreset.bitrate]);
+
+  const handleStart = async () => {
+    if (!clip.src || (clip.kind !== 'video' && clip.kind !== 'image')) return;
+    setCompressing(true);
+    setProgress(0);
+    setErrorMsg(null);
+    setResult(null);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const res = await compressClipMedia({
+        layerId: clip.id,
+        kind: clip.kind,
+        sourceUrl: clip.src,
+        fileName: clip.mediaFileName || clip.name || 'clip.mp4',
+        targetHeight: selectedPreset.height,
+        targetBitrate: customBitrateKbps * 1000,
+        onProgress: (pct) => setProgress(pct),
+        signal: controller.signal,
+      });
+      setResult(res);
+      onApplyCompressed(res);
+    } catch (err) {
+      if (!controller.signal.aborted) {
+        setErrorMsg(
+          err instanceof Error ? err.message : 'Не удалось сжать медиафайл'
+        );
+      }
+    } finally {
+      setCompressing(false);
+      abortRef.current = null;
+    }
+  };
+
+  const handleCancel = () => {
+    abortRef.current?.abort();
+    void cancelNativeVideoCompression(clip.id);
+    setCompressing(false);
+  };
+
+  const savedPercent =
+    result && result.originalSizeBytes > 0
+      ? Math.max(
+          0,
+          Math.round(
+            (1 - result.compressedSizeBytes / result.originalSizeBytes) * 100
+          )
+        )
+      : null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-0 backdrop-blur-xs sm:items-center sm:p-4">
+      <div className="w-full max-w-md space-y-4 rounded-t-3xl border border-white/15 bg-[#141418] p-5 shadow-2xl sm:rounded-2xl">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <Minimize2 className="h-4 w-4 shrink-0 text-cyan-400" />
+              <h3 className="truncate text-base font-semibold text-white">
+                Сжать исходник (Качество)
+              </h3>
+            </div>
+            <p className="mt-0.5 truncate text-xs text-zinc-400">
+              {clip.name} ·{' '}
+              {isNativeMedia3
+                ? 'Media3 Transformer (H.264 / AAC)'
+                : 'Локальное перекодирование'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              if (compressing) handleCancel();
+              onClose();
+            }}
+            aria-label="Закрыть диалог сжатия"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-zinc-300 hover:text-white"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="space-y-2">
+          <p className="text-xs font-medium text-zinc-400">
+            Выберите разрешение и профиль сжатия
+          </p>
+          <div className="space-y-2">
+            {COMPRESS_PRESETS.map((preset) => {
+              const active = preset.id === selectedPresetId;
+              return (
+                <button
+                  key={preset.id}
+                  type="button"
+                  disabled={compressing}
+                  onClick={() => setSelectedPresetId(preset.id)}
+                  className={`flex w-full items-center justify-between rounded-xl border px-3.5 py-2.5 text-left transition ${
+                    active
+                      ? 'border-cyan-400 bg-cyan-500/15'
+                      : 'border-white/10 bg-zinc-900/80 hover:border-white/25'
+                  } disabled:opacity-60`}
+                >
+                  <div>
+                    <p
+                      className={`text-xs font-semibold ${
+                        active ? 'text-cyan-200' : 'text-white'
+                      }`}
+                    >
+                      {preset.label}
+                    </p>
+                    <p className="text-[11px] text-zinc-400">{preset.desc}</p>
+                  </div>
+                  {active && <Check className="h-4 w-4 shrink-0 text-cyan-400" />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <label className="block space-y-1.5 rounded-xl border border-white/10 bg-zinc-900/60 p-3 text-xs text-zinc-300">
+          <div className="flex items-center justify-between">
+            <span>Целевой битрейт</span>
+            <span className="font-mono font-semibold tabular-nums text-cyan-300">
+              {customBitrateKbps >= 1000
+                ? `${(customBitrateKbps / 1000).toFixed(1)} Мбит/с`
+                : `${customBitrateKbps} кбит/с`}
+            </span>
+          </div>
+          <input
+            type="range"
+            min={350}
+            max={4000}
+            step={50}
+            disabled={compressing}
+            value={customBitrateKbps}
+            onChange={(e) => setCustomBitrateKbps(Number(e.target.value))}
+            className="w-full accent-cyan-400"
+          />
+        </label>
+
+        {compressing && (
+          <div className="space-y-2 rounded-xl border border-cyan-500/30 bg-cyan-500/10 p-3">
+            <div className="flex items-center justify-between text-xs">
+              <span className="font-medium text-cyan-200">
+                Перекодирование исходника...
+              </span>
+              <span className="font-mono tabular-nums text-white">
+                {progress}%
+              </span>
+            </div>
+            <div className="h-2 w-full overflow-hidden rounded-full bg-zinc-800">
+              <div
+                style={{width: `${progress}%`}}
+                className="h-full bg-cyan-400 transition-all duration-150"
+              />
+            </div>
+          </div>
+        )}
+
+        {errorMsg && (
+          <p className="rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+            {errorMsg}
+          </p>
+        )}
+
+        {result && (
+          <div className="space-y-1 rounded-xl border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs">
+            <p className="font-semibold text-emerald-300">
+              Исходник сжат и обновлён в клипе
+            </p>
+            <p className="font-mono text-[11px] text-zinc-200">
+              {formatBytes(result.originalSizeBytes)} →{' '}
+              {formatBytes(result.compressedSizeBytes)}
+              {savedPercent !== null ? ` (−${savedPercent}%)` : ''}
+            </p>
+          </div>
+        )}
+
+        <div className="flex gap-2 pt-1">
+          {compressing ? (
+            <button
+              type="button"
+              onClick={handleCancel}
+              className="h-11 flex-1 rounded-xl border border-rose-500/40 bg-rose-500/15 text-xs font-semibold text-rose-300 hover:bg-rose-500/25"
+            >
+              Отменить сжатие
+            </button>
+          ) : result ? (
+            <button
+              type="button"
+              onClick={onClose}
+              className="h-11 flex-1 rounded-xl bg-emerald-500 text-xs font-semibold text-zinc-950 hover:bg-emerald-400"
+            >
+              Готово
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={onClose}
+                className="h-11 rounded-xl border border-white/10 bg-zinc-900 px-4 text-xs font-medium text-zinc-300 hover:bg-zinc-800"
+              >
+                Закрыть
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleStart()}
+                className="h-11 flex-1 rounded-xl bg-cyan-500 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 active:scale-[0.99]"
+              >
+                Сжать и применить
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const TOOL_TABS: Array<{
   id: ActiveToolTab;
   label: string;
   icon: React.FC<{className?: string}>;
 }> = [
-  {id: 'edit', label: 'Монтаж', icon: Film},
+  {id: 'edit', label: 'Изменить', icon: Scissors},
   {id: 'media', label: 'Медиа', icon: Plus},
   {id: 'overlay', label: 'Наложение', icon: Layers},
   {id: 'text', label: 'Текст', icon: Type},

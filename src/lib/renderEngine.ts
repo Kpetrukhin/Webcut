@@ -800,104 +800,108 @@ export function renderCompositeFrame(
     trackList.filter((t) => t.hidden).map((t) => t.id)
   );
 
-  const orderedClipsForType = (type: Clip['track']) => {
-    const matchingTracks = trackList.filter((t) => t.type === type);
-    const trackOrder = new Map<string, number>();
-    matchingTracks.forEach((t, i) => trackOrder.set(t.id, i));
+  const trackOrder = new Map<string, number>();
+  trackList.forEach((t, i) => trackOrder.set(t.id, i));
 
-    return clips
-      .filter(
-        (c) =>
-          c.track === type &&
-          !hiddenTrackIds.has(c.trackId) &&
-          time >= c.start &&
-          time < c.start + c.duration
-      )
-      .sort((a, b) => {
-        const ta = trackOrder.get(a.trackId) ?? 0;
-        const tb = trackOrder.get(b.trackId) ?? 0;
-        if (ta !== tb) return ta - tb;
-        return a.start - b.start;
-      });
-  };
+  const fallbackRank = (type: Clip['track']) =>
+    type === 'video' ? 0 : type === 'overlay' ? 1 : 2;
 
-  // 1. Base Video Tracks
-  for (const clip of orderedClipsForType('video')) {
-    const progress = Math.max(
-      0,
-      Math.min(1, (time - clip.start) / Math.max(0.01, clip.duration))
-    );
-    if (clip.mediaStatus === 'DOWNLOADING') {
-      drawCoverMedia(
+  const activeVisualClips = clips
+    .filter(
+      (c) =>
+        c.track !== 'audio' &&
+        !hiddenTrackIds.has(c.trackId) &&
+        time >= c.start &&
+        time < c.start + c.duration
+    )
+    .sort((a, b) => {
+      const ta = trackOrder.get(a.trackId);
+      const tb = trackOrder.get(b.trackId);
+      if (ta !== undefined && tb !== undefined && ta !== tb) {
+        return ta - tb;
+      }
+      if (ta !== undefined && tb === undefined) return -1;
+      if (ta === undefined && tb !== undefined) return 1;
+      const fa = fallbackRank(a.track);
+      const fb = fallbackRank(b.track);
+      if (fa !== fb) return fa - fb;
+      return a.start - b.start;
+    });
+
+  // Render all visual layers from top track (lowest Z-index / background)
+  // to bottom track (highest Z-index / foreground).
+  for (const clip of activeVisualClips) {
+    if (clip.track === 'video') {
+      const progress = Math.max(
+        0,
+        Math.min(1, (time - clip.start) / Math.max(0.01, clip.duration))
+      );
+      if (clip.mediaStatus === 'DOWNLOADING') {
+        drawCoverMedia(
+          ctx,
+          null,
+          cw,
+          ch,
+          clip,
+          time,
+          progress,
+          selectedClipId,
+          collaborators,
+          currentUserId
+        );
+      } else if (clip.kind === 'image' && clip.src) {
+        const img = pool.getImage(clip.src);
+        drawCoverMedia(
+          ctx,
+          img,
+          cw,
+          ch,
+          clip,
+          time,
+          progress,
+          selectedClipId,
+          collaborators,
+          currentUserId
+        );
+      } else if (clip.kind === 'video' && clip.src) {
+        const vid = pool.getVideo(clip.src);
+        drawCoverMedia(
+          ctx,
+          vid.readyState >= 2 ? vid : null,
+          cw,
+          ch,
+          clip,
+          time,
+          progress,
+          selectedClipId,
+          collaborators,
+          currentUserId
+        );
+      }
+    } else if (clip.track === 'overlay') {
+      drawOverlayClip(
         ctx,
-        null,
         cw,
         ch,
         clip,
         time,
-        progress,
+        pool,
         selectedClipId,
         collaborators,
         currentUserId
       );
-    } else if (clip.kind === 'image' && clip.src) {
-      const img = pool.getImage(clip.src);
-      drawCoverMedia(
+    } else if (clip.track === 'text') {
+      drawTextClip(
         ctx,
-        img,
         cw,
         ch,
         clip,
         time,
-        progress,
-        selectedClipId,
-        collaborators,
-        currentUserId
-      );
-    } else if (clip.kind === 'video' && clip.src) {
-      const vid = pool.getVideo(clip.src);
-      drawCoverMedia(
-        ctx,
-        vid.readyState >= 2 ? vid : null,
-        cw,
-        ch,
-        clip,
-        time,
-        progress,
         selectedClipId,
         collaborators,
         currentUserId
       );
     }
-  }
-
-  // 2. Overlay / PIP Tracks
-  for (const clip of orderedClipsForType('overlay')) {
-    drawOverlayClip(
-      ctx,
-      cw,
-      ch,
-      clip,
-      time,
-      pool,
-      selectedClipId,
-      collaborators,
-      currentUserId
-    );
-  }
-
-  // 3. Text Tracks
-  for (const clip of orderedClipsForType('text')) {
-    drawTextClip(
-      ctx,
-      cw,
-      ch,
-      clip,
-      time,
-      selectedClipId,
-      collaborators,
-      currentUserId
-    );
   }
 
   // 4. Magnetic Center Snap Guide Lines

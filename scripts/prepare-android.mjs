@@ -77,7 +77,7 @@ if (fs.existsSync(appGradlePath)) {
   if (!appGradle.includes('jvmTarget =')) {
     appGradle = appGradle.replace(
       'buildTypes {',
-      `compileOptions {\n        sourceCompatibility JavaVersion.VERSION_21\n        targetCompatibility JavaVersion.VERSION_21\n    }\n    kotlinOptions {\n        jvmTarget = '21'\n    }\n    packaging {\n        resources {\n            excludes += ['META-INF/INDEX.LIST', 'META-INF/io.netty.versions.properties', 'META-INF/DEPENDENCIES', 'META-INF/LICENSE*', 'META-INF/NOTICE*', 'META-INF/*.kotlin_module']\n        }\n    }\n    buildTypes {`
+      `compileOptions {\n        sourceCompatibility JavaVersion.VERSION_21\n        targetCompatibility JavaVersion.VERSION_21\n    }\n    kotlinOptions {\n        jvmTarget = '21'\n        freeCompilerArgs += ['-opt-in=androidx.media3.common.util.UnstableApi']\n    }\n    packaging {\n        resources {\n            excludes += ['META-INF/INDEX.LIST', 'META-INF/io.netty.versions.properties', 'META-INF/DEPENDENCIES', 'META-INF/LICENSE*', 'META-INF/NOTICE*', 'META-INF/*.kotlin_module']\n        }\n    }\n    buildTypes {`
     );
   }
 
@@ -98,8 +98,21 @@ if (fs.existsSync(appGradlePath)) {
     );
   }
 
+  if (!appGradle.includes('androidx.media3:media3-transformer')) {
+    const media3Deps = `
+    def media3Version = '1.5.1'
+    implementation "androidx.media3:media3-transformer:$media3Version"
+    implementation "androidx.media3:media3-effect:$media3Version"
+    implementation "androidx.media3:media3-common:$media3Version"
+`;
+    appGradle = appGradle.replace(
+      "implementation project(':capacitor-android')",
+      `implementation project(':capacitor-android')${media3Deps}`
+    );
+  }
+
   fs.writeFileSync(appGradlePath, appGradle, 'utf-8');
-  console.log('Patched android/app/build.gradle with Ktor 2.3.12 CIO + Kotlin 21.');
+  console.log('Patched android/app/build.gradle with Ktor 2.3.12 CIO, Media3 1.5.1 Transformer + Kotlin 21.');
 }
 
 // 4. Copy native Kotlin Ktor P2P plugin files & wire MainActivity.java

@@ -1,8 +1,25 @@
 package com.cutsync.webcut
 
 import android.content.Context
+import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.Looper
 import android.webkit.MimeTypeMap
+import androidx.annotation.OptIn
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.effect.Presentation
+import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
+import androidx.media3.transformer.EditedMediaItem
+import androidx.media3.transformer.Effects
+import androidx.media3.transformer.ExportException
+import androidx.media3.transformer.ExportResult
+import androidx.media3.transformer.ProgressHolder
+import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.cio.CIO as ClientCIO
 import io.ktor.client.request.prepareGet
@@ -109,6 +126,12 @@ class KtorLanEngine(private val context: Context) {
     var onDownloadProgress: ((String, Int) -> Unit)? = null
     var onDownloadComplete: ((String, String, String) -> Unit)? = null
     var onDownloadError: ((String, String) -> Unit)? = null
+    var onCompressProgress: ((String, Int) -> Unit)? = null
+    var onCompressComplete: ((String, String, String, String, Long, Long) -> Unit)? = null
+    var onCompressError: ((String, String) -> Unit)? = null
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val activeTransformers = ConcurrentHashMap<String, Transformer>()
 
     fun getLocalNetworkInterfaces(): List<NetIfaceInfo> {
         val result = mutableListOf<NetIfaceInfo>()
@@ -551,6 +574,13 @@ class KtorLanEngine(private val context: Context) {
                 c.put("mediaRemoteUrl", mediaUrl)
                 c.put("mediaFileName", fileName)
                 c.put("src", mediaUrl)
+                val incomingClip = msg.optJSONObject("clip")
+                if (incomingClip != null) {
+                    if (incomingClip.has("name")) c.put("name", incomingClip.optString("name"))
+                    if (incomingClip.has("kind")) c.put("kind", incomingClip.optString("kind"))
+                    if (incomingClip.has("trimStart")) c.put("trimStart", incomingClip.optDouble("trimStart", 0.0))
+                    if (incomingClip.has("sourceDuration")) c.put("sourceDuration", incomingClip.optDouble("sourceDuration", c.optDouble("sourceDuration", 60.0)))
+                }
                 found = true
                 break
             }
@@ -634,6 +664,72 @@ class KtorLanEngine(private val context: Context) {
                 for (i in 0 until clips.length()) {
                     val c = clips.optJSONObject(i) ?: continue
                     if (c.optString("id") != clipId) nextClips.put(c)
+                }
+                hostRoomState.put("clips", nextClips)
+            }
+            "op:track_reorder" -> {
+                val trackIds = msg.optJSONArray("trackIds") ?: return
+                val tracks = hostRoomState.optJSONArray("tracks") ?: return
+                val byId = LinkedHashMap<String, JSONObject>()
+                for (i in 0 until tracks.length()) {
+                    val t = tracks.optJSONObject(i) ?: continue
+                    byId[t.optString("id")] = t
+                }
+                val reordered = JSONArray()
+                val seen = HashSet<String>()
+                for (i in 0 until trackIds.length()) {
+                    val id = trackIds.optString(i)
+                    val t = byId[id]
+                    if (t != null && seen.add(id)) {
+                        reordered.put(t)
+                    }
+                }
+                for ((id, t) in byId) {
+                    if (seen.add(id)) {
+                        reordered.put(t)
+                    }
+                }
+                hostRoomState.put("tracks", reordered)
+            }
+            "op:clip_duplicate" -> {
+                val clipId = msg.optString("clipId")
+                val newClipId = msg.optString("newClipId")
+                val clips = hostRoomState.optJSONArray("clips") ?: return
+                var targetIdx = -1
+                var targetClip: JSONObject? = null
+                for (i in 0 until clips.length()) {
+                    val c = clips.optJSONObject(i) ?: continue
+                    if (c.optString("id") == newClipId) return
+                    if (c.optString("id") == clipId) {
+                        targetIdx = i
+                        targetClip = c
+                    }
+                }
+                if (targetIdx == -1 || targetClip == null) return
+                val copyStart = Math.round((targetClip.optDouble("start", 0.0) + targetClip.optDouble("duration", 0.0)) * 100.0) / 100.0
+                val dur = targetClip.optDouble("duration", 0.0)
+                val targetTrackId = targetClip.optString("trackId")
+                val copy = JSONObject(targetClip.toString()).apply {
+                    put("id", newClipId)
+                    put("name", "${targetClip.optString("name")} (копия)")
+                    put("start", copyStart)
+                    remove("lockedByUserId")
+                    remove("lockedByUserName")
+                    remove("lockedByUserColor")
+                }
+                val nextClips = JSONArray()
+                for (i in 0 until clips.length()) {
+                    val c = clips.optJSONObject(i) ?: continue
+                    if (c.optString("id") != clipId &&
+                        c.optString("trackId") == targetTrackId &&
+                        c.optDouble("start", 0.0) >= copyStart - 0.05
+                    ) {
+                        c.put("start", Math.round((c.optDouble("start", 0.0) + dur) * 100.0) / 100.0)
+                    }
+                    nextClips.put(c)
+                    if (i == targetIdx) {
+                        nextClips.put(copy)
+                    }
                 }
                 hostRoomState.put("clips", nextClips)
             }
@@ -863,6 +959,173 @@ class KtorLanEngine(private val context: Context) {
         }
     }
 
+    @OptIn(UnstableApi::class)
+    fun compressVideo(
+        layerId: String,
+        sourceUrl: String,
+        fileName: String,
+        targetHeight: Int,
+        targetBitrate: Int
+    ) {
+        scope.launch {
+            try {
+                var inputFile: File? = null
+                val candidateFromName = File(fileName).name
+                if (candidateFromName.isNotEmpty()) {
+                    val reg = registeredFiles[candidateFromName]
+                    val cached = File(mediaDir, candidateFromName)
+                    if (reg != null && reg.exists()) inputFile = reg
+                    else if (cached.exists()) inputFile = cached
+                }
+                if (inputFile == null && sourceUrl.contains("/media/")) {
+                    val rawPart = sourceUrl.substringAfterLast("/media/").substringBefore("?")
+                    val decoded = java.net.URLDecoder.decode(rawPart, "UTF-8")
+                    val safe = File(decoded).name
+                    val reg = registeredFiles[safe]
+                    val cached = File(mediaDir, safe)
+                    if (reg != null && reg.exists()) inputFile = reg
+                    else if (cached.exists()) inputFile = cached
+                }
+
+                if (inputFile == null && (sourceUrl.startsWith("http://") || sourceUrl.startsWith("https://"))) {
+                    val safeSrc = "src-${System.currentTimeMillis()}.mp4"
+                    val dlFile = File(mediaDir, safeSrc)
+                    httpClient.prepareGet(sourceUrl).execute { response ->
+                        val channel = response.bodyAsChannel()
+                        FileOutputStream(dlFile).use { fos ->
+                            while (!channel.isClosedForRead) {
+                                val packet = channel.readRemaining(32 * 1024)
+                                while (!packet.isEmpty) {
+                                    fos.write(packet.readBytes())
+                                }
+                            }
+                        }
+                    }
+                    inputFile = dlFile
+                }
+
+                val inputUri = if (inputFile != null && inputFile.exists()) {
+                    Uri.fromFile(inputFile)
+                } else {
+                    Uri.parse(sourceUrl)
+                }
+                val originalSizeBytes = inputFile?.length() ?: 0L
+
+                val baseName = File(fileName.ifEmpty { "clip" }).nameWithoutExtension
+                    .replace(Regex("[^a-zA-Z0-9._-]"), "_")
+                    .ifEmpty { "clip" }
+                val outName = "cmp-${System.currentTimeMillis()}-$baseName.mp4"
+                val outFile = File(mediaDir, outName)
+                if (outFile.exists()) outFile.delete()
+
+                mainHandler.post {
+                    try {
+                        activeTransformers.remove(layerId)?.cancel()
+
+                        val mediaItem = MediaItem.fromUri(inputUri)
+                        val videoEffects = if (targetHeight > 0) {
+                            listOf(Presentation.createForHeight(targetHeight))
+                        } else {
+                            emptyList()
+                        }
+                        val effects = Effects(emptyList(), videoEffects)
+                        val editedMediaItem = EditedMediaItem.Builder(mediaItem)
+                            .setEffects(effects)
+                            .build()
+
+                        val encoderBuilder = DefaultEncoderFactory.Builder(context)
+                            .setEnableFallback(true)
+                        if (targetBitrate > 0) {
+                            val encoderSettings = VideoEncoderSettings.Builder()
+                                .setBitrate(targetBitrate)
+                                .build()
+                            encoderBuilder.setRequestedVideoEncoderSettings(encoderSettings)
+                        }
+
+                        var transformerRef: Transformer? = null
+                        val transformer = Transformer.Builder(context)
+                            .setEncoderFactory(encoderBuilder.build())
+                            .setVideoMimeType(MimeTypes.VIDEO_H264)
+                            .setAudioMimeType(MimeTypes.AUDIO_AAC)
+                            .addListener(object : Transformer.Listener {
+                                override fun onCompleted(
+                                    composition: Composition,
+                                    exportResult: ExportResult
+                                ) {
+                                    if (activeTransformers[layerId] === transformerRef) {
+                                        activeTransformers.remove(layerId)
+                                    }
+                                    registeredFiles[outName] = outFile
+                                    ensureMediaServerStarted()
+                                    val bestIp = getPrimaryIp()
+                                    val localUrl = "http://127.0.0.1:$serverPort/media/$outName"
+                                    val shareUrl = "http://$bestIp:$serverPort/media/$outName"
+                                    val compressedSize = outFile.length()
+                                    onCompressProgress?.invoke(layerId, 100)
+                                    onCompressComplete?.invoke(
+                                        layerId,
+                                        outName,
+                                        localUrl,
+                                        shareUrl,
+                                        originalSizeBytes,
+                                        compressedSize
+                                    )
+                                }
+
+                                override fun onError(
+                                    composition: Composition,
+                                    exportResult: ExportResult,
+                                    exportException: ExportException
+                                ) {
+                                    if (activeTransformers[layerId] === transformerRef) {
+                                        activeTransformers.remove(layerId)
+                                    }
+                                    if (outFile.exists()) outFile.delete()
+                                    onCompressError?.invoke(
+                                        layerId,
+                                        exportException.message ?: "Media3 Transformer error (${exportException.errorCode})"
+                                    )
+                                }
+                            })
+                            .build()
+
+                        transformerRef = transformer
+                        activeTransformers[layerId] = transformer
+                        transformer.start(editedMediaItem, outFile.absolutePath)
+
+                        val progressHolder = ProgressHolder()
+                        val poller = object : Runnable {
+                            override fun run() {
+                                if (activeTransformers[layerId] !== transformer) return
+                                val state = transformer.getProgress(progressHolder)
+                                if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
+                                    onCompressProgress?.invoke(
+                                        layerId,
+                                        progressHolder.progress.coerceIn(0, 99)
+                                    )
+                                }
+                                mainHandler.postDelayed(this, 250)
+                            }
+                        }
+                        mainHandler.postDelayed(poller, 250)
+                    } catch (err: Throwable) {
+                        activeTransformers.remove(layerId)
+                        onCompressError?.invoke(layerId, err.message ?: "Media3 start failed")
+                    }
+                }
+            } catch (err: Throwable) {
+                onCompressError?.invoke(layerId, err.message ?: "Compression setup failed")
+            }
+        }
+    }
+
+    @OptIn(UnstableApi::class)
+    fun cancelCompressVideo(layerId: String) {
+        mainHandler.post {
+            activeTransformers.remove(layerId)?.cancel()
+        }
+    }
+
     fun stopHostServer() {
         isHostingRoom = false
         beaconJob?.cancel()
@@ -872,6 +1135,15 @@ class KtorLanEngine(private val context: Context) {
 
     fun stopServer() {
         stopHostServer()
+        mainHandler.post {
+            for (t in activeTransformers.values) {
+                try {
+                    t.cancel()
+                } catch (_: Throwable) {
+                }
+            }
+            activeTransformers.clear()
+        }
         try {
             server?.stop(200, 500)
         } catch (_: Throwable) {

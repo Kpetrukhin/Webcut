@@ -1,19 +1,26 @@
-import React, {useRef} from 'react';
+import React, {useEffect, useRef, useState} from 'react';
 import {
   Eye,
   EyeOff,
   Film,
+  GripVertical,
   Layers,
   Music,
   Plus,
+  Search,
   Trash2,
   Type,
   Volume2,
   VolumeX,
-  ZoomIn,
-  ZoomOut,
 } from 'lucide-react';
 import type {Clip, Collaborator, Track, TrackType} from '../shared/types.ts';
+import {ScrubNumberField} from './ScrubNumberField.tsx';
+
+const BASE_PX_PER_SEC = 64;
+const MIN_ZOOM_PCT = 30;
+const MAX_ZOOM_PCT = 300;
+const MIN_PX_PER_SEC = (BASE_PX_PER_SEC * MIN_ZOOM_PCT) / 100;
+const MAX_PX_PER_SEC = (BASE_PX_PER_SEC * MAX_ZOOM_PCT) / 100;
 
 interface TimelineProps {
   tracks: Track[];
@@ -30,6 +37,10 @@ interface TimelineProps {
   onAddTrack: (type: TrackType) => void;
   onUpdateTrack: (trackId: string, patch: Partial<Track>) => void;
   onDeleteTrack: (trackId: string) => void;
+  onReorderTracks: (
+    trackIds: string[],
+    opts?: {commit?: boolean; undoTracks?: Track[]}
+  ) => void;
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onClipTransform: (
     clipId: string,
@@ -91,12 +102,39 @@ export const Timeline: React.FC<TimelineProps> = ({
   onAddTrack,
   onUpdateTrack,
   onDeleteTrack,
+  onReorderTracks,
   onLockLayer,
   onClipTransform,
 }) => {
   const rulerRef = useRef<HTMLDivElement | null>(null);
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const stickyHeaderRef = useRef<HTMLDivElement | null>(null);
   const rowRefs = useRef<Map<string, HTMLDivElement>>(new Map());
   const scrubActiveRef = useRef(false);
+  const [editingTrackId, setEditingTrackId] = useState<string | null>(null);
+  const [trackNameDraft, setTrackNameDraft] = useState('');
+  const [draggingTrackId, setDraggingTrackId] = useState<string | null>(null);
+
+  const pxPerSecRef = useRef(pxPerSec);
+  pxPerSecRef.current = pxPerSec;
+  const onZoomChangeRef = useRef(onZoomChange);
+  onZoomChangeRef.current = onZoomChange;
+  const onClipTransformRef = useRef(onClipTransform);
+  onClipTransformRef.current = onClipTransform;
+  const onLockLayerRef = useRef(onLockLayer);
+  onLockLayerRef.current = onLockLayer;
+
+  const pinchRef = useRef<{
+    startDist: number;
+    startPxPerSec: number;
+    startTimeAtMid: number;
+  } | null>(null);
+
+  const dragTrackRef = useRef<{
+    trackId: string;
+    origTracks: Track[];
+    currentOrder: string[];
+  } | null>(null);
 
   const dragClipRef = useRef<{
     clipId: string;
@@ -111,7 +149,131 @@ export const Timeline: React.FC<TimelineProps> = ({
     speed: number;
   } | null>(null);
 
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+
+    const getStickyWidth = () =>
+      stickyHeaderRef.current?.getBoundingClientRect().width ?? 132;
+
+    const cancelActiveSingleFingerDrags = () => {
+      scrubActiveRef.current = false;
+      if (dragTrackRef.current) {
+        dragTrackRef.current = null;
+        setDraggingTrackId(null);
+      }
+      const clipDrag = dragClipRef.current;
+      if (clipDrag) {
+        dragClipRef.current = null;
+        onClipTransformRef.current(
+          clipDrag.clipId,
+          {
+            start: clipDrag.origStart,
+            duration: clipDrag.origDuration,
+            trimStart: clipDrag.origTrimStart,
+            trackId: clipDrag.origTrackId,
+          },
+          false
+        );
+        onLockLayerRef.current?.(clipDrag.clipId, false);
+      }
+    };
+
+    const initPinch = (t1: Touch, t2: Touch) => {
+      const startDist = Math.max(
+        10,
+        Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY)
+      );
+      const midClientX = (t1.clientX + t2.clientX) / 2;
+      const rect = container.getBoundingClientRect();
+      const anchorOffsetPx = Math.max(0, midClientX - rect.left - getStickyWidth());
+      const curPx = pxPerSecRef.current;
+      pinchRef.current = {
+        startDist,
+        startPxPerSec: curPx,
+        startTimeAtMid: (container.scrollLeft + anchorOffsetPx) / curPx,
+      };
+    };
+
+    const onTouchStart = (e: TouchEvent) => {
+      if (e.touches.length >= 2) {
+        cancelActiveSingleFingerDrags();
+        initPinch(e.touches[0], e.touches[1]);
+      }
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+      if (e.touches.length < 2) return;
+      if (e.cancelable) e.preventDefault();
+      const t1 = e.touches[0];
+      const t2 = e.touches[1];
+      if (!pinchRef.current) {
+        cancelActiveSingleFingerDrags();
+        initPinch(t1, t2);
+      }
+      const pinch = pinchRef.current;
+      if (!pinch) return;
+
+      const dist = Math.max(
+        10,
+        Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY)
+      );
+      const rawPx = pinch.startPxPerSec * (dist / pinch.startDist);
+      const nextPx = Math.max(MIN_PX_PER_SEC, Math.min(MAX_PX_PER_SEC, rawPx));
+      onZoomChangeRef.current(nextPx);
+
+      const midClientX = (t1.clientX + t2.clientX) / 2;
+      const rect = container.getBoundingClientRect();
+      const curAnchorPx = Math.max(0, midClientX - rect.left - getStickyWidth());
+      const targetScrollLeft = Math.max(
+        0,
+        pinch.startTimeAtMid * nextPx - curAnchorPx
+      );
+      requestAnimationFrame(() => {
+        if (scrollContainerRef.current) {
+          scrollContainerRef.current.scrollLeft = targetScrollLeft;
+        }
+      });
+    };
+
+    const onTouchEndOrCancel = (e: TouchEvent) => {
+      if (e.touches.length < 2) {
+        pinchRef.current = null;
+      }
+    };
+
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      e.preventDefault();
+      const curPx = pxPerSecRef.current;
+      const factor = Math.exp(-e.deltaY * 0.004);
+      const nextPx = Math.max(
+        MIN_PX_PER_SEC,
+        Math.min(MAX_PX_PER_SEC, curPx * factor)
+      );
+      onZoomChangeRef.current(nextPx);
+    };
+
+    container.addEventListener('touchstart', onTouchStart, {passive: true});
+    container.addEventListener('touchmove', onTouchMove, {passive: false});
+    container.addEventListener('touchend', onTouchEndOrCancel, {passive: true});
+    container.addEventListener('touchcancel', onTouchEndOrCancel, {passive: true});
+    container.addEventListener('wheel', onWheel, {passive: false});
+
+    return () => {
+      container.removeEventListener('touchstart', onTouchStart);
+      container.removeEventListener('touchmove', onTouchMove);
+      container.removeEventListener('touchend', onTouchEndOrCancel);
+      container.removeEventListener('touchcancel', onTouchEndOrCancel);
+      container.removeEventListener('wheel', onWheel);
+    };
+  }, []);
+
   const totalWidth = Math.max(640, Math.ceil((duration + 4) * pxPerSec));
+  const zoomPercent = Math.max(
+    MIN_ZOOM_PCT,
+    Math.min(MAX_ZOOM_PCT, Math.round((pxPerSec / BASE_PX_PER_SEC) * 100))
+  );
 
   const clientXToTime = (clientX: number): number => {
     const el = rulerRef.current;
@@ -179,6 +341,7 @@ export const Timeline: React.FC<TimelineProps> = ({
     clip: Clip,
     mode: 'move' | 'trim-left' | 'trim-right'
   ) => {
+    if (pinchRef.current) return;
     e.stopPropagation();
     onSelectClip(clip.id);
     if (clip.lockedByUserId && clip.lockedByUserId !== currentUserId) {
@@ -243,6 +406,7 @@ export const Timeline: React.FC<TimelineProps> = ({
   };
 
   const handleClipPointerMove = (e: React.PointerEvent<HTMLElement>) => {
+    if (pinchRef.current) return;
     const drag = dragClipRef.current;
     if (!drag) return;
     e.stopPropagation();
@@ -263,6 +427,85 @@ export const Timeline: React.FC<TimelineProps> = ({
     }
     onClipTransform(drag.clipId, patch, true);
     onLockLayer?.(drag.clipId, false);
+  };
+
+  const startTrackDrag = (
+    e: React.PointerEvent<HTMLElement>,
+    track: Track
+  ) => {
+    e.stopPropagation();
+    setEditingTrackId(null);
+    e.currentTarget.setPointerCapture(e.pointerId);
+    setDraggingTrackId(track.id);
+    dragTrackRef.current = {
+      trackId: track.id,
+      origTracks: tracks,
+      currentOrder: tracks.map((t) => t.id),
+    };
+  };
+
+  const handleTrackDragMove = (e: React.PointerEvent<HTMLElement>) => {
+    const drag = dragTrackRef.current;
+    if (!drag) return;
+    e.stopPropagation();
+
+    const order = drag.currentOrder;
+    const currentIdx = order.indexOf(drag.trackId);
+    if (currentIdx === -1) return;
+
+    let targetIdx = currentIdx;
+    for (let i = 0; i < order.length; i++) {
+      const id = order[i];
+      const row = rowRefs.current.get(id);
+      if (!row) continue;
+      const rect = row.getBoundingClientRect();
+      const midY = rect.top + rect.height / 2;
+      if (e.clientY < midY) {
+        targetIdx = i;
+        break;
+      }
+      targetIdx = i;
+    }
+
+    if (targetIdx !== currentIdx) {
+      const nextOrder = [...order];
+      const [moved] = nextOrder.splice(currentIdx, 1);
+      nextOrder.splice(targetIdx, 0, moved);
+      drag.currentOrder = nextOrder;
+      onReorderTracks(nextOrder, {commit: false});
+    }
+  };
+
+  const handleTrackDragUp = (e: React.PointerEvent<HTMLElement>) => {
+    const drag = dragTrackRef.current;
+    if (!drag) return;
+    e.stopPropagation();
+    dragTrackRef.current = null;
+    setDraggingTrackId(null);
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+
+    const origOrder = drag.origTracks.map((t) => t.id);
+    const changed =
+      drag.currentOrder.length === origOrder.length &&
+      drag.currentOrder.some((id, idx) => id !== origOrder[idx]);
+    if (changed) {
+      onReorderTracks(drag.currentOrder, {
+        commit: true,
+        undoTracks: drag.origTracks,
+      });
+    }
+  };
+
+  const commitTrackRename = (track: Track) => {
+    const trimmed = trackNameDraft.trim().slice(0, 24);
+    setEditingTrackId(null);
+    if (trimmed && trimmed !== track.name) {
+      onUpdateTrack(track.id, {name: trimmed});
+    }
   };
 
   const secStep = pxPerSec >= 90 ? 1 : pxPerSec >= 55 ? 2 : 5;
@@ -303,36 +546,41 @@ export const Timeline: React.FC<TimelineProps> = ({
           </button>
         </div>
 
-        <div className="flex shrink-0 items-center gap-1">
-          <button
-            type="button"
-            onClick={() => onZoomChange(Math.max(36, pxPerSec - 16))}
-            aria-label="Уменьшить масштаб таймлайна"
-            className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white active:scale-95"
-          >
-            <ZoomOut className="h-3.5 w-3.5" />
-          </button>
-          <span className="w-9 text-center font-mono text-[10px] tabular-nums text-zinc-400">
-            {Math.round((pxPerSec / 64) * 100)}%
-          </span>
-          <button
-            type="button"
-            onClick={() => onZoomChange(Math.min(160, pxPerSec + 16))}
-            aria-label="Увеличить масштаб таймлайна"
-            className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-400 hover:bg-white/10 hover:text-white active:scale-95"
-          >
-            <ZoomIn className="h-3.5 w-3.5" />
-          </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Search className="h-3.5 w-3.5 shrink-0 text-zinc-400" />
+          <ScrubNumberField
+            compact
+            accent="cyan"
+            value={zoomPercent}
+            min={MIN_ZOOM_PCT}
+            max={MAX_ZOOM_PCT}
+            step={1}
+            suffix="%"
+            ariaLabel="Масштаб таймлайна в процентах"
+            onChange={(pct) => {
+              const clamped = Math.max(MIN_ZOOM_PCT, Math.min(MAX_ZOOM_PCT, pct));
+              onZoomChange((clamped / 100) * BASE_PX_PER_SEC);
+            }}
+          />
         </div>
       </div>
 
       {/* Unified Single Scroll Container: Sticky Left Cells + Track Lanes stay 100% aligned */}
-      <div className="studio-scrollbar relative flex-1 min-h-0 overflow-auto bg-[#0e0e11]">
+      <div
+        ref={scrollContainerRef}
+        className="studio-scrollbar relative flex-1 min-h-0 overflow-auto bg-[#0e0e11] [touch-action:pan-x_pan-y]"
+      >
         <div className="relative min-w-max">
           {/* Top Sticky Ruler Row */}
           <div className="sticky top-0 z-40 flex h-6 border-b border-white/10 bg-[#16161b]">
-            <div className="sticky left-0 z-50 flex w-[112px] shrink-0 items-center border-r border-white/10 bg-[#16161b] px-2.5 text-[10px] font-semibold uppercase tracking-wider text-zinc-400 sm:w-[136px]">
-              Дорожки
+            <div
+              ref={stickyHeaderRef}
+              className="sticky left-0 z-50 flex w-[132px] shrink-0 items-center justify-between border-r border-white/10 bg-[#16161b] px-2 text-[10px] font-semibold uppercase tracking-wider text-zinc-400 sm:w-[158px]"
+            >
+              <span>Слои</span>
+              <span className="text-[9px] font-normal normal-case text-zinc-500">
+                верх=фон
+              </span>
             </div>
             <div
               ref={rulerRef}
@@ -376,6 +624,8 @@ export const Timeline: React.FC<TimelineProps> = ({
             const sameTypeCount = tracks.filter(
               (t) => t.type === track.type
             ).length;
+            const isDraggingThisTrack = draggingTrackId === track.id;
+            const isEditingThisTrack = editingTrackId === track.id;
 
             return (
               <div
@@ -384,14 +634,66 @@ export const Timeline: React.FC<TimelineProps> = ({
                   if (el) rowRefs.current.set(track.id, el);
                   else rowRefs.current.delete(track.id);
                 }}
-                className={`flex ${hClass} border-b border-white/5 bg-[#0e0e11]`}
+                className={`flex ${hClass} border-b border-white/5 transition-colors ${
+                  isDraggingThisTrack
+                    ? 'relative z-40 bg-[#1a1a24] ring-1 ring-cyan-400/70'
+                    : 'bg-[#0e0e11]'
+                }`}
               >
                 {/* Sticky Left Track Header Cell */}
-                <div className="sticky left-0 z-30 flex w-[112px] shrink-0 items-center justify-between gap-1 border-r border-white/10 bg-[#141418] pl-2 pr-1 text-[11px] font-medium text-zinc-200 sm:w-[136px] sm:pl-2.5 sm:pr-1.5">
-                  <div className="flex min-w-0 items-center gap-1.5">
+                <div
+                  className={`sticky left-0 z-30 flex w-[132px] shrink-0 items-center justify-between gap-0.5 border-r border-white/10 pl-1 pr-1 text-[11px] font-medium text-zinc-200 sm:w-[158px] sm:pl-1.5 sm:pr-1.5 ${
+                    isDraggingThisTrack ? 'bg-[#1c1c28]' : 'bg-[#141418]'
+                  }`}
+                >
+                  <div className="flex min-w-0 flex-1 items-center gap-1">
+                    <button
+                      type="button"
+                      onPointerDown={(e) => startTrackDrag(e, track)}
+                      onPointerMove={handleTrackDragMove}
+                      onPointerUp={handleTrackDragUp}
+                      onPointerCancel={handleTrackDragUp}
+                      aria-label={`Перетащить дорожку ${track.name}`}
+                      title="Потяните вверх/вниз для смены порядка слоёв"
+                      className="flex h-7 w-5 shrink-0 cursor-grab touch-none items-center justify-center rounded text-zinc-500 hover:bg-white/10 hover:text-zinc-200 active:cursor-grabbing active:text-cyan-300"
+                    >
+                      <GripVertical className="h-3.5 w-3.5" />
+                    </button>
                     <span className={`h-4 w-1 shrink-0 rounded-full ${accentClass}`} />
                     <Icon className="h-3 w-3 shrink-0 text-zinc-400" />
-                    <span className="truncate">{track.name}</span>
+                    {isEditingThisTrack ? (
+                      <input
+                        type="text"
+                        autoFocus
+                        value={trackNameDraft}
+                        onChange={(e) => setTrackNameDraft(e.target.value)}
+                        onBlur={() => commitTrackRename(track)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            e.preventDefault();
+                            commitTrackRename(track);
+                          } else if (e.key === 'Escape') {
+                            setEditingTrackId(null);
+                          }
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        onPointerDown={(e) => e.stopPropagation()}
+                        className="h-6 min-w-0 flex-1 rounded border border-cyan-400 bg-zinc-900 px-1 text-[11px] font-medium text-white focus:outline-none"
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setEditingTrackId(track.id);
+                          setTrackNameDraft(track.name);
+                        }}
+                        title="Нажмите, чтобы переименовать дорожку"
+                        className="min-w-0 flex-1 truncate rounded px-0.5 py-0.5 text-left hover:bg-white/10 hover:text-cyan-200"
+                      >
+                        {track.name}
+                      </button>
+                    )}
                   </div>
 
                   <div className="flex shrink-0 items-center">
@@ -611,7 +913,7 @@ export const Timeline: React.FC<TimelineProps> = ({
           })}
 
           {/* Continuous Playhead Lines Over Track Lanes Only (always slide cleanly under sticky left column z-30) */}
-          <div className="pointer-events-none absolute top-6 bottom-0 left-[112px] right-0 z-20 sm:left-[136px]">
+          <div className="pointer-events-none absolute top-6 bottom-0 left-[132px] right-0 z-20 sm:left-[158px]">
             {collaborators.map((collab) => (
               <div
                 key={collab.id}

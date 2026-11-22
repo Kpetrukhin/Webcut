@@ -1,10 +1,10 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {
-  ChevronsUpDown,
   EyeOff,
   Magnet,
   SlidersHorizontal,
 } from 'lucide-react';
+import {ScrubNumberField} from './ScrubNumberField.tsx';
 import type {
   AspectRatio,
   Clip,
@@ -69,9 +69,9 @@ function normalizeAngleDeg(deg: number): number {
 
 const PICKER_OFFSET_STORAGE_KEY = 'cutsync_chroma_picker_offset';
 
-function loadSavedPickerOffset(): number {
+function loadSavedNumber(key: string, fallback: number): number {
   try {
-    const raw = localStorage.getItem(PICKER_OFFSET_STORAGE_KEY);
+    const raw = localStorage.getItem(key);
     if (raw !== null) {
       const parsed = Number(raw);
       if (Number.isFinite(parsed)) return parsed;
@@ -79,111 +79,8 @@ function loadSavedPickerOffset(): number {
   } catch {
     // ignore storage errors
   }
-  return 52;
+  return fallback;
 }
-
-interface ScrubNumberFieldProps {
-  value: number;
-  onChange: (next: number) => void;
-}
-
-const ScrubNumberField: React.FC<ScrubNumberFieldProps> = ({
-  value,
-  onChange,
-}) => {
-  const [editing, setEditing] = useState(false);
-  const [draft, setDraft] = useState(String(value));
-  const [scrubbing, setScrubbing] = useState(false);
-  const dragRef = useRef<{
-    startY: number;
-    startVal: number;
-    moved: boolean;
-  } | null>(null);
-
-  const commitDraft = () => {
-    const parsed = Number(draft.replace(',', '.').trim());
-    if (Number.isFinite(parsed)) {
-      onChange(parsed);
-    }
-    setEditing(false);
-  };
-
-  if (editing) {
-    return (
-      <input
-        type="text"
-        inputMode="decimal"
-        autoFocus
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commitDraft}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') commitDraft();
-          if (e.key === 'Escape') setEditing(false);
-        }}
-        className="h-8 w-24 rounded-lg border border-cyan-400 bg-zinc-900 px-2 text-right font-mono text-xs text-white focus:outline-none"
-      />
-    );
-  }
-
-  return (
-    <div
-      role="spinbutton"
-      aria-valuenow={value}
-      tabIndex={0}
-      onPointerDown={(e) => {
-        e.stopPropagation();
-        e.currentTarget.setPointerCapture(e.pointerId);
-        dragRef.current = {
-          startY: e.clientY,
-          startVal: value,
-          moved: false,
-        };
-      }}
-      onPointerMove={(e) => {
-        if (!dragRef.current) return;
-        e.stopPropagation();
-        const dy = dragRef.current.startY - e.clientY;
-        if (!dragRef.current.moved && Math.abs(dy) > 4) {
-          dragRef.current.moved = true;
-          setScrubbing(true);
-        }
-        if (dragRef.current.moved) {
-          const next = Math.round(dragRef.current.startVal + dy * 0.75);
-          onChange(next);
-        }
-      }}
-      onPointerUp={(e) => {
-        e.stopPropagation();
-        try {
-          e.currentTarget.releasePointerCapture(e.pointerId);
-        } catch {
-          // ignore
-        }
-        const wasMoved = dragRef.current?.moved;
-        dragRef.current = null;
-        setScrubbing(false);
-        if (!wasMoved) {
-          setDraft(String(value));
-          setEditing(true);
-        }
-      }}
-      onPointerCancel={() => {
-        dragRef.current = null;
-        setScrubbing(false);
-      }}
-      title="Потяните вверх/вниз для изменения или нажмите для ввода"
-      className={`flex h-8 w-24 cursor-ns-resize touch-none items-center justify-between gap-1 rounded-lg border px-2 font-mono text-xs select-none transition ${
-        scrubbing
-          ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
-          : 'border-white/15 bg-zinc-900 text-zinc-100 hover:border-cyan-400/60'
-      }`}
-    >
-      <ChevronsUpDown className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
-      <span className="truncate tabular-nums">{value}</span>
-    </div>
-  );
-};
 
 export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   tracks,
@@ -220,8 +117,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   });
   const [draggingPicker, setDraggingPicker] = useState(false);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
-  const [pickerOffsetPx, setPickerOffsetPx] = useState<number>(
-    loadSavedPickerOffset
+  const [pickerOffsetPx, setPickerOffsetPx] = useState<number>(() =>
+    loadSavedNumber(PICKER_OFFSET_STORAGE_KEY, 52)
   );
 
   const updatePickerOffset = (next: number) => {
@@ -385,47 +282,40 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
 
   const findHitClip = (nx: number, ny: number): Clip | null => {
     const hiddenIds = new Set(tracks.filter((t) => t.hidden).map((t) => t.id));
+    const trackOrder = new Map<string, number>();
+    tracks.forEach((t, i) => trackOrder.set(t.id, i));
 
-    const activeTexts = clips.filter(
-      (c) =>
-        c.track === 'text' &&
-        !hiddenIds.has(c.trackId) &&
-        currentTime >= c.start &&
-        currentTime < c.start + c.duration
-    );
-    for (let i = activeTexts.length - 1; i >= 0; i--) {
-      const c = activeTexts[i];
-      const tr = evaluateClipTransform(c, currentTime);
-      if (Math.abs(nx - tr.x) < 0.28 && Math.abs(ny - tr.y) < 0.12) {
+    const activeVisual = clips
+      .filter(
+        (c) =>
+          c.track !== 'audio' &&
+          !hiddenIds.has(c.trackId) &&
+          currentTime >= c.start &&
+          currentTime < c.start + c.duration
+      )
+      .sort((a, b) => {
+        const ta = trackOrder.get(a.trackId) ?? 0;
+        const tb = trackOrder.get(b.trackId) ?? 0;
+        if (ta !== tb) return ta - tb;
+        return a.start - b.start;
+      });
+
+    for (let i = activeVisual.length - 1; i >= 0; i--) {
+      const c = activeVisual[i];
+      if (c.track === 'text') {
+        const tr = evaluateClipTransform(c, currentTime);
+        if (Math.abs(nx - tr.x) < 0.28 && Math.abs(ny - tr.y) < 0.12) {
+          return c;
+        }
+      } else if (c.track === 'overlay') {
+        const tr = evaluateClipTransform(c, currentTime);
+        const half = Math.max(0.12, tr.scale / 2);
+        if (Math.abs(nx - tr.x) <= half && Math.abs(ny - tr.y) <= half) {
+          return c;
+        }
+      } else if (c.track === 'video') {
         return c;
       }
-    }
-
-    const activeOverlays = clips.filter(
-      (c) =>
-        c.track === 'overlay' &&
-        !hiddenIds.has(c.trackId) &&
-        currentTime >= c.start &&
-        currentTime < c.start + c.duration
-    );
-    for (let i = activeOverlays.length - 1; i >= 0; i--) {
-      const c = activeOverlays[i];
-      const tr = evaluateClipTransform(c, currentTime);
-      const half = Math.max(0.12, tr.scale / 2);
-      if (Math.abs(nx - tr.x) <= half && Math.abs(ny - tr.y) <= half) {
-        return c;
-      }
-    }
-
-    const activeVideos = clips.filter(
-      (c) =>
-        c.track === 'video' &&
-        !hiddenIds.has(c.trackId) &&
-        currentTime >= c.start &&
-        currentTime < c.start + c.duration
-    );
-    if (activeVideos.length > 0) {
-      return activeVideos[activeVideos.length - 1];
     }
 
     return null;
@@ -811,19 +701,24 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
               </span>
             </button>
 
-            {/* 3. Высота пипетки (Unity-style drag up/down) */}
+            {/* 3. Высота пипетки (Unity-style scrub) */}
             <div className="flex items-center justify-between gap-2 rounded-lg border border-white/10 bg-zinc-900/80 px-2.5 py-2">
               <div className="min-w-0">
                 <p className="text-xs font-medium text-zinc-200">
                   Высота пипетки
                 </p>
                 <p className="text-[10px] text-zinc-500">
-                  Свайп ↕ или ввод
+                  Свайп ↕/↔ или ввод
                 </p>
               </div>
               <ScrubNumberField
                 value={pickerOffsetPx}
                 onChange={updatePickerOffset}
+                min={-250}
+                max={250}
+                step={1}
+                suffix="px"
+                ariaLabel="Высота пипетки"
               />
             </div>
           </div>
@@ -890,9 +785,9 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
                   top: `${pickerPos.y * 100}%`,
                 }}
               >
-                {/* Floating color loupe badge above finger while dragging */}
+                {/* Floating color loupe badge above crosshair while dragging */}
                 {draggingPicker && (
-                  <div className="mb-2 flex -translate-y-10 justify-center">
+                  <div className="pointer-events-none absolute left-1/2 bottom-full mb-2 flex -translate-x-1/2 -translate-y-full justify-center">
                     <div
                       className="h-8 w-8 rounded-full border-2 border-white shadow-lg ring-2 ring-black/60"
                       style={{

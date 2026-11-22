@@ -49,6 +49,34 @@ class LanSyncPlugin : Plugin() {
             }
             notifyListeners("mediaDownloadError", payload)
         }
+
+        engine.onCompressProgress = { layerId: String, progress: Int ->
+            val payload = JSObject().apply {
+                put("layerId", layerId)
+                put("progress", progress)
+            }
+            notifyListeners("mediaCompressProgress", payload)
+        }
+
+        engine.onCompressComplete = { layerId: String, fileName: String, localUrl: String, shareUrl: String, originalSizeBytes: Long, compressedSizeBytes: Long ->
+            val payload = JSObject().apply {
+                put("layerId", layerId)
+                put("fileName", fileName)
+                put("localUrl", localUrl)
+                put("shareUrl", shareUrl)
+                put("originalSizeBytes", originalSizeBytes)
+                put("compressedSizeBytes", compressedSizeBytes)
+            }
+            notifyListeners("mediaCompressComplete", payload)
+        }
+
+        engine.onCompressError = { layerId: String, message: String ->
+            val payload = JSObject().apply {
+                put("layerId", layerId)
+                put("message", message)
+            }
+            notifyListeners("mediaCompressError", payload)
+        }
     }
 
     override fun handleOnDestroy() {
@@ -144,5 +172,31 @@ class LanSyncPlugin : Plugin() {
         val fileName = call.getString("fileName") ?: "media-${System.currentTimeMillis()}"
         engine.downloadMediaToCache(layerId, url, fileName)
         call.resolve(JSObject().apply { put("started", true) })
+    }
+
+    @PluginMethod
+    fun compressVideo(call: PluginCall) {
+        val layerId = call.getString("layerId") ?: run {
+            call.reject("Missing layerId")
+            return
+        }
+        val sourceUrl = call.getString("sourceUrl") ?: run {
+            call.reject("Missing sourceUrl")
+            return
+        }
+        val fileName = call.getString("fileName") ?: "clip.mp4"
+        val targetHeight = call.getInt("targetHeight", 720) ?: 720
+        val targetBitrate = call.getInt("targetBitrate", 2_000_000) ?: 2_000_000
+        engine.compressVideo(layerId, sourceUrl, fileName, targetHeight, targetBitrate)
+        call.resolve(JSObject().apply { put("started", true) })
+    }
+
+    @PluginMethod
+    fun cancelCompressVideo(call: PluginCall) {
+        val layerId = call.getString("layerId") ?: ""
+        if (layerId.isNotEmpty()) {
+            engine.cancelCompressVideo(layerId)
+        }
+        call.resolve()
     }
 }

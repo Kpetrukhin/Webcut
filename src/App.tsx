@@ -8,6 +8,7 @@ import {
   Home,
   Layers,
   MessageSquare,
+  Minimize2,
   Move,
   Pause,
   Pipette,
@@ -33,6 +34,7 @@ import {
   upsertKeyframeAtTime,
 } from './lib/keyframeEngine.ts';
 import {uploadFileForP2P} from './lib/lanSyncBridge.ts';
+import type {CompressedMediaResult} from './lib/lanSyncBridge.ts';
 import {
   getLocalProjects,
   removeLocalProject,
@@ -48,12 +50,14 @@ import {
 import {HomeScreen} from './components/HomeScreen.tsx';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
 import type {CanvasTransformPatch} from './components/PreviewCanvas.tsx';
+import {ScrubNumberField} from './components/ScrubNumberField.tsx';
 import {Timeline} from './components/Timeline.tsx';
 import {TransformTrackpad} from './components/TransformTrackpad.tsx';
 import {RoomsLobbyModal} from './components/RoomsLobbyModal.tsx';
 import {
   AudioPanel,
   BottomSheet,
+  CompressMediaModal,
   EffectsPanel,
   KeyframeControls,
   MediaPanel,
@@ -98,10 +102,13 @@ export default function App() {
     addTrack,
     updateTrack,
     deleteTrack,
+    reorderTracks,
     addClip,
     updateClip,
     deleteClip,
     splitClip,
+    duplicateClip,
+    moveClipTrackType,
     updateProjectMeta,
     addCustomFont,
     replaceClips,
@@ -136,6 +143,8 @@ export default function App() {
   const [showOpacitySlider, setShowOpacitySlider] = useState(false);
   const [showChromaKeyPanel, setShowChromaKeyPanel] = useState(false);
   const [showTrackpad, setShowTrackpad] = useState(false);
+  const [showCompressModal, setShowCompressModal] = useState(false);
+  const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [showSelectionOutline, setShowSelectionOutline] = useState(true);
   const [replacingMedia, setReplacingMedia] = useState(false);
@@ -190,6 +199,7 @@ export default function App() {
       (selectedClip.kind !== 'image' && selectedClip.kind !== 'video')
     ) {
       setShowChromaKeyPanel(false);
+      setShowCompressModal(false);
     }
   }, [selectedClip]);
 
@@ -277,21 +287,55 @@ export default function App() {
 
   const handleDuplicateSelected = useCallback(() => {
     if (!selectedClip) return;
-    const {clip: copy} = addClip(
-      {
-        ...structuredClone(selectedClip),
-        id: `clip-${Math.random().toString(36).slice(2, 9)}`,
-        name: `${selectedClip.name} (копия)`,
-        start:
-          Math.round((selectedClip.start + selectedClip.duration) * 100) / 100,
-        lockedByUserId: null,
-        lockedByUserName: null,
-        lockedByUserColor: null,
-      },
-      {forceNewTrack: selectedClip.track !== 'video'}
+    const newId = duplicateClip(selectedClip.id);
+    if (newId) setSelectedClipId(newId);
+  }, [selectedClip, duplicateClip]);
+
+  const showTransientNotice = useCallback((msg: string) => {
+    setNoticeMsg(msg);
+    setTimeout(() => {
+      setNoticeMsg((cur) => (cur === msg ? null : cur));
+    }, 2000);
+  }, []);
+
+  const handleOpenEditTab = useCallback(() => {
+    if (selectedClipId) return;
+    const hiddenIds = new Set(
+      project.tracks.filter((t) => t.hidden).map((t) => t.id)
     );
-    setSelectedClipId(copy.id);
-  }, [selectedClip, addClip]);
+    const trackRank = new Map(project.tracks.map((t, i) => [t.id, i]));
+    const atPlayhead = project.clips
+      .filter(
+        (c) =>
+          currentTime >= c.start - 0.01 &&
+          currentTime <= c.start + c.duration + 0.01
+      )
+      .sort((a, b) => {
+        const aHidden = hiddenIds.has(a.trackId) ? 1 : 0;
+        const bHidden = hiddenIds.has(b.trackId) ? 1 : 0;
+        if (aHidden !== bHidden) return aHidden - bHidden;
+        return (trackRank.get(a.trackId) ?? 999) - (trackRank.get(b.trackId) ?? 999);
+      });
+
+    const target =
+      atPlayhead.find((c) => c.track === 'video' && !hiddenIds.has(c.trackId)) ??
+      atPlayhead[0] ??
+      null;
+
+    if (target) {
+      setSelectedClipId(target.id);
+    } else if (project.clips.length === 0) {
+      setMobileSheet('media');
+    } else {
+      showTransientNotice('Под белой линией времени нет клипа');
+    }
+  }, [
+    selectedClipId,
+    project.tracks,
+    project.clips,
+    currentTime,
+    showTransientNotice,
+  ]);
 
   const handleCycleSpeed = useCallback(() => {
     if (!selectedClip) return;
@@ -472,6 +516,27 @@ export default function App() {
       }
     },
     [project.clips, user.id, sendLayerMediaUpdated]
+  );
+
+  const handleApplyCompressedMedia = useCallback(
+    (clip: Clip, res: CompressedMediaResult) => {
+      const updatedClip: Clip = {
+        ...clip,
+        src: res.localSrc,
+        mediaFileName: res.fileName,
+        mediaRemoteUrl: res.shareUrl,
+        mediaStatus: 'READY',
+        downloadProgress: 100,
+      };
+      sendLayerMediaUpdated({
+        layerId: clip.id,
+        fileName: res.fileName,
+        mediaUrl: res.shareUrl,
+        localSrc: res.localSrc,
+        clip: updatedClip,
+      });
+    },
+    [sendLayerMediaUpdated]
   );
 
   const handleAddText = useCallback(
@@ -1055,15 +1120,20 @@ export default function App() {
       <div className="flex flex-1 min-h-0 flex-col lg:grid lg:grid-cols-[360px_1fr_310px]">
         {/* Desktop Left Sidebar */}
         <aside className="hidden border-r border-white/10 bg-[#111114] lg:flex lg:min-h-0 lg:flex-col">
-          <div className="grid grid-cols-6 gap-1 border-b border-white/10 p-1.5">
-            {TOOL_TABS.filter((t) => t.id !== 'edit').map((tab) => {
+          <div className="grid grid-cols-7 gap-0.5 border-b border-white/10 p-1.5">
+            {TOOL_TABS.map((tab) => {
               const Icon = tab.icon;
               const active = desktopTab === tab.id;
               return (
                 <button
                   key={tab.id}
                   type="button"
-                  onClick={() => setDesktopTab(tab.id)}
+                  onClick={() => {
+                    if (tab.id === 'edit') {
+                      handleOpenEditTab();
+                    }
+                    setDesktopTab(tab.id);
+                  }}
                   className={`flex flex-col items-center justify-center gap-1 rounded-lg py-2 text-[10px] font-medium transition ${
                     active
                       ? 'bg-cyan-500/15 text-cyan-300'
@@ -1077,6 +1147,134 @@ export default function App() {
             })}
           </div>
           <div className="studio-scrollbar flex-1 overflow-y-auto p-4">
+            {desktopTab === 'edit' && (
+              <div className="space-y-3">
+                {selectedClip ? (
+                  <>
+                    <div className="rounded-xl border border-white/10 bg-zinc-900/70 p-3">
+                      <p className="truncate text-xs font-semibold text-white">
+                        {selectedClip.name}
+                      </p>
+                      <p className="mt-0.5 text-[11px] text-zinc-400">
+                        {selectedClip.track === 'video'
+                          ? 'Основная видеодорожка'
+                          : selectedClip.track === 'overlay'
+                            ? 'Дорожка наложения'
+                            : selectedClip.track === 'text'
+                              ? 'Текстовый титр'
+                              : 'Аудиодорожка'}
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={handleSplitSelectedOrCurrent}
+                        disabled={!canSplitNow}
+                        className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-3 text-xs font-medium text-zinc-200 hover:border-cyan-400 disabled:opacity-35"
+                      >
+                        <Scissors className="h-4 w-4 text-cyan-400" />
+                        Разделить
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDuplicateSelected}
+                        className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-3 text-xs font-medium text-zinc-200 hover:border-cyan-400"
+                      >
+                        <CopyPlus className="h-4 w-4 text-cyan-400" />
+                        Копия
+                      </button>
+                      {(selectedClip.kind === 'image' ||
+                        selectedClip.kind === 'video') && (
+                        <label
+                          className={`flex h-11 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-white/10 bg-zinc-900 px-3 text-xs font-medium text-zinc-200 hover:border-cyan-400 ${
+                            replacingMedia ? 'opacity-50 pointer-events-none' : ''
+                          }`}
+                        >
+                          <RefreshCw
+                            className={`h-4 w-4 text-cyan-400 ${
+                              replacingMedia ? 'animate-spin' : ''
+                            }`}
+                          />
+                          Заменить
+                          <input
+                            type="file"
+                            accept="video/*,image/*"
+                            disabled={replacingMedia}
+                            onChange={(e) => {
+                              const file = e.target.files?.[0];
+                              if (file && selectedClip) {
+                                void handleReplaceClipMedia(
+                                  selectedClip.id,
+                                  file
+                                );
+                              }
+                              e.target.value = '';
+                            }}
+                            className="hidden"
+                          />
+                        </label>
+                      )}
+                      {(selectedClip.track === 'video' ||
+                        selectedClip.track === 'overlay') && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            moveClipTrackType(
+                              selectedClip.id,
+                              selectedClip.track === 'video'
+                                ? 'overlay'
+                                : 'video'
+                            )
+                          }
+                          className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-indigo-500/35 bg-indigo-500/10 px-3 text-xs font-medium text-indigo-200 hover:border-indigo-400"
+                        >
+                          <Layers className="h-4 w-4 text-indigo-400" />
+                          {selectedClip.track === 'video'
+                            ? 'Наложение'
+                            : 'Основное'}
+                        </button>
+                      )}
+                      {(selectedClip.kind === 'image' ||
+                        selectedClip.kind === 'video') && (
+                        <button
+                          type="button"
+                          onClick={() => setShowCompressModal(true)}
+                          className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-emerald-500/35 bg-emerald-500/10 px-3 text-xs font-medium text-emerald-200 hover:border-emerald-400"
+                        >
+                          <Minimize2 className="h-4 w-4 text-emerald-400" />
+                          Сжать (Качество)
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => {
+                          deleteClip(selectedClip.id);
+                          setSelectedClipId(null);
+                        }}
+                        className="flex h-11 items-center justify-center gap-1.5 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3 text-xs font-medium text-rose-300 hover:border-rose-400"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        Удалить
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="space-y-3 rounded-xl border border-white/10 bg-zinc-900/60 p-4 text-center text-xs text-zinc-400">
+                    <p>
+                      Выберите клип на таймлайне или поставьте линию времени на нужный фрагмент и нажмите «Изменить».
+                    </p>
+                    <button
+                      type="button"
+                      onClick={handleOpenEditTab}
+                      className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-cyan-500 px-3 text-xs font-semibold text-zinc-950 hover:bg-cyan-400"
+                    >
+                      <Scissors className="h-3.5 w-3.5" />
+                      Выделить под плейхедом
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
             {desktopTab === 'media' && (
               <MediaPanel onAddMediaClip={handleAddMediaClip} />
             )}
@@ -1144,9 +1342,9 @@ export default function App() {
 
         {/* Center Preview Canvas + Transport Bar */}
         <main className="relative flex flex-1 min-h-0 flex-col bg-[#09090b]">
-          {lockWarning && (
+          {(lockWarning || noticeMsg) && (
             <div className="pointer-events-none absolute top-3 left-1/2 z-30 -translate-x-1/2 rounded-full border border-amber-400/50 bg-zinc-950/90 px-3.5 py-1.5 text-xs font-semibold text-amber-300 shadow-lg backdrop-blur-xs">
-              {lockWarning}
+              {lockWarning || noticeMsg}
             </div>
           )}
           <div className="flex-1 min-h-0">
@@ -1318,7 +1516,7 @@ export default function App() {
                   className="flex h-10 flex-col items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-[11px] text-zinc-200 hover:border-cyan-400"
                 >
                   <CopyPlus className="mb-0.5 h-3.5 w-3.5 text-cyan-400" />
-                  Дубликат
+                  Копия
                 </button>
                 <button
                   type="button"
@@ -1329,6 +1527,40 @@ export default function App() {
                   {selectedClip.speed}x
                 </button>
               </div>
+
+              {(selectedClip.track === 'video' ||
+                selectedClip.track === 'overlay') && (
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      moveClipTrackType(
+                        selectedClip.id,
+                        selectedClip.track === 'video' ? 'overlay' : 'video'
+                      )
+                    }
+                    className="flex h-9 items-center justify-center gap-1.5 rounded-lg border border-indigo-500/35 bg-indigo-500/10 px-2.5 text-xs font-medium text-indigo-200 hover:border-indigo-400"
+                  >
+                    <Layers className="h-3.5 w-3.5 text-indigo-400" />
+                    <span>
+                      {selectedClip.track === 'video'
+                        ? 'Наложение'
+                        : 'Основное'}
+                    </span>
+                  </button>
+                  {(selectedClip.kind === 'image' ||
+                    selectedClip.kind === 'video') && (
+                    <button
+                      type="button"
+                      onClick={() => setShowCompressModal(true)}
+                      className="flex h-9 items-center justify-center gap-1.5 rounded-lg border border-emerald-500/35 bg-emerald-500/10 px-2.5 text-xs font-medium text-emerald-200 hover:border-emerald-400"
+                    >
+                      <Minimize2 className="h-3.5 w-3.5 text-emerald-400" />
+                      <span>Сжать</span>
+                    </button>
+                  )}
+                </div>
+              )}
 
               {selectedClip.track !== 'audio' && (
                 <div className="space-y-2">
@@ -1441,12 +1673,43 @@ export default function App() {
                           </button>
                         </div>
 
-                        <label className="block space-y-1 text-xs text-zinc-300">
-                          <div className="flex justify-between text-[11px]">
+                        <div className="space-y-1 text-xs text-zinc-300">
+                          <div className="flex items-center justify-between text-[11px]">
                             <span>Интенсивность</span>
-                            <span className="font-mono tabular-nums text-emerald-300">
-                              {(selectedClip.chromaKeyIntensity ?? 0.35).toFixed(2)}
-                            </span>
+                            <ScrubNumberField
+                              compact
+                              accent="emerald"
+                              value={selectedClip.chromaKeyIntensity ?? 0.35}
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              decimals={2}
+                              ariaLabel="Интенсивность хромакея"
+                              onChange={(val) =>
+                                handleUpdateChromaKey(
+                                  selectedClip.id,
+                                  {
+                                    chromaKeyEnabled: true,
+                                    chromaKeyColor:
+                                      selectedClip.chromaKeyColor || '#00ff00',
+                                    chromaKeyIntensity: val,
+                                  },
+                                  false
+                                )
+                              }
+                              onCommit={(val) =>
+                                handleUpdateChromaKey(
+                                  selectedClip.id,
+                                  {
+                                    chromaKeyEnabled: true,
+                                    chromaKeyColor:
+                                      selectedClip.chromaKeyColor || '#00ff00',
+                                    chromaKeyIntensity: val,
+                                  },
+                                  true
+                                )
+                              }
+                            />
                           </div>
                           <input
                             type="range"
@@ -1479,16 +1742,45 @@ export default function App() {
                             }
                             className="w-full accent-emerald-400"
                           />
-                        </label>
+                        </div>
 
-                        <label className="block space-y-1 text-xs text-zinc-300">
-                          <div className="flex justify-between text-[11px]">
+                        <div className="space-y-1 text-xs text-zinc-300">
+                          <div className="flex items-center justify-between text-[11px]">
                             <span>Сглаживание</span>
-                            <span className="font-mono tabular-nums text-emerald-300">
-                              {(
-                                selectedClip.chromaKeySmoothness ?? 0.15
-                              ).toFixed(2)}
-                            </span>
+                            <ScrubNumberField
+                              compact
+                              accent="emerald"
+                              value={selectedClip.chromaKeySmoothness ?? 0.15}
+                              min={0}
+                              max={1}
+                              step={0.01}
+                              decimals={2}
+                              ariaLabel="Сглаживание хромакея"
+                              onChange={(val) =>
+                                handleUpdateChromaKey(
+                                  selectedClip.id,
+                                  {
+                                    chromaKeyEnabled: true,
+                                    chromaKeyColor:
+                                      selectedClip.chromaKeyColor || '#00ff00',
+                                    chromaKeySmoothness: val,
+                                  },
+                                  false
+                                )
+                              }
+                              onCommit={(val) =>
+                                handleUpdateChromaKey(
+                                  selectedClip.id,
+                                  {
+                                    chromaKeyEnabled: true,
+                                    chromaKeyColor:
+                                      selectedClip.chromaKeyColor || '#00ff00',
+                                    chromaKeySmoothness: val,
+                                  },
+                                  true
+                                )
+                              }
+                            />
                           </div>
                           <input
                             type="range"
@@ -1521,7 +1813,7 @@ export default function App() {
                             }
                             className="w-full accent-emerald-400"
                           />
-                        </label>
+                        </div>
                       </div>
                     )}
                 </div>
@@ -1539,12 +1831,29 @@ export default function App() {
 
               {(selectedClip.track === 'audio' ||
                 selectedClip.kind === 'video') && (
-                <label className="block space-y-1 text-xs text-zinc-400">
-                  <div className="flex justify-between">
+                <div className="space-y-1 text-xs text-zinc-400">
+                  <div className="flex items-center justify-between">
                     <span>Громкость</span>
-                    <span className="font-mono text-zinc-200">
-                      {Math.round(selectedClip.volume * 100)}%
-                    </span>
+                    <ScrubNumberField
+                      compact
+                      accent="emerald"
+                      value={Math.round(selectedClip.volume * 100)}
+                      min={0}
+                      max={100}
+                      step={1}
+                      suffix="%"
+                      ariaLabel="Громкость"
+                      onChange={(pct) =>
+                        updateClip(
+                          selectedClip.id,
+                          {volume: pct / 100},
+                          {skipUndo: true, skipSync: true}
+                        )
+                      }
+                      onCommit={(pct) =>
+                        updateClip(selectedClip.id, {volume: pct / 100})
+                      }
+                    />
                   </div>
                   <input
                     type="range"
@@ -1559,7 +1868,7 @@ export default function App() {
                     }
                     className="w-full accent-emerald-400"
                   />
-                </label>
+                </div>
               )}
 
               {selectedClip.track !== 'audio' && (
@@ -1627,6 +1936,7 @@ export default function App() {
             onAddTrack={addTrack}
             onUpdateTrack={updateTrack}
             onDeleteTrack={deleteTrack}
+            onReorderTracks={reorderTracks}
             onLockLayer={sendLayerLock}
             onClipTransform={handleClipTransform}
           />
@@ -1663,9 +1973,18 @@ export default function App() {
               }
               className="h-2 flex-1 cursor-pointer accent-cyan-400"
             />
-            <span className="w-10 shrink-0 text-right font-mono text-xs tabular-nums text-white">
-              {Math.round(selectedOpacityValue * 100)}%
-            </span>
+            <ScrubNumberField
+              compact
+              accent="cyan"
+              value={Math.round(selectedOpacityValue * 100)}
+              min={0}
+              max={100}
+              step={1}
+              suffix="%"
+              ariaLabel="Прозрачность"
+              onChange={(pct) => handleChangeSelectedOpacity(pct / 100, false)}
+              onCommit={(pct) => handleChangeSelectedOpacity(pct / 100, true)}
+            />
             <button
               type="button"
               onClick={() => setShowOpacitySlider(false)}
@@ -1725,12 +2044,43 @@ export default function App() {
               </div>
 
               <div className="grid grid-cols-2 gap-3">
-                <label className="space-y-1">
-                  <div className="flex justify-between text-[10px] text-zinc-300">
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[10px] text-zinc-300">
                     <span>Интенсивность</span>
-                    <span className="font-mono tabular-nums text-emerald-300">
-                      {(selectedClip.chromaKeyIntensity ?? 0.35).toFixed(2)}
-                    </span>
+                    <ScrubNumberField
+                      compact
+                      accent="emerald"
+                      value={selectedClip.chromaKeyIntensity ?? 0.35}
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      decimals={2}
+                      ariaLabel="Интенсивность хромакея"
+                      onChange={(val) =>
+                        handleUpdateChromaKey(
+                          selectedClip.id,
+                          {
+                            chromaKeyEnabled: true,
+                            chromaKeyColor:
+                              selectedClip.chromaKeyColor || '#00ff00',
+                            chromaKeyIntensity: val,
+                          },
+                          false
+                        )
+                      }
+                      onCommit={(val) =>
+                        handleUpdateChromaKey(
+                          selectedClip.id,
+                          {
+                            chromaKeyEnabled: true,
+                            chromaKeyColor:
+                              selectedClip.chromaKeyColor || '#00ff00',
+                            chromaKeyIntensity: val,
+                          },
+                          true
+                        )
+                      }
+                    />
                   </div>
                   <input
                     type="range"
@@ -1774,14 +2124,45 @@ export default function App() {
                     }
                     className="h-2 w-full cursor-pointer accent-emerald-400"
                   />
-                </label>
+                </div>
 
-                <label className="space-y-1">
-                  <div className="flex justify-between text-[10px] text-zinc-300">
+                <div className="space-y-1">
+                  <div className="flex items-center justify-between text-[10px] text-zinc-300">
                     <span>Сглаживание</span>
-                    <span className="font-mono tabular-nums text-emerald-300">
-                      {(selectedClip.chromaKeySmoothness ?? 0.15).toFixed(2)}
-                    </span>
+                    <ScrubNumberField
+                      compact
+                      accent="emerald"
+                      value={selectedClip.chromaKeySmoothness ?? 0.15}
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      decimals={2}
+                      ariaLabel="Сглаживание хромакея"
+                      onChange={(val) =>
+                        handleUpdateChromaKey(
+                          selectedClip.id,
+                          {
+                            chromaKeyEnabled: true,
+                            chromaKeyColor:
+                              selectedClip.chromaKeyColor || '#00ff00',
+                            chromaKeySmoothness: val,
+                          },
+                          false
+                        )
+                      }
+                      onCommit={(val) =>
+                        handleUpdateChromaKey(
+                          selectedClip.id,
+                          {
+                            chromaKeyEnabled: true,
+                            chromaKeyColor:
+                              selectedClip.chromaKeyColor || '#00ff00',
+                            chromaKeySmoothness: val,
+                          },
+                          true
+                        )
+                      }
+                    />
                   </div>
                   <input
                     type="range"
@@ -1825,7 +2206,7 @@ export default function App() {
                     }
                     className="h-2 w-full cursor-pointer accent-emerald-400"
                   />
-                </label>
+                </div>
               </div>
             </div>
           )}
@@ -1848,11 +2229,76 @@ export default function App() {
               <Scissors className="h-4 w-4 text-cyan-400" />
               <span>Разделить</span>
             </button>
+            <button
+              type="button"
+              onClick={handleDuplicateSelected}
+              className="flex h-11 min-w-[58px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
+            >
+              <CopyPlus className="h-4 w-4 text-cyan-400" />
+              <span>Копия</span>
+            </button>
+            {(selectedClip.kind === 'image' ||
+              selectedClip.kind === 'video') && (
+              <label
+                className={`flex h-11 min-w-[64px] shrink-0 cursor-pointer flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5 ${
+                  replacingMedia ? 'opacity-50 pointer-events-none' : ''
+                }`}
+              >
+                <RefreshCw
+                  className={`h-4 w-4 text-cyan-400 ${
+                    replacingMedia ? 'animate-spin' : ''
+                  }`}
+                />
+                <span>Заменить</span>
+                <input
+                  type="file"
+                  accept="video/*,image/*"
+                  disabled={replacingMedia}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file && selectedClip) {
+                      void handleReplaceClipMedia(selectedClip.id, file);
+                    }
+                    e.target.value = '';
+                  }}
+                  className="hidden"
+                />
+              </label>
+            )}
+            {(selectedClip.track === 'video' ||
+              selectedClip.track === 'overlay') && (
+              <button
+                type="button"
+                onClick={() =>
+                  moveClipTrackType(
+                    selectedClip.id,
+                    selectedClip.track === 'video' ? 'overlay' : 'video'
+                  )
+                }
+                className="flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-indigo-300 hover:bg-white/5"
+              >
+                <Layers className="h-4 w-4 text-indigo-400" />
+                <span>
+                  {selectedClip.track === 'video' ? 'Наложение' : 'Основное'}
+                </span>
+              </button>
+            )}
+            {(selectedClip.kind === 'image' ||
+              selectedClip.kind === 'video') && (
+              <button
+                type="button"
+                onClick={() => setShowCompressModal(true)}
+                className="flex h-11 min-w-[62px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-emerald-300 hover:bg-white/5"
+              >
+                <Minimize2 className="h-4 w-4 text-emerald-400" />
+                <span>Сжать</span>
+              </button>
+            )}
             {selectedClip.track !== 'audio' && (
               <button
                 type="button"
                 onClick={() => setShowTrackpad((v) => !v)}
-                className={`flex h-11 min-w-[68px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                className={`flex h-11 min-w-[66px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
                   showTrackpad
                     ? 'bg-cyan-500/20 text-cyan-300'
                     : 'text-zinc-200 hover:bg-white/5'
@@ -1881,56 +2327,29 @@ export default function App() {
             )}
             {(selectedClip.kind === 'image' ||
               selectedClip.kind === 'video') && (
-              <>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setShowOpacitySlider(false);
-                    setShowChromaKeyPanel((v) => !v);
-                  }}
-                  className={`flex h-11 min-w-[70px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
-                    showChromaKeyPanel
-                      ? 'bg-emerald-500/20 text-emerald-300'
-                      : selectedClip.chromaKeyEnabled
-                        ? 'text-emerald-300 hover:bg-white/5'
-                        : 'text-zinc-200 hover:bg-white/5'
-                  }`}
-                >
-                  <Pipette className="h-4 w-4 text-emerald-400" />
-                  <span>Хромакей</span>
-                </button>
-                <label
-                  className={`flex h-11 min-w-[66px] shrink-0 cursor-pointer flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5 ${
-                    replacingMedia ? 'opacity-50 pointer-events-none' : ''
-                  }`}
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 text-cyan-400 ${
-                      replacingMedia ? 'animate-spin' : ''
-                    }`}
-                  />
-                  <span>Заменить</span>
-                  <input
-                    type="file"
-                    accept="video/*,image/*"
-                    disabled={replacingMedia}
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
-                      if (file && selectedClip) {
-                        void handleReplaceClipMedia(selectedClip.id, file);
-                      }
-                      e.target.value = '';
-                    }}
-                    className="hidden"
-                  />
-                </label>
-              </>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOpacitySlider(false);
+                  setShowChromaKeyPanel((v) => !v);
+                }}
+                className={`flex h-11 min-w-[68px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  showChromaKeyPanel
+                    ? 'bg-emerald-500/20 text-emerald-300'
+                    : selectedClip.chromaKeyEnabled
+                      ? 'text-emerald-300 hover:bg-white/5'
+                      : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <Pipette className="h-4 w-4 text-emerald-400" />
+                <span>Хромакей</span>
+              </button>
             )}
             {selectedClip.track === 'overlay' && (
               <button
                 type="button"
                 onClick={() => setMobileSheet('overlay')}
-                className="flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-amber-300 hover:bg-white/5"
+                className="flex h-11 min-w-[72px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-amber-300 hover:bg-white/5"
               >
                 <Layers className="h-4 w-4 text-amber-400" />
                 <span>PIP/Ключи</span>
@@ -1939,7 +2358,7 @@ export default function App() {
             <button
               type="button"
               onClick={handleCycleSpeed}
-              className="flex h-11 min-w-[56px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
+              className="flex h-11 min-w-[54px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
             >
               <Gauge className="h-4 w-4 text-cyan-400" />
               <span>{selectedClip.speed}x</span>
@@ -1955,7 +2374,7 @@ export default function App() {
                       : 'effects'
                 )
               }
-              className="flex h-11 min-w-[64px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
+              className="flex h-11 min-w-[62px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
             >
               <Sparkles className="h-4 w-4 text-cyan-400" />
               <span>
@@ -1965,14 +2384,6 @@ export default function App() {
                     ? 'Звук'
                     : 'Эффекты'}
               </span>
-            </button>
-            <button
-              type="button"
-              onClick={handleDuplicateSelected}
-              className="flex h-11 min-w-[64px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium text-zinc-200 hover:bg-white/5"
-            >
-              <CopyPlus className="h-4 w-4 text-zinc-300" />
-              <span>Дубликат</span>
             </button>
             <button
               type="button"
@@ -1997,9 +2408,7 @@ export default function App() {
                   type="button"
                   onClick={() => {
                     if (tab.id === 'edit') {
-                      const first = project.clips[0];
-                      if (first) setSelectedClipId(first.id);
-                      else setMobileSheet('media');
+                      handleOpenEditTab();
                     } else {
                       setMobileSheet(tab.id);
                     }
@@ -2208,6 +2617,19 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Media Compression Quality Dialog (Media3 Transformer / Browser Fallback) */}
+      {showCompressModal &&
+        selectedClip &&
+        (selectedClip.kind === 'video' || selectedClip.kind === 'image') && (
+          <CompressMediaModal
+            clip={selectedClip}
+            onApplyCompressed={(res) =>
+              handleApplyCompressedMedia(selectedClip, res)
+            }
+            onClose={() => setShowCompressModal(false)}
+          />
+        )}
 
       <OfflineIndicator />
     </div>

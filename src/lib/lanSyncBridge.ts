@@ -37,6 +37,14 @@ interface LanSyncPluginInterface {
     url: string;
     fileName: string;
   }): Promise<{started: boolean}>;
+  compressVideo(options: {
+    layerId: string;
+    sourceUrl: string;
+    fileName: string;
+    targetHeight: number;
+    targetBitrate: number;
+  }): Promise<{started: boolean}>;
+  cancelCompressVideo(options: {layerId: string}): Promise<void>;
   addListener(
     eventName: 'udpRoomsUpdate',
     listenerFunc: (data: {rooms: DiscoveredUdpRoom[]}) => void
@@ -55,6 +63,25 @@ interface LanSyncPluginInterface {
   ): Promise<PluginListenerHandle>;
   addListener(
     eventName: 'mediaDownloadError',
+    listenerFunc: (data: {layerId: string; message: string}) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'mediaCompressProgress',
+    listenerFunc: (data: {layerId: string; progress: number}) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'mediaCompressComplete',
+    listenerFunc: (data: {
+      layerId: string;
+      fileName: string;
+      localUrl: string;
+      shareUrl: string;
+      originalSizeBytes: number;
+      compressedSizeBytes: number;
+    }) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'mediaCompressError',
     listenerFunc: (data: {layerId: string; message: string}) => void
   ): Promise<PluginListenerHandle>;
 }
@@ -415,4 +442,317 @@ export async function downloadMediaInBackground(opts: {
   const blob = new Blob(blobParts, {type: mime});
   onProgress?.(100);
   return URL.createObjectURL(blob);
+}
+
+export interface CompressedMediaResult {
+  fileName: string;
+  localSrc: string;
+  shareUrl: string;
+  originalSizeBytes: number;
+  compressedSizeBytes: number;
+  engine: 'media3' | 'browser';
+}
+
+export function isNativeMedia3Available(): boolean {
+  return hasNativeLanPlugin();
+}
+
+export async function cancelNativeVideoCompression(
+  layerId: string
+): Promise<void> {
+  if (!hasNativeLanPlugin()) return;
+  try {
+    await LanSync.cancelCompressVideo({layerId});
+  } catch {
+    // ignore
+  }
+}
+
+export async function compressClipMedia(opts: {
+  layerId: string;
+  kind: 'video' | 'image';
+  sourceUrl: string;
+  fileName: string;
+  targetHeight: number;
+  targetBitrate: number;
+  onProgress?: (pct: number) => void;
+  signal?: AbortSignal;
+}): Promise<CompressedMediaResult> {
+  const {
+    layerId,
+    kind,
+    sourceUrl,
+    fileName,
+    targetHeight,
+    targetBitrate,
+    onProgress,
+    signal,
+  } = opts;
+
+  if (kind === 'video' && hasNativeLanPlugin()) {
+    let resolvedUrl = sourceUrl;
+    if (sourceUrl.startsWith('blob:')) {
+      const resp = await fetch(sourceUrl);
+      const blob = await resp.blob();
+      const uploaded = await uploadFileForP2P(
+        new File([blob], fileName || 'clip.mp4', {
+          type: blob.type || 'video/mp4',
+        }),
+        'video'
+      );
+      resolvedUrl = uploaded.localSrc;
+    }
+
+    const netInfo = await getP2PNetworkInfo();
+    return new Promise<CompressedMediaResult>((resolve, reject) => {
+      let settled = false;
+      let progressHandle: PluginListenerHandle | null = null;
+      let completeHandle: PluginListenerHandle | null = null;
+      let errorHandle: PluginListenerHandle | null = null;
+
+      const cleanup = () => {
+        void progressHandle?.remove();
+        void completeHandle?.remove();
+        void errorHandle?.remove();
+        signal?.removeEventListener('abort', onAbort);
+      };
+
+      const onAbort = () => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          void LanSync.cancelCompressVideo({layerId}).catch(() => {});
+          reject(new Error('Сжатие отменено'));
+        }
+      };
+      signal?.addEventListener('abort', onAbort);
+
+      const setup = async () => {
+        progressHandle = await LanSync.addListener(
+          'mediaCompressProgress',
+          (ev) => {
+            if (ev.layerId === layerId) {
+              onProgress?.(ev.progress);
+            }
+          }
+        );
+        completeHandle = await LanSync.addListener(
+          'mediaCompressComplete',
+          (ev) => {
+            if (ev.layerId === layerId && !settled) {
+              settled = true;
+              cleanup();
+              const shareIp = pickBestShareIpForRemoteHost(
+                netInfo.interfaces || [],
+                netInfo.primaryIp || '127.0.0.1'
+              );
+              const port = netInfo.port || 8080;
+              const bestShareUrl = `http://${shareIp}:${port}/media/${encodeURIComponent(ev.fileName)}`;
+              onProgress?.(100);
+              resolve({
+                fileName: ev.fileName,
+                localSrc: ev.localUrl,
+                shareUrl: bestShareUrl || ev.shareUrl,
+                originalSizeBytes: ev.originalSizeBytes,
+                compressedSizeBytes: ev.compressedSizeBytes,
+                engine: 'media3',
+              });
+            }
+          }
+        );
+        errorHandle = await LanSync.addListener('mediaCompressError', (ev) => {
+          if (ev.layerId === layerId && !settled) {
+            settled = true;
+            cleanup();
+            reject(new Error(ev.message || 'Ошибка сжатия Media3 Transformer'));
+          }
+        });
+
+        await LanSync.compressVideo({
+          layerId,
+          sourceUrl: resolvedUrl,
+          fileName: fileName || 'clip.mp4',
+          targetHeight,
+          targetBitrate,
+        });
+      };
+
+      setup().catch((err) => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          reject(err);
+        }
+      });
+    });
+  }
+
+  // Browser / PWA fallback
+  if (kind === 'image') {
+    onProgress?.(15);
+    const res = await fetch(sourceUrl);
+    const origBlob = await res.blob();
+    const imgUrl = URL.createObjectURL(origBlob);
+    try {
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error('Не удалось загрузить изображение'));
+        el.src = imgUrl;
+      });
+      if (signal?.aborted) throw new Error('Сжатие отменено');
+      const scale =
+        targetHeight > 0 && img.naturalHeight > targetHeight
+          ? targetHeight / img.naturalHeight
+          : 1;
+      const w = Math.max(2, Math.round(img.naturalWidth * scale));
+      const h = Math.max(2, Math.round(img.naturalHeight * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('Canvas недоступен');
+      ctx.drawImage(img, 0, 0, w, h);
+      const quality =
+        targetBitrate <= 700_000 ? 0.55 : targetBitrate <= 1_400_000 ? 0.72 : 0.84;
+      onProgress?.(60);
+      const outBlob = await new Promise<Blob>((resolve, reject) => {
+        canvas.toBlob(
+          (b) => (b ? resolve(b) : reject(new Error('Не удалось сжать фото'))),
+          'image/jpeg',
+          quality
+        );
+      });
+      const base = (fileName || 'image').replace(/\.[^.]+$/, '');
+      const outFile = new File([outBlob], `${base}_${targetHeight}p.jpg`, {
+        type: 'image/jpeg',
+      });
+      const uploaded = await uploadFileForP2P(outFile, 'image');
+      onProgress?.(100);
+      return {
+        fileName: uploaded.fileName,
+        localSrc: uploaded.localSrc,
+        shareUrl: uploaded.shareUrl,
+        originalSizeBytes: origBlob.size,
+        compressedSizeBytes: outBlob.size,
+        engine: 'browser',
+      };
+    } finally {
+      URL.revokeObjectURL(imgUrl);
+    }
+  }
+
+  // Browser Video fallback via MediaRecorder
+  onProgress?.(5);
+  const srcResp = await fetch(sourceUrl);
+  const origVideoBlob = await srcResp.blob();
+  const srcBlobUrl = URL.createObjectURL(origVideoBlob);
+
+  try {
+    const vid = document.createElement('video');
+    vid.muted = false;
+    vid.playsInline = true;
+    vid.src = srcBlobUrl;
+
+    await new Promise<void>((resolve, reject) => {
+      vid.onloadedmetadata = () => resolve();
+      vid.onerror = () => reject(new Error('Не удалось прочитать видео'));
+    });
+
+    if (signal?.aborted) throw new Error('Сжатие отменено');
+
+    const srcW = vid.videoWidth || 1280;
+    const srcH = vid.videoHeight || 720;
+    const scale =
+      targetHeight > 0 && srcH > targetHeight ? targetHeight / srcH : 1;
+    const outW = Math.max(2, Math.round((srcW * scale) / 2) * 2);
+    const outH = Math.max(2, Math.round((srcH * scale) / 2) * 2);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = outW;
+    canvas.height = outH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) throw new Error('Canvas 2D недоступен');
+
+    const stream = canvas.captureStream(30);
+    const mimeCandidates = [
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm',
+      'video/mp4',
+    ];
+    const mimeType =
+      mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+    const recorder = new MediaRecorder(
+      stream,
+      mimeType
+        ? {mimeType, videoBitsPerSecond: targetBitrate}
+        : {videoBitsPerSecond: targetBitrate}
+    );
+
+    const chunks: BlobPart[] = [];
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+
+    const donePromise = new Promise<Blob>((resolve) => {
+      recorder.onstop = () => {
+        resolve(new Blob(chunks, {type: mimeType || 'video/webm'}));
+      };
+    });
+
+    recorder.start(200);
+    vid.currentTime = 0;
+    await vid.play().catch(() => {});
+
+    const totalDur = Math.max(0.2, vid.duration || 5);
+    await new Promise<void>((resolve, reject) => {
+      let raf = 0;
+      const cleanupLoop = () => {
+        cancelAnimationFrame(raf);
+        signal?.removeEventListener('abort', onAbort);
+      };
+      const onAbort = () => {
+        cleanupLoop();
+        vid.pause();
+        if (recorder.state !== 'inactive') recorder.stop();
+        reject(new Error('Сжатие отменено'));
+      };
+      signal?.addEventListener('abort', onAbort);
+
+      const draw = () => {
+        if (signal?.aborted) return;
+        ctx.drawImage(vid, 0, 0, outW, outH);
+        const pct = Math.min(95, Math.round((vid.currentTime / totalDur) * 95));
+        onProgress?.(pct);
+        if (vid.ended || vid.currentTime >= totalDur - 0.04) {
+          cleanupLoop();
+          if (recorder.state !== 'inactive') recorder.stop();
+          resolve();
+          return;
+        }
+        raf = requestAnimationFrame(draw);
+      };
+      raf = requestAnimationFrame(draw);
+    });
+
+    const outBlob = await donePromise;
+    const ext = (mimeType || '').includes('mp4') ? 'mp4' : 'webm';
+    const base = (fileName || 'video').replace(/\.[^.]+$/, '');
+    const outFile = new File([outBlob], `${base}_${targetHeight}p.${ext}`, {
+      type: outBlob.type || 'video/webm',
+    });
+    const uploaded = await uploadFileForP2P(outFile, 'video');
+    onProgress?.(100);
+    return {
+      fileName: uploaded.fileName,
+      localSrc: uploaded.localSrc,
+      shareUrl: uploaded.shareUrl,
+      originalSizeBytes: origVideoBlob.size,
+      compressedSizeBytes: outBlob.size,
+      engine: 'browser',
+    };
+  } finally {
+    URL.revokeObjectURL(srcBlobUrl);
+  }
 }

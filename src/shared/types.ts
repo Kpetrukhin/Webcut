@@ -214,9 +214,11 @@ export type ClientWsMessage =
   | {type: 'op:track_add'; track: Track}
   | {type: 'op:track_update'; trackId: string; patch: Partial<Track>}
   | {type: 'op:track_delete'; trackId: string}
+  | {type: 'op:track_reorder'; trackIds: string[]}
   | {type: 'op:clip_add'; clip: Clip; newTrack?: Track}
   | {type: 'op:clip_update'; clipId: string; patch: Partial<Clip>}
   | {type: 'op:clip_delete'; clipId: string}
+  | {type: 'op:clip_duplicate'; clipId: string; newClipId: string}
   | {
       type: 'op:clip_split';
       clipId: string;
@@ -289,6 +291,12 @@ export type ServerWsMessage =
     }
   | {type: 'op:track_delete'; trackId: string; revision: number; senderId: string}
   | {
+      type: 'op:track_reorder';
+      trackIds: string[];
+      revision: number;
+      senderId: string;
+    }
+  | {
       type: 'op:clip_add';
       clip: Clip;
       newTrack?: Track;
@@ -303,6 +311,13 @@ export type ServerWsMessage =
       senderId: string;
     }
   | {type: 'op:clip_delete'; clipId: string; revision: number; senderId: string}
+  | {
+      type: 'op:clip_duplicate';
+      clipId: string;
+      newClipId: string;
+      revision: number;
+      senderId: string;
+    }
   | {
       type: 'op:clip_split';
       clipId: string;
@@ -751,5 +766,75 @@ export function applyClipSplit(
 
   const next = [...clips];
   next.splice(idx, 1, firstHalf, secondHalf);
+  return next;
+}
+
+export function applyTrackReorder(
+  tracks: Track[],
+  trackIds: string[]
+): Track[] {
+  const byId = new Map(tracks.map((t) => [t.id, t]));
+  const seen = new Set<string>();
+  const reordered: Track[] = [];
+  for (const id of trackIds) {
+    const t = byId.get(id);
+    if (t && !seen.has(id)) {
+      reordered.push(t);
+      seen.add(id);
+    }
+  }
+  for (const t of tracks) {
+    if (!seen.has(t.id)) {
+      reordered.push(t);
+    }
+  }
+  return reordered;
+}
+
+export function applyClipDuplicate(
+  clips: Clip[],
+  clipId: string,
+  newClipId: string
+): Clip[] {
+  const idx = clips.findIndex((c) => c.id === clipId);
+  if (idx === -1) return clips;
+  if (clips.some((c) => c.id === newClipId)) return clips;
+
+  const target = clips[idx];
+  const copyStart = Math.round((target.start + target.duration) * 100) / 100;
+
+  const clonedKeyframes = target.keyframes?.map((kf) => ({
+    ...kf,
+    id: `kf-${Math.random().toString(36).slice(2, 8)}`,
+  }));
+
+  const copy: Clip = {
+    ...target,
+    textStyle: target.textStyle ? {...target.textStyle} : undefined,
+    keyframes: clonedKeyframes,
+    id: newClipId,
+    name: `${target.name} (копия)`,
+    start: copyStart,
+    lockedByUserId: null,
+    lockedByUserName: null,
+    lockedByUserColor: null,
+  };
+
+  const shifted = clips.map((c) => {
+    if (
+      c.id !== target.id &&
+      c.trackId === target.trackId &&
+      c.start >= copyStart - 0.05
+    ) {
+      return {
+        ...c,
+        start: Math.round((c.start + target.duration) * 100) / 100,
+      };
+    }
+    return c;
+  });
+
+  const next = [...shifted];
+  next.splice(idx + 1, 0, copy);
   return next;
 }

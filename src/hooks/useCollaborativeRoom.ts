@@ -1,6 +1,8 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
 import {
+  applyClipDuplicate,
   applyClipSplit,
+  applyTrackReorder,
   createDefaultTracks,
   createStarterClips,
   createTrackOfType,
@@ -375,6 +377,14 @@ export function useCollaborativeRoom() {
             }));
             break;
 
+          case 'op:track_reorder':
+            setProject((prev) => ({
+              ...prev,
+              revision: msg.revision,
+              tracks: applyTrackReorder(prev.tracks, msg.trackIds),
+            }));
+            break;
+
           case 'op:clip_add':
             setProject((prev) => {
               if (prev.clips.some((c) => c.id === msg.clip.id)) return prev;
@@ -418,6 +428,18 @@ export function useCollaborativeRoom() {
                 prev.clips,
                 msg.clipId,
                 msg.splitTime,
+                msg.newClipId
+              ),
+            }));
+            break;
+
+          case 'op:clip_duplicate':
+            setProject((prev) => ({
+              ...prev,
+              revision: msg.revision,
+              clips: applyClipDuplicate(
+                prev.clips,
+                msg.clipId,
                 msg.newClipId
               ),
             }));
@@ -467,7 +489,12 @@ export function useCollaborativeRoom() {
                           mediaStatus: isFromSelf ? 'READY' : 'DOWNLOADING',
                           downloadProgress: isFromSelf ? 100 : 0,
                           ...(msg.clip
-                            ? {name: msg.clip.name, kind: msg.clip.kind}
+                            ? {
+                                name: msg.clip.name,
+                                kind: msg.clip.kind,
+                                trimStart: msg.clip.trimStart,
+                                sourceDuration: msg.clip.sourceDuration,
+                              }
                             : {}),
                         }
                       : c
@@ -618,6 +645,31 @@ export function useCollaborativeRoom() {
     [pushUndo, sendRaw]
   );
 
+  const reorderTracks = useCallback(
+    (
+      trackIds: string[],
+      opts?: {commit?: boolean; undoTracks?: Track[]}
+    ) => {
+      const commit = opts?.commit ?? true;
+      if (commit) {
+        const snapshot: UndoSnapshot = {
+          clips: structuredClone(projectRef.current.clips),
+          tracks: structuredClone(opts?.undoTracks ?? projectRef.current.tracks),
+        };
+        setUndoStack((prev) => [...prev.slice(-29), snapshot]);
+        setRedoStack([]);
+      }
+      setProject((prev) => ({
+        ...prev,
+        tracks: applyTrackReorder(prev.tracks, trackIds),
+      }));
+      if (commit) {
+        sendRaw({type: 'op:track_reorder', trackIds});
+      }
+    },
+    [sendRaw]
+  );
+
   const addClip = useCallback(
     (
       clipInput: Omit<Clip, 'trackId'> & {trackId?: string},
@@ -678,6 +730,12 @@ export function useCollaborativeRoom() {
       newTrack?: Track;
     }) => {
       const localUrl = opts.localSrc || opts.mediaUrl;
+      const alreadyExists = projectRef.current.clips.some(
+        (c) => c.id === opts.layerId
+      );
+      if (alreadyExists) {
+        pushUndo();
+      }
       setProject((prev) => {
         const nextTracks =
           opts.newTrack &&
@@ -699,7 +757,12 @@ export function useCollaborativeRoom() {
                     mediaStatus: 'READY',
                     downloadProgress: 100,
                     ...(opts.clip
-                      ? {name: opts.clip.name, kind: opts.clip.kind}
+                      ? {
+                          name: opts.clip.name,
+                          kind: opts.clip.kind,
+                          trimStart: opts.clip.trimStart,
+                          sourceDuration: opts.clip.sourceDuration,
+                        }
                       : {}),
                   }
                 : c
@@ -730,7 +793,7 @@ export function useCollaborativeRoom() {
         newTrack: opts.newTrack,
       });
     },
-    [sendRaw]
+    [pushUndo, sendRaw]
   );
 
   const sendLayerLock = useCallback(
@@ -842,6 +905,100 @@ export function useCollaborativeRoom() {
       }));
       sendRaw({type: 'op:clip_split', clipId, splitTime, newClipId});
       return newClipId;
+    },
+    [pushUndo, sendRaw, showLockWarning]
+  );
+
+  const duplicateClip = useCallback(
+    (clipId: string): string | null => {
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
+      if (!target) return null;
+      if (
+        target.lockedByUserId &&
+        target.lockedByUserId !== userRef.current.id
+      ) {
+        showLockWarning(target.lockedByUserName || 'другой участник');
+        return null;
+      }
+      pushUndo();
+      const newClipId = `clip-${Math.random().toString(36).slice(2, 9)}`;
+      setProject((prev) => ({
+        ...prev,
+        clips: applyClipDuplicate(prev.clips, clipId, newClipId),
+      }));
+      sendRaw({type: 'op:clip_duplicate', clipId, newClipId});
+      return newClipId;
+    },
+    [pushUndo, sendRaw, showLockWarning]
+  );
+
+  const moveClipTrackType = useCallback(
+    (clipId: string, targetTrackType: 'video' | 'overlay') => {
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
+      if (!target || target.track === targetTrackType) return;
+      if (target.track !== 'video' && target.track !== 'overlay') return;
+      if (
+        target.lockedByUserId &&
+        target.lockedByUserId !== userRef.current.id
+      ) {
+        showLockWarning(target.lockedByUserName || 'другой участник');
+        return;
+      }
+
+      pushUndo();
+      const placed = resolveTrackPlacement(
+        projectRef.current.tracks,
+        projectRef.current.clips.filter((c) => c.id !== clipId),
+        targetTrackType,
+        target.start,
+        target.duration,
+        false
+      );
+
+      const patch: Partial<Clip> =
+        targetTrackType === 'overlay'
+          ? {
+              track: 'overlay',
+              trackId: placed.trackId,
+              mediaScale:
+                target.mediaScale !== undefined && target.mediaScale < 0.99
+                  ? target.mediaScale
+                  : 0.48,
+              mediaX: target.mediaX ?? 0.5,
+              mediaY: target.mediaY ?? 0.5,
+              borderRadius:
+                target.borderRadius && target.borderRadius > 0
+                  ? target.borderRadius
+                  : 16,
+            }
+          : {
+              track: 'video',
+              trackId: placed.trackId,
+              mediaScale: 1,
+              mediaX: 0.5,
+              mediaY: 0.5,
+              borderRadius: 0,
+            };
+
+      setProject((prev) => {
+        const nextTracks =
+          placed.newTrack &&
+          !prev.tracks.some((t) => t.id === placed.newTrack!.id)
+            ? [...prev.tracks, placed.newTrack]
+            : prev.tracks;
+        return {
+          ...prev,
+          tracks: nextTracks,
+          clips: prev.clips.map((c) =>
+            c.id === clipId ? {...c, ...patch, id: c.id} : c
+          ),
+        };
+      });
+
+      if (placed.newTrack) {
+        sendRaw({type: 'op:track_add', track: placed.newTrack});
+      }
+      sendRaw({type: 'op:clip_update', clipId, patch});
     },
     [pushUndo, sendRaw, showLockWarning]
   );
@@ -1102,10 +1259,13 @@ export function useCollaborativeRoom() {
     addTrack,
     updateTrack,
     deleteTrack,
+    reorderTracks,
     addClip,
     updateClip,
     deleteClip,
     splitClip,
+    duplicateClip,
+    moveClipTrackType,
     updateProjectMeta,
     addCustomFont,
     replaceClips,

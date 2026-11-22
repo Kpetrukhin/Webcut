@@ -9,7 +9,9 @@ import express from 'express';
 import multer from 'multer';
 import {WebSocket, WebSocketServer} from 'ws';
 import {
+  applyClipDuplicate,
   applyClipSplit,
+  applyTrackReorder,
   createDefaultTracks,
   createStarterClips,
   normalizeProjectTracks,
@@ -692,6 +694,24 @@ wss.on('connection', (ws) => {
         break;
       }
 
+      case 'op:track_reorder': {
+        project.tracks = applyTrackReorder(project.tracks, msg.trackIds);
+        project.revision += 1;
+        project.updatedAt = Date.now();
+        scheduleSaveRooms();
+        broadcastToRoom(
+          session.roomId,
+          {
+            type: 'op:track_reorder',
+            trackIds: msg.trackIds,
+            revision: project.revision,
+            senderId: session.user.id,
+          },
+          ws
+        );
+        break;
+      }
+
       case 'op:clip_add': {
         if (project.clips.some((c) => c.id === msg.clip.id)) return;
         if (
@@ -789,6 +809,32 @@ wss.on('connection', (ws) => {
           },
           ws
         );
+        break;
+      }
+
+      case 'op:clip_duplicate': {
+        const nextClips = applyClipDuplicate(
+          project.clips,
+          msg.clipId,
+          msg.newClipId
+        );
+        if (nextClips === project.clips) return;
+        project.clips = nextClips;
+        project.revision += 1;
+        project.updatedAt = Date.now();
+        scheduleSaveRooms();
+        broadcastToRoom(
+          session.roomId,
+          {
+            type: 'op:clip_duplicate',
+            clipId: msg.clipId,
+            newClipId: msg.newClipId,
+            revision: project.revision,
+            senderId: session.user.id,
+          },
+          ws
+        );
+        broadcastLobbyRooms();
         break;
       }
 
@@ -914,6 +960,14 @@ wss.on('connection', (ws) => {
             src: msg.mediaUrl,
             mediaRemoteUrl: msg.mediaUrl,
             mediaFileName: msg.fileName,
+            ...(msg.clip
+              ? {
+                  name: msg.clip.name,
+                  kind: msg.clip.kind,
+                  trimStart: msg.clip.trimStart,
+                  sourceDuration: msg.clip.sourceDuration,
+                }
+              : {}),
           };
         } else if (msg.clip) {
           project.clips.push({
