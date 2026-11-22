@@ -1,5 +1,9 @@
 import type {ProjectFont} from '../shared/types.ts';
-import {resolveMediaSrc} from './serverConfig.ts';
+import {
+  resolveMediaCandidateUrls,
+  resolveMediaSrc,
+} from './serverConfig.ts';
+import {sha256Hex} from './sha256.ts';
 
 export const BUILTIN_FONTS: Array<{name: string; family: string; css: string}> = [
   {name: 'Jakarta (Стандарт)', family: 'Plus Jakarta Sans', css: '"Plus Jakarta Sans", sans-serif'},
@@ -39,28 +43,80 @@ export function sanitizeFontFamilyName(raw: string): string {
   return cleaned || 'CustomFont';
 }
 
-export function loadCustomFont(fontFamily: string, src?: string): Promise<void> {
+export interface LoadCustomFontOptions {
+  fileName?: string;
+  fileSize?: number;
+  fileHash?: string;
+}
+
+export function loadCustomFont(
+  fontFamily: string,
+  src?: string,
+  opts?: LoadCustomFontOptions
+): Promise<void> {
   if (!fontFamily || !src) return Promise.resolve();
-  const resolved = resolveMediaSrc(src) || src;
-  const cacheKey = `${fontFamily}::${resolved}`;
+  const primary = resolveMediaSrc(src) || src;
+  const cacheKey = `${fontFamily}::${opts?.fileName || primary}`;
   if (loadedFontKeys.has(cacheKey)) return Promise.resolve();
 
   const existing = loadingFontPromises.get(cacheKey);
   if (existing) return existing;
 
+  const candidates =
+    src.startsWith('blob:') || src.startsWith('data:')
+      ? [src]
+      : resolveMediaCandidateUrls(src, opts?.fileName);
+  if (candidates.length === 0) candidates.push(primary);
+
   const promise = (async () => {
-    try {
-      const face = new FontFace(fontFamily, `url("${resolved}")`);
-      const loaded = await face.load();
-      document.fonts.add(loaded);
-      loadedFontKeys.add(cacheKey);
-      notifyFontLoaded();
-    } catch {
-      // ignore invalid font files
-    } finally {
-      loadingFontPromises.delete(cacheKey);
+    const maxAttempts = 3;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const targetUrl =
+        candidates[(attempt - 1) % candidates.length] || primary;
+      try {
+        if (targetUrl.startsWith('blob:') || targetUrl.startsWith('data:')) {
+          const face = new FontFace(fontFamily, `url("${targetUrl}")`);
+          const loaded = await face.load();
+          document.fonts.add(loaded);
+          loadedFontKeys.add(cacheKey);
+          notifyFontLoaded();
+          return;
+        }
+
+        const res = await fetch(targetUrl);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const buf = await res.arrayBuffer();
+        const headerSize = Number(res.headers.get('x-file-size') || 0);
+        const expectedSize = opts?.fileSize || headerSize;
+        if (expectedSize > 0 && buf.byteLength !== expectedSize) {
+          throw new Error(
+            `Размер шрифта не совпал (${buf.byteLength} !== ${expectedSize})`
+          );
+        }
+        const headerHash = res.headers.get('x-content-sha256')?.trim();
+        const expectedHash = (opts?.fileHash || headerHash || '').toLowerCase();
+        if (expectedHash) {
+          const actualHash = await sha256Hex(buf);
+          if (actualHash !== expectedHash) {
+            throw new Error('Контрольная сумма шрифта повреждена');
+          }
+        }
+
+        const face = new FontFace(fontFamily, buf);
+        const loaded = await face.load();
+        document.fonts.add(loaded);
+        loadedFontKeys.add(cacheKey);
+        notifyFontLoaded();
+        return;
+      } catch {
+        if (attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 300 * attempt));
+        }
+      }
     }
-  })();
+  })().finally(() => {
+    loadingFontPromises.delete(cacheKey);
+  });
 
   loadingFontPromises.set(cacheKey, promise);
   return promise;
@@ -68,5 +124,13 @@ export function loadCustomFont(fontFamily: string, src?: string): Promise<void> 
 
 export async function preloadProjectFonts(fonts?: ProjectFont[]): Promise<void> {
   if (!fonts || fonts.length === 0) return;
-  await Promise.all(fonts.map((f) => loadCustomFont(f.fontFamily, f.src)));
+  await Promise.all(
+    fonts.map((f) =>
+      loadCustomFont(f.fontFamily, f.src, {
+        fileName: f.fileName,
+        fileSize: f.fileSize,
+        fileHash: f.fileHash,
+      })
+    )
+  );
 }

@@ -127,11 +127,31 @@ class LanSyncPlugin : Plugin() {
     }
 
     @PluginMethod
+    fun getServerStatus(call: PluginCall) {
+        val statusObj = engine.getServerStatusJson()
+        val res = JSObject().apply {
+            put("state", statusObj.optString("state", "stopped"))
+            put("port", statusObj.optInt("port", 8080))
+            put("preferredPort", statusObj.optInt("preferredPort", 8080))
+            put("hosting", statusObj.optBoolean("hosting", false))
+            if (statusObj.has("error")) {
+                put("error", statusObj.optString("error"))
+            }
+        }
+        call.resolve(res)
+    }
+
+    @PluginMethod
     fun ensureMediaServer(call: PluginCall) {
         val port = engine.ensureMediaServerStarted()
+        val statusObj = engine.getServerStatusJson()
         val res = buildInterfacesPayload()
         res.put("port", port)
         res.put("localUploadUrl", "http://127.0.0.1:$port/media/upload")
+        res.put("serverState", statusObj.optString("state", "running"))
+        if (statusObj.has("error")) {
+            res.put("serverError", statusObj.optString("error"))
+        }
         call.resolve(res)
     }
 
@@ -139,11 +159,16 @@ class LanSyncPlugin : Plugin() {
     fun startHostServer(call: PluginCall) {
         val snapshot = call.getString("snapshotJson")
         val port = engine.startHostServer(snapshot)
+        val statusObj = engine.getServerStatusJson()
         val res = buildInterfacesPayload()
-        res.put("ok", true)
+        res.put("ok", statusObj.optString("state", "running") == "running")
         res.put("port", port)
         res.put("wsUrl", "ws://127.0.0.1:$port/sync")
         res.put("localUploadUrl", "http://127.0.0.1:$port/media/upload")
+        res.put("serverState", statusObj.optString("state", "running"))
+        if (statusObj.has("error")) {
+            res.put("serverError", statusObj.optString("error"))
+        }
         call.resolve(res)
     }
 
@@ -185,7 +210,19 @@ class LanSyncPlugin : Plugin() {
             return
         }
         val fileName = call.getString("fileName") ?: "media-${System.currentTimeMillis()}"
-        engine.downloadMediaToCache(layerId, url, fileName)
+        val fallbackUrl = call.getString("fallbackUrl")
+        val expectedSize = call.getDouble("expectedSize", -1.0)?.toLong() ?: -1L
+        val expectedHash = call.getString("expectedHash")
+        val maxRetries = call.getInt("maxRetries", 3) ?: 3
+        engine.downloadMediaToCache(
+            layerId = layerId,
+            remoteUrl = url,
+            fileName = fileName,
+            fallbackUrl = fallbackUrl,
+            expectedSize = expectedSize,
+            expectedHash = expectedHash,
+            maxRetries = maxRetries
+        )
         call.resolve(JSObject().apply { put("started", true) })
     }
 
@@ -248,12 +285,15 @@ class LanSyncPlugin : Plugin() {
                     durationMs = durationMs
                 )
                 val shareUrl = "http://${engine.getPrimaryIp()}:${engine.getBoundPort()}/media/$outName"
+                val (fileSize, fileHash) = engine.getCachedFileMetadata(outName)
                 call.resolve(
                     JSObject().apply {
                         put("fileName", outName)
                         put("localUrl", localUrl)
                         put("shareUrl", shareUrl)
                         put("durationSec", durSec)
+                        if (fileSize > 0) put("fileSize", fileSize)
+                        if (fileHash.isNotEmpty()) put("fileHash", fileHash)
                     }
                 )
             } catch (err: Throwable) {

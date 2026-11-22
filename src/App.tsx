@@ -125,6 +125,9 @@ export default function App() {
     hostPort,
     udpRooms,
     lockWarning,
+    pingMs,
+    ktorStatus,
+    downloadQueue,
     status,
     project,
     collaborators,
@@ -151,6 +154,8 @@ export default function App() {
     sendChatMessage,
     sendLayerMediaUpdated,
     sendLayerLock,
+    forceSyncProject,
+    retryMediaDownload,
     switchRoom,
     updateUserProfile,
     updateServerConnection,
@@ -506,6 +511,8 @@ export default function App() {
       src: string;
       fileName?: string;
       remoteUrl?: string;
+      fileSize?: number;
+      fileHash?: string;
       duration: number;
       track: 'video' | 'overlay';
       forceNewTrack?: boolean;
@@ -533,6 +540,8 @@ export default function App() {
           isSticker: isSticker || undefined,
           mediaFileName: opts.fileName,
           mediaRemoteUrl: opts.remoteUrl,
+          mediaFileSize: opts.fileSize,
+          mediaFileHash: opts.fileHash,
           mediaStatus: 'READY',
           downloadProgress: 100,
           start,
@@ -567,6 +576,8 @@ export default function App() {
           fileName: opts.fileName || opts.name,
           mediaUrl: opts.remoteUrl,
           localSrc: opts.src,
+          fileSize: opts.fileSize,
+          fileHash: opts.fileHash,
           clip,
           newTrack,
         });
@@ -620,6 +631,9 @@ export default function App() {
           src: prepared.localSrc,
           mediaFileName: prepared.fileName,
           mediaRemoteUrl: prepared.shareUrl,
+          mediaFileSize: prepared.fileSize,
+          mediaFileHash: prepared.fileHash,
+          mediaError: undefined,
           mediaStatus: 'READY',
           downloadProgress: 100,
           trimStart: 0,
@@ -631,6 +645,8 @@ export default function App() {
           fileName: prepared.fileName,
           mediaUrl: prepared.shareUrl,
           localSrc: prepared.localSrc,
+          fileSize: prepared.fileSize,
+          fileHash: prepared.fileHash,
           clip: updatedClip,
         });
       } finally {
@@ -647,6 +663,7 @@ export default function App() {
         src: res.localSrc,
         mediaFileName: res.fileName,
         mediaRemoteUrl: res.shareUrl,
+        mediaFileSize: res.compressedSizeBytes,
         mediaStatus: 'READY',
         downloadProgress: 100,
       };
@@ -655,6 +672,7 @@ export default function App() {
         fileName: res.fileName,
         mediaUrl: res.shareUrl,
         localSrc: res.localSrc,
+        fileSize: res.compressedSizeBytes,
         clip: updatedClip,
       });
     },
@@ -795,6 +813,8 @@ export default function App() {
       src: string;
       fileName?: string;
       remoteUrl?: string;
+      fileSize?: number;
+      fileHash?: string;
       duration: number;
       startTime?: number;
       forceNewTrack?: boolean;
@@ -813,6 +833,8 @@ export default function App() {
           src: opts.src,
           mediaFileName: opts.fileName,
           mediaRemoteUrl: opts.remoteUrl,
+          mediaFileSize: opts.fileSize,
+          mediaFileHash: opts.fileHash,
           mediaStatus: 'READY',
           downloadProgress: 100,
           start,
@@ -841,6 +863,8 @@ export default function App() {
           fileName: opts.fileName || opts.name,
           mediaUrl: opts.remoteUrl,
           localSrc: opts.src,
+          fileSize: opts.fileSize,
+          fileHash: opts.fileHash,
           clip,
           newTrack,
         });
@@ -1549,6 +1573,16 @@ export default function App() {
                           />
                         </label>
                       )}
+                      {selectedClip.mediaStatus === 'ERROR' && (
+                        <button
+                          type="button"
+                          onClick={() => retryMediaDownload(selectedClip.id)}
+                          className="col-span-2 flex h-11 items-center justify-center gap-1.5 rounded-xl border border-rose-500/50 bg-rose-500/20 px-3 text-xs font-semibold text-rose-200 hover:bg-rose-500/30"
+                        >
+                          <RefreshCw className="h-4 w-4 text-rose-300" />
+                          Перекачать файл P2P
+                        </button>
+                      )}
                       {(selectedClip.track === 'video' ||
                         selectedClip.track === 'overlay') && (
                         <button
@@ -1979,6 +2013,9 @@ export default function App() {
                 networkInterfaces={networkInterfaces}
                 hostPort={hostPort}
                 udpRooms={udpRooms}
+                pingMs={pingMs}
+                ktorStatus={ktorStatus}
+                downloadQueue={downloadQueue}
                 user={user}
                 allCollaborators={allCollaborators}
                 availableRooms={availableRooms}
@@ -1995,6 +2032,8 @@ export default function App() {
                 onRefreshNetwork={() => {
                   void refreshNetworkInfo();
                 }}
+                onForceSyncProject={forceSyncProject}
+                onRetryDownload={retryMediaDownload}
               />
             )}
           </div>
@@ -2386,6 +2425,16 @@ export default function App() {
                             className="hidden"
                           />
                         </label>
+                        {selectedClip.mediaStatus === 'ERROR' && (
+                          <button
+                            type="button"
+                            onClick={() => retryMediaDownload(selectedClip.id)}
+                            className="flex h-10 shrink-0 items-center gap-1 rounded-xl border border-rose-500/50 bg-rose-500/20 px-2.5 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/30"
+                          >
+                            <RefreshCw className="h-3.5 w-3.5 text-rose-300" />
+                            <span>Перекачать</span>
+                          </button>
+                        )}
                       </>
                     )}
                   </div>
@@ -2529,6 +2578,7 @@ export default function App() {
               onDeleteTrack={deleteTrack}
               onReorderTracks={reorderTracks}
               onLockLayer={sendLayerLock}
+              onRetryDownload={retryMediaDownload}
               onClipTransform={handleClipTransform}
             />
           </div>
@@ -2712,6 +2762,8 @@ export default function App() {
                 src: rec.src,
                 fileName: rec.fileName,
                 remoteUrl: rec.remoteUrl,
+                fileSize: rec.fileSize,
+                fileHash: rec.fileHash,
                 duration: rec.duration,
                 startTime: rec.startTime,
                 forceNewTrack: false,
@@ -3359,6 +3411,9 @@ export default function App() {
             networkInterfaces={networkInterfaces}
             hostPort={hostPort}
             udpRooms={udpRooms}
+            pingMs={pingMs}
+            ktorStatus={ktorStatus}
+            downloadQueue={downloadQueue}
             user={user}
             allCollaborators={allCollaborators}
             availableRooms={availableRooms}
@@ -3378,6 +3433,8 @@ export default function App() {
             onRefreshNetwork={() => {
               void refreshNetworkInfo();
             }}
+            onForceSyncProject={forceSyncProject}
+            onRetryDownload={retryMediaDownload}
           />
         </BottomSheet>
       )}
@@ -3507,6 +3564,8 @@ export default function App() {
               src: st.src,
               fileName: st.fileName,
               remoteUrl: st.remoteUrl,
+              fileSize: st.fileSize,
+              fileHash: st.fileHash,
               duration: 5,
               track: 'overlay',
               isSticker: true,

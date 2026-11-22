@@ -25,6 +25,8 @@ interface StickersSheetProps {
     src: string;
     fileName?: string;
     remoteUrl?: string;
+    fileSize?: number;
+    fileHash?: string;
   }) => void;
   onOpenSettings: () => void;
   onClose: () => void;
@@ -145,6 +147,8 @@ export const StickersSheet: React.FC<StickersSheetProps> = ({
         src: prepared.localSrc,
         fileName: prepared.fileName,
         remoteUrl: prepared.shareUrl,
+        fileSize: prepared.fileSize,
+        fileHash: prepared.fileHash,
       });
     } catch (err) {
       setErrorMsg(

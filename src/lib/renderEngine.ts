@@ -445,17 +445,19 @@ function drawDownloadingStub(
   clip: Clip,
   sf: number
 ) {
+  const isError = clip.mediaStatus === 'ERROR';
   ctx.save();
-  ctx.fillStyle = 'rgba(24, 24, 27, 0.92)';
+  ctx.fillStyle = isError ? 'rgba(39, 14, 21, 0.94)' : 'rgba(24, 24, 27, 0.92)';
   ctx.fillRect(-w / 2, -h / 2, w, h);
 
-  ctx.strokeStyle = 'rgba(34, 211, 238, 0.5)';
+  ctx.strokeStyle = isError
+    ? 'rgba(251, 113, 133, 0.8)'
+    : 'rgba(34, 211, 238, 0.5)';
   ctx.lineWidth = 2 * sf;
   ctx.setLineDash([8 * sf, 6 * sf]);
   ctx.strokeRect(-w / 2 + 4 * sf, -h / 2 + 4 * sf, w - 8 * sf, h - 8 * sf);
   ctx.setLineDash([]);
 
-  const pct = Math.max(0, Math.min(100, Math.round(clip.downloadProgress ?? 0)));
   ctx.fillStyle = '#e4e4e7';
   ctx.font = `600 ${Math.max(12, Math.round(16 * sf))}px "Plus Jakarta Sans", sans-serif`;
   ctx.textAlign = 'center';
@@ -463,10 +465,24 @@ function drawDownloadingStub(
   ctx.fillText(
     clip.name.slice(0, 22),
     0,
-    -14 * sf,
+    -18 * sf,
     Math.max(40, w - 24 * sf)
   );
 
+  if (isError) {
+    ctx.fillStyle = '#fb7185';
+    ctx.font = `700 ${Math.max(11, Math.round(14 * sf))}px "Plus Jakarta Sans", sans-serif`;
+    ctx.fillText('Ошибка загрузки P2P', 0, 6 * sf, Math.max(40, w - 24 * sf));
+
+    ctx.fillStyle = '#fda4af';
+    ctx.font = `500 ${Math.max(9, Math.round(11 * sf))}px "Plus Jakarta Sans", sans-serif`;
+    const errText = (clip.mediaError || 'Нажмите «Перекачать»').slice(0, 36);
+    ctx.fillText(errText, 0, 26 * sf, Math.max(40, w - 24 * sf));
+    ctx.restore();
+    return;
+  }
+
+  const pct = Math.max(0, Math.min(100, Math.round(clip.downloadProgress ?? 0)));
   ctx.fillStyle = '#22d3ee';
   ctx.font = `700 ${Math.max(11, Math.round(14 * sf))}px monospace`;
   ctx.fillText(`Загрузка P2P... ${pct}%`, 0, 8 * sf);
@@ -601,7 +617,11 @@ function drawCoverMedia(
     targetCtx.translate(centerX, centerY);
     if (kf.rotation) targetCtx.rotate((kf.rotation * Math.PI) / 180);
 
-    if (clip.mediaStatus === 'DOWNLOADING' || !media) {
+    if (
+      clip.mediaStatus === 'DOWNLOADING' ||
+      clip.mediaStatus === 'ERROR' ||
+      !media
+    ) {
       drawDownloadingStub(targetCtx, drawW, drawH, clip, sf);
     } else {
       let sourceToDraw: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement =
@@ -736,7 +756,7 @@ function drawOverlayClip(
     | HTMLVideoElement
     | HTMLCanvasElement
     | null =
-    clip.mediaStatus === 'DOWNLOADING'
+    clip.mediaStatus === 'DOWNLOADING' || clip.mediaStatus === 'ERROR'
       ? null
       : clip.kind === 'video' && clip.src
         ? pool.getVideo(clip.src)
@@ -805,7 +825,11 @@ function drawOverlayClip(
       targetCtx.clip();
     }
 
-    if (clip.mediaStatus === 'DOWNLOADING' || !media) {
+    if (
+      clip.mediaStatus === 'DOWNLOADING' ||
+      clip.mediaStatus === 'ERROR' ||
+      !media
+    ) {
       drawDownloadingStub(targetCtx, pipW, pipH, clip, sf);
     } else if (
       (media instanceof HTMLImageElement ||
@@ -1146,7 +1170,10 @@ export function renderCompositeFrame(
         0,
         Math.min(1, (time - clip.start) / Math.max(0.01, clip.duration))
       );
-      if (clip.mediaStatus === 'DOWNLOADING') {
+      if (
+        clip.mediaStatus === 'DOWNLOADING' ||
+        clip.mediaStatus === 'ERROR'
+      ) {
         drawCoverMedia(
           ctx,
           null,

@@ -16,6 +16,8 @@ interface VoiceRecorderOverlayProps {
     src: string;
     fileName?: string;
     remoteUrl?: string;
+    fileSize?: number;
+    fileHash?: string;
     duration: number;
     startTime: number;
   }) => void;
@@ -222,6 +224,8 @@ export const VoiceRecorderOverlay: React.FC<VoiceRecorderOverlayProps> = ({
           src: prepared.localSrc,
           fileName: prepared.fileName,
           remoteUrl: prepared.shareUrl,
+          fileSize: prepared.fileSize,
+          fileHash: prepared.fileHash,
           duration: Math.round(finalDur * 100) / 100,
           startTime: Math.round(recordStartTimeRef.current * 100) / 100,
         });

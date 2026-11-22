@@ -116,6 +116,9 @@ export interface ProjectFont {
   name: string;
   fontFamily: string;
   src: string;
+  fileName?: string;
+  fileSize?: number;
+  fileHash?: string;
 }
 
 export interface Track {
@@ -241,6 +244,9 @@ export interface Clip {
   mediaStatus?: 'READY' | 'DOWNLOADING' | 'ERROR';
   mediaFileName?: string;
   mediaRemoteUrl?: string;
+  mediaFileSize?: number;
+  mediaFileHash?: string;
+  mediaError?: string;
   downloadProgress?: number;
   lockedByUserId?: string | null;
   lockedByUserName?: string | null;
@@ -378,11 +384,15 @@ export type ClientWsMessage =
       isPlaying: boolean;
     }
   | {type: 'chat:send'; text: string; messageId: string}
+  | {type: 'ping'; ts: number}
+  | {type: 'SYNC_FULL_STATE'}
   | {
       type: 'LAYER_MEDIA_UPDATED';
       layerId: string;
       fileName: string;
       mediaUrl: string;
+      fileSize?: number;
+      fileHash?: string;
       senderId: string;
       clip?: Clip;
       newTrack?: Track;
@@ -478,11 +488,20 @@ export type ServerWsMessage =
     }
   | {type: 'presence:update'; collaborators: Collaborator[]}
   | {type: 'chat:message'; message: ChatMessage}
+  | {type: 'pong'; ts: number; serverTime?: number}
+  | {
+      type: 'SYNC_FULL_STATE';
+      project: ProjectState;
+      collaborators: Collaborator[];
+      rooms: RoomSummary[];
+    }
   | {
       type: 'LAYER_MEDIA_UPDATED';
       layerId: string;
       fileName: string;
       mediaUrl: string;
+      fileSize?: number;
+      fileHash?: string;
       senderId: string;
       clip?: Clip;
       newTrack?: Track;
@@ -858,6 +877,62 @@ export function getProjectDuration(clips: Clip[]): number {
   return Math.round(maxEnd * 100) / 100;
 }
 
+export function encodePatchForSync<T extends object>(
+  patch: Partial<T>
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(patch)) {
+    out[k] = v === undefined ? null : v;
+  }
+  return out;
+}
+
+export function applyClipPatch(
+  clip: Clip,
+  patch: Record<string, unknown>
+): Clip {
+  const next: Record<string, unknown> = {...clip};
+  for (const [key, val] of Object.entries(patch)) {
+    if (key === 'id') continue;
+    if (val === undefined || val === null) {
+      if (key.startsWith('lockedBy')) {
+        next[key] = null;
+      } else {
+        delete next[key];
+      }
+    } else {
+      next[key] = val;
+    }
+  }
+  next.id = clip.id;
+  return next as unknown as Clip;
+}
+
+function cloneTextStyle(style?: TextStyle): TextStyle | undefined {
+  if (!style) return undefined;
+  return {
+    ...style,
+    curvePoints: style.curvePoints?.map((p) => ({...p})),
+  };
+}
+
+function cloneColorAdjustments(
+  adj?: ColorAdjustments
+): ColorAdjustments | undefined {
+  if (!adj) return undefined;
+  return {
+    ...adj,
+    curves: adj.curves
+      ? {
+          rgb: adj.curves.rgb.map((p) => ({...p})),
+          r: adj.curves.r.map((p) => ({...p})),
+          g: adj.curves.g.map((p) => ({...p})),
+          b: adj.curves.b.map((p) => ({...p})),
+        }
+      : undefined,
+  };
+}
+
 export function applyClipSplit(
   clips: Clip[],
   clipId: string,
@@ -874,25 +949,9 @@ export function applyClipSplit(
     return clips;
   }
 
-  const cloneColorAdjustments = (
-    adj?: ColorAdjustments
-  ): ColorAdjustments | undefined => {
-    if (!adj) return undefined;
-    return {
-      ...adj,
-      curves: adj.curves
-        ? {
-            rgb: adj.curves.rgb.map((p) => ({...p})),
-            r: adj.curves.r.map((p) => ({...p})),
-            g: adj.curves.g.map((p) => ({...p})),
-            b: adj.curves.b.map((p) => ({...p})),
-          }
-        : undefined,
-    };
-  };
-
   const firstHalf: Clip = {
     ...target,
+    textStyle: cloneTextStyle(target.textStyle),
     colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
     crop: target.crop ? {...target.crop} : undefined,
     mask: target.mask ? {...target.mask} : undefined,
@@ -906,6 +965,7 @@ export function applyClipSplit(
     ...target,
     id: newClipId,
     name: `${target.name} (2)`,
+    textStyle: cloneTextStyle(target.textStyle),
     colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
     crop: target.crop ? {...target.crop} : undefined,
     mask: target.mask ? {...target.mask} : undefined,
@@ -969,20 +1029,8 @@ export function applyClipDuplicate(
 
   const copy: Clip = {
     ...target,
-    textStyle: target.textStyle ? {...target.textStyle} : undefined,
-    colorAdjustments: target.colorAdjustments
-      ? {
-          ...target.colorAdjustments,
-          curves: target.colorAdjustments.curves
-            ? {
-                rgb: target.colorAdjustments.curves.rgb.map((p) => ({...p})),
-                r: target.colorAdjustments.curves.r.map((p) => ({...p})),
-                g: target.colorAdjustments.curves.g.map((p) => ({...p})),
-                b: target.colorAdjustments.curves.b.map((p) => ({...p})),
-              }
-            : undefined,
-        }
-      : undefined,
+    textStyle: cloneTextStyle(target.textStyle),
+    colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
     crop: target.crop ? {...target.crop} : undefined,
     mask: target.mask ? {...target.mask} : undefined,
     keyframes: clonedKeyframes,

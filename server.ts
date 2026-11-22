@@ -10,6 +10,7 @@ import multer from 'multer';
 import {WebSocket, WebSocketServer} from 'ws';
 import {
   applyClipDuplicate,
+  applyClipPatch,
   applyClipSplit,
   applyTrackReorder,
   createDefaultTracks,
@@ -26,8 +27,10 @@ import type {
   ServerWsMessage,
 } from './src/shared/types.ts';
 
-const PORT = Number(process.env.PORT) || 3000;
+let ACTIVE_PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
+const DEFAULT_LOCK_TIMEOUT_MS = Number(process.env.LOCK_TIMEOUT_MS) || 5000;
+let lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS;
 
 const ROOT_DIR = process.cwd();
 const UPLOADS_DIR = path.join(ROOT_DIR, 'uploads');
@@ -39,7 +42,52 @@ fs.mkdirSync(DATA_DIR, {recursive: true});
 
 const rooms = new Map<string, ProjectState>();
 const roomConnections = new Map<string, Set<ClientSession>>();
+const roomLockTimestamps = new Map<string, Map<string, number>>();
 const allSockets = new Set<WebSocket>();
+const fileHashCache = new Map<string, string>();
+
+function computeFileSha256(filePath: string): string {
+  try {
+    const stat = fs.statSync(filePath);
+    const cacheKey = `${filePath}:${stat.size}:${stat.mtimeMs}`;
+    const cached = fileHashCache.get(cacheKey);
+    if (cached) return cached;
+    const hash = crypto.createHash('sha256');
+    const fd = fs.openSync(filePath, 'r');
+    const buf = Buffer.allocUnsafe(64 * 1024);
+    try {
+      let bytesRead = 0;
+      while ((bytesRead = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+        hash.update(buf.subarray(0, bytesRead));
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    const digest = hash.digest('hex');
+    fileHashCache.set(cacheKey, digest);
+    return digest;
+  } catch {
+    return '';
+  }
+}
+
+function touchLayerLock(roomId: string, layerId: string) {
+  let map = roomLockTimestamps.get(roomId);
+  if (!map) {
+    map = new Map();
+    roomLockTimestamps.set(roomId, map);
+  }
+  map.set(layerId, Date.now());
+}
+
+function clearLayerLockTimestamp(roomId: string, layerId: string) {
+  const map = roomLockTimestamps.get(roomId);
+  if (!map) return;
+  map.delete(layerId);
+  if (map.size === 0) {
+    roomLockTimestamps.delete(roomId);
+  }
+}
 
 interface ClientSession {
   ws: WebSocket;
@@ -226,17 +274,27 @@ function getNetworkInterfacesList(): NetworkInterfaceInfo[] {
     for (const addr of addrs) {
       if (addr.family === 'IPv4' && !addr.internal) {
         const lower = name.toLowerCase();
-        const type: NetworkInterfaceInfo['type'] = lower.startsWith('zt')
+        const isVpn =
+          lower.startsWith('zt') ||
+          lower.startsWith('tun') ||
+          lower.startsWith('tap');
+        const isWifi =
+          lower.startsWith('wl') ||
+          lower.startsWith('wifi') ||
+          lower.startsWith('wi-fi') ||
+          lower.startsWith('ap') ||
+          lower.startsWith('en');
+        const type: NetworkInterfaceInfo['type'] = isVpn
           ? 'zerotier'
-          : lower.startsWith('wl') ||
-              lower.startsWith('wifi') ||
-              lower.startsWith('wi-fi') ||
-              lower.startsWith('en')
+          : isWifi || addr.address.startsWith('192.168.')
             ? 'wifi'
-            : 'lan';
-        const label =
-          type === 'zerotier'
-            ? `ZeroTier (${name})`
+            : addr.address.startsWith('10.')
+              ? 'zerotier'
+              : 'lan';
+        const label = lower.startsWith('zt')
+          ? `ZeroTier (${name})`
+          : type === 'zerotier'
+            ? `VPN / ZeroTier (${name})`
             : type === 'wifi'
               ? `Wi-Fi (${name})`
               : `LAN (${name})`;
@@ -265,6 +323,10 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
+  res.header(
+    'Access-Control-Expose-Headers',
+    'X-File-Size, X-Content-Sha256, Content-Length'
+  );
   if (req.method === 'OPTIONS') {
     res.sendStatus(204);
     return;
@@ -315,11 +377,30 @@ const upload = multer({
   },
 });
 
+const staticMediaHeaders = (
+  res: express.Response,
+  filePath: string
+) => {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.isFile()) {
+      res.setHeader('X-File-Size', String(stat.size));
+      const hash = computeFileSha256(filePath);
+      if (hash) {
+        res.setHeader('X-Content-Sha256', hash);
+      }
+    }
+  } catch {
+    // ignore
+  }
+};
+
 app.use(
   '/uploads',
   express.static(UPLOADS_DIR, {
     acceptRanges: true,
     maxAge: '1d',
+    setHeaders: staticMediaHeaders,
   })
 );
 
@@ -328,6 +409,7 @@ app.use(
   express.static(UPLOADS_DIR, {
     acceptRanges: true,
     maxAge: '1d',
+    setHeaders: staticMediaHeaders,
   })
 );
 
@@ -351,11 +433,20 @@ app.post('/media/upload', (req, res, next) => {
       ifaces.find((i) => i.type === 'wifi')?.ip ||
       ifaces[0]?.ip ||
       '127.0.0.1';
+    let fileSize = 0;
+    try {
+      fileSize = fs.statSync(destPath).size;
+    } catch {
+      fileSize = 0;
+    }
+    const fileHash = computeFileSha256(destPath);
     res.json({
       ok: true,
       fileName: finalName,
       localUrl: `/media/${finalName}`,
-      shareUrl: `http://${primaryIp}:${PORT}/media/${finalName}`,
+      shareUrl: `http://${primaryIp}:${ACTIVE_PORT}/media/${finalName}`,
+      fileSize,
+      fileHash,
     });
   });
   ws.on('error', (err) => {
@@ -387,9 +478,9 @@ app.get('/api/network-info', (req, res) => {
     origin: `${protocol}://${host}`,
     interfaces,
     primaryIp,
-    port: PORT,
+    port: ACTIVE_PORT,
     udpPort: 8081,
-    lanUrls: ips.map((ip) => `http://${ip}:${PORT}`),
+    lanUrls: ips.map((ip) => `http://${ip}:${ACTIVE_PORT}`),
     hostName: os.hostname(),
   });
 });
@@ -470,6 +561,8 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     displayName = file.originalname;
   }
 
+  const fileHash = computeFileSha256(file.path);
+
   res.json({
     id: crypto.randomBytes(6).toString('hex'),
     name: displayName,
@@ -477,6 +570,7 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     fileName: file.filename,
     src: `/media/${file.filename}`,
     sizeBytes: file.size,
+    fileHash,
   });
 });
 
@@ -514,6 +608,7 @@ function removeSession(session: ClientSession | null) {
         clip.lockedByUserId = null;
         clip.lockedByUserName = null;
         clip.lockedByUserColor = null;
+        clearLayerLockTimestamp(session.roomId, clip.id);
         broadcastToRoom(session.roomId, {
           type: 'LAYER_LOCK',
           layerId: clip.id,
@@ -554,6 +649,17 @@ wss.on('connection', (ws) => {
     try {
       msg = JSON.parse(raw.toString()) as ClientWsMessage;
     } catch {
+      return;
+    }
+
+    if (msg.type === 'ping') {
+      ws.send(
+        JSON.stringify({
+          type: 'pong',
+          ts: typeof msg.ts === 'number' ? msg.ts : Date.now(),
+          serverTime: Date.now(),
+        } satisfies ServerWsMessage)
+      );
       return;
     }
 
@@ -615,6 +721,18 @@ wss.on('connection', (ws) => {
     const project = rooms.get(session.roomId);
     if (!project) return;
     session.user.lastActive = Date.now();
+
+    if (msg.type === 'SYNC_FULL_STATE') {
+      ws.send(
+        JSON.stringify({
+          type: 'SYNC_FULL_STATE',
+          project,
+          collaborators: getRoomCollaborators(session.roomId),
+          rooms: getPublicRoomSummaries(),
+        } satisfies ServerWsMessage)
+      );
+      return;
+    }
 
     switch (msg.type) {
       case 'presence:profile': {
@@ -742,11 +860,13 @@ wss.on('connection', (ws) => {
       case 'op:clip_update': {
         const idx = project.clips.findIndex((c) => c.id === msg.clipId);
         if (idx === -1) return;
-        project.clips[idx] = {
-          ...project.clips[idx],
-          ...msg.patch,
-          id: project.clips[idx].id,
-        };
+        project.clips[idx] = applyClipPatch(
+          project.clips[idx],
+          msg.patch as Record<string, unknown>
+        );
+        if (project.clips[idx].lockedByUserId === session.user.id) {
+          touchLayerLock(session.roomId, msg.clipId);
+        }
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -955,11 +1075,17 @@ wss.on('connection', (ws) => {
         }
         const idx = project.clips.findIndex((c) => c.id === msg.layerId);
         if (idx !== -1) {
+          if (project.clips[idx].lockedByUserId === session.user.id) {
+            touchLayerLock(session.roomId, msg.layerId);
+          }
           project.clips[idx] = {
             ...project.clips[idx],
             src: msg.mediaUrl,
             mediaRemoteUrl: msg.mediaUrl,
             mediaFileName: msg.fileName,
+            mediaFileSize: msg.fileSize ?? project.clips[idx].mediaFileSize,
+            mediaFileHash: msg.fileHash ?? project.clips[idx].mediaFileHash,
+            mediaError: undefined,
             ...(msg.clip
               ? {
                   name: msg.clip.name,
@@ -976,6 +1102,8 @@ wss.on('connection', (ws) => {
             src: msg.mediaUrl,
             mediaRemoteUrl: msg.mediaUrl,
             mediaFileName: msg.fileName,
+            mediaFileSize: msg.fileSize ?? msg.clip.mediaFileSize,
+            mediaFileHash: msg.fileHash ?? msg.clip.mediaFileHash,
           });
         }
         project.revision += 1;
@@ -988,6 +1116,8 @@ wss.on('connection', (ws) => {
             layerId: msg.layerId,
             fileName: msg.fileName,
             mediaUrl: msg.mediaUrl,
+            fileSize: msg.fileSize,
+            fileHash: msg.fileHash,
             senderId: session.user.id,
             clip: msg.clip,
             newTrack: msg.newTrack,
@@ -1001,35 +1131,45 @@ wss.on('connection', (ws) => {
 
       case 'LAYER_LOCK': {
         const idx = project.clips.findIndex((c) => c.id === msg.layerId);
+        let applied = true;
         if (idx !== -1) {
+          const curHolder = project.clips[idx].lockedByUserId;
           if (msg.locked) {
-            project.clips[idx] = {
-              ...project.clips[idx],
-              lockedByUserId: session.user.id,
-              lockedByUserName: session.user.name,
-              lockedByUserColor: session.user.color,
-            };
-          } else if (project.clips[idx].lockedByUserId === session.user.id) {
+            if (curHolder && curHolder !== session.user.id) {
+              applied = false;
+            } else {
+              project.clips[idx] = {
+                ...project.clips[idx],
+                lockedByUserId: session.user.id,
+                lockedByUserName: session.user.name,
+                lockedByUserColor: session.user.color,
+              };
+              touchLayerLock(session.roomId, msg.layerId);
+            }
+          } else if (curHolder === session.user.id || !curHolder) {
             project.clips[idx] = {
               ...project.clips[idx],
               lockedByUserId: null,
               lockedByUserName: null,
               lockedByUserColor: null,
             };
+            clearLayerLockTimestamp(session.roomId, msg.layerId);
           }
         }
-        broadcastToRoom(
-          session.roomId,
-          {
-            type: 'LAYER_LOCK',
-            layerId: msg.layerId,
-            userId: session.user.id,
-            userName: msg.locked ? session.user.name : '',
-            userColor: msg.locked ? session.user.color : '',
-            locked: msg.locked,
-          },
-          ws
-        );
+        if (applied) {
+          broadcastToRoom(
+            session.roomId,
+            {
+              type: 'LAYER_LOCK',
+              layerId: msg.layerId,
+              userId: session.user.id,
+              userName: msg.locked ? session.user.name : '',
+              userColor: msg.locked ? session.user.color : '',
+              locked: msg.locked,
+            },
+            ws
+          );
+        }
         break;
       }
     }
@@ -1048,7 +1188,7 @@ wss.on('connection', (ws) => {
   });
 });
 
-setInterval(() => {
+const wsHealthTimer = setInterval(() => {
   for (const set of roomConnections.values()) {
     for (const conn of set) {
       if (!conn.isAlive) {
@@ -1061,11 +1201,54 @@ setInterval(() => {
     }
   }
 }, 25000);
+wsHealthTimer.unref?.();
+
+const lockSweepTimer = setInterval(() => {
+  const now = Date.now();
+  for (const [roomId, layerMap] of roomLockTimestamps.entries()) {
+    const project = rooms.get(roomId);
+    if (!project) {
+      roomLockTimestamps.delete(roomId);
+      continue;
+    }
+    for (const [layerId, lastActive] of layerMap.entries()) {
+      if (now - lastActive < lockTimeoutMs) continue;
+      layerMap.delete(layerId);
+      const idx = project.clips.findIndex((c) => c.id === layerId);
+      if (idx !== -1 && project.clips[idx].lockedByUserId) {
+        const ownerId = project.clips[idx].lockedByUserId!;
+        project.clips[idx] = {
+          ...project.clips[idx],
+          lockedByUserId: null,
+          lockedByUserName: null,
+          lockedByUserColor: null,
+        };
+        broadcastToRoom(roomId, {
+          type: 'LAYER_LOCK',
+          layerId,
+          userId: ownerId,
+          userName: '',
+          userColor: '',
+          locked: false,
+        });
+      }
+    }
+    if (layerMap.size === 0) {
+      roomLockTimestamps.delete(roomId);
+    }
+  }
+}, 500);
+lockSweepTimer.unref?.();
 
 // Minecraft-style UDP LAN discovery beacon on port 8081
+let udpBeaconSocket: dgram.Socket | null = null;
+let udpBeaconInterval: ReturnType<typeof setInterval> | null = null;
+
 function startLanBeacon() {
+  if (udpBeaconSocket) return;
   try {
     const udp = dgram.createSocket('udp4');
+    udpBeaconSocket = udp;
     udp.on('error', () => {
       // Ignore if container/OS restricts UDP broadcast
     });
@@ -1076,7 +1259,7 @@ function startLanBeacon() {
         // ignore
       }
     });
-    setInterval(() => {
+    udpBeaconInterval = setInterval(() => {
       const publicRooms = getPublicRoomSummaries();
       if (publicRooms.length === 0) return;
       const ifaces = getNetworkInterfacesList();
@@ -1093,7 +1276,7 @@ function startLanBeacon() {
           hostName: primary.hostName || os.hostname(),
           ip: primaryIp,
           ips: ifaces.map((i) => i.ip),
-          port: PORT,
+          port: ACTIVE_PORT,
           aspectRatio: primary.aspectRatio,
           participants: primary.collaboratorsCount,
           roomsCount: publicRooms.length,
@@ -1105,34 +1288,93 @@ function startLanBeacon() {
         // ignore
       }
     }, 1500);
+    udpBeaconInterval.unref?.();
   } catch {
     // ignore
   }
 }
 
-async function startServer() {
-  if (!IS_PROD) {
-    const {createServer: createViteServer} = await import('vite');
-    const vite = await createViteServer({
-      server: {middlewareMode: true, hmr: false},
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distDir = path.join(ROOT_DIR, 'dist');
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
+export async function startServer(opts?: {
+  port?: number;
+  isProd?: boolean;
+  lockTimeoutMs?: number;
+  disableVite?: boolean;
+  disableBeacon?: boolean;
+}): Promise<{port: number; server: http.Server}> {
+  if (typeof opts?.lockTimeoutMs === 'number' && opts.lockTimeoutMs > 0) {
+    lockTimeoutMs = opts.lockTimeoutMs;
+  }
+  const prodMode = opts?.isProd ?? IS_PROD;
+  if (!opts?.disableVite) {
+    if (!prodMode) {
+      const {createServer: createViteServer} = await import('vite');
+      const vite = await createViteServer({
+        server: {middlewareMode: true, hmr: false},
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distDir = path.join(ROOT_DIR, 'dist');
+      app.use(express.static(distDir));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distDir, 'index.html'));
+      });
+    }
   }
 
-  server.listen(PORT, '0.0.0.0', () => {
-    console.log(`CutSync server listening on http://0.0.0.0:${PORT}`);
-    startLanBeacon();
+  const listenPort = opts?.port ?? ACTIVE_PORT;
+  await new Promise<void>((resolve) => {
+    server.listen(listenPort, '0.0.0.0', () => {
+      const addr = server.address();
+      if (addr && typeof addr === 'object') {
+        ACTIVE_PORT = addr.port;
+      }
+      if (!opts?.disableBeacon) {
+        startLanBeacon();
+      }
+      resolve();
+    });
+  });
+
+  if (process.env.CUTSYNC_NO_AUTOSTART !== '1') {
+    console.log(`CutSync server listening on http://0.0.0.0:${ACTIVE_PORT}`);
+  }
+  return {port: ACTIVE_PORT, server};
+}
+
+export async function stopServer(): Promise<void> {
+  clearInterval(wsHealthTimer);
+  clearInterval(lockSweepTimer);
+  if (udpBeaconInterval) {
+    clearInterval(udpBeaconInterval);
+    udpBeaconInterval = null;
+  }
+  if (udpBeaconSocket) {
+    try {
+      udpBeaconSocket.close();
+    } catch {
+      // ignore
+    }
+    udpBeaconSocket = null;
+  }
+  for (const ws of allSockets) {
+    try {
+      ws.terminate();
+    } catch {
+      // ignore
+    }
+  }
+  allSockets.clear();
+  await new Promise<void>((resolve) => {
+    wss.close(() => {
+      server.close(() => resolve());
+    });
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start CutSync server:', err);
-  process.exit(1);
-});
+if (process.env.CUTSYNC_NO_AUTOSTART !== '1') {
+  startServer().catch((err) => {
+    console.error('Failed to start CutSync server:', err);
+    process.exit(1);
+  });
+}

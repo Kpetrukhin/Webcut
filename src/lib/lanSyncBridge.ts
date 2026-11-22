@@ -5,7 +5,13 @@ import type {
   NetworkInterfaceInfo,
   ProjectState,
 } from '../shared/types.ts';
-import {getApiUrl, getSavedServerUrl, isNativeCapacitorApp} from './serverConfig.ts';
+import {
+  getApiUrl,
+  getSavedServerUrl,
+  isNativeCapacitorApp,
+  resolveMediaCandidateUrls,
+} from './serverConfig.ts';
+import {sha256Hex} from './sha256.ts';
 
 export interface NetworkInfoSnapshot {
   interfaces: NetworkInterfaceInfo[];
@@ -14,10 +20,23 @@ export interface NetworkInfoSnapshot {
   udpPort: number;
 }
 
+export interface KtorServerStatus {
+  state: 'running' | 'port_error' | 'stopped' | 'web';
+  port: number;
+  preferredPort: number;
+  hosting: boolean;
+  error?: string;
+}
+
 interface LanSyncPluginInterface {
   getNetworkInfo(): Promise<NetworkInfoSnapshot>;
+  getServerStatus(): Promise<KtorServerStatus>;
   ensureMediaServer(): Promise<
-    NetworkInfoSnapshot & {localUploadUrl: string}
+    NetworkInfoSnapshot & {
+      localUploadUrl: string;
+      serverState?: string;
+      serverError?: string;
+    }
   >;
   startHostServer(options: {
     snapshotJson?: string;
@@ -26,6 +45,8 @@ interface LanSyncPluginInterface {
       ok: boolean;
       wsUrl: string;
       localUploadUrl: string;
+      serverState?: string;
+      serverError?: string;
     }
   >;
   syncHostSnapshot(options: {snapshotJson: string}): Promise<void>;
@@ -35,7 +56,11 @@ interface LanSyncPluginInterface {
   downloadMedia(options: {
     layerId: string;
     url: string;
+    fallbackUrl?: string;
     fileName: string;
+    expectedSize?: number;
+    expectedHash?: string;
+    maxRetries?: number;
   }): Promise<{started: boolean}>;
   compressVideo(options: {
     layerId: string;
@@ -56,6 +81,8 @@ interface LanSyncPluginInterface {
     localUrl: string;
     shareUrl: string;
     durationSec: number;
+    fileSize?: number;
+    fileHash?: string;
   }>;
   addListener(
     eventName: 'udpRoomsUpdate',
@@ -141,8 +168,66 @@ export async function getP2PNetworkInfo(): Promise<NetworkInfoSnapshot> {
   return {
     interfaces: [],
     primaryIp: '127.0.0.1',
-    port: isNativeCapacitorApp() ? 8080 : Number(window.location.port) || 3000,
+    port: isNativeCapacitorApp()
+      ? 8080
+      : typeof window !== 'undefined'
+        ? Number(window.location.port) || 3000
+        : 3000,
     udpPort: 8081,
+  };
+}
+
+export async function getKtorServerStatus(): Promise<KtorServerStatus> {
+  if (hasNativeLanPlugin()) {
+    try {
+      const s = await LanSync.getServerStatus();
+      return {
+        state:
+          s.state === 'port_error'
+            ? 'port_error'
+            : s.state === 'running'
+              ? 'running'
+              : 'stopped',
+        port: s.port || 8080,
+        preferredPort: s.preferredPort || 8080,
+        hosting: Boolean(s.hosting),
+        error: s.error,
+      };
+    } catch (err) {
+      return {
+        state: 'port_error',
+        port: 8080,
+        preferredPort: 8080,
+        hosting: false,
+        error: err instanceof Error ? err.message : 'Ktor недоступен',
+      };
+    }
+  }
+  const healthUrl = getApiUrl('/api/health');
+  if (healthUrl) {
+    try {
+      const res = await fetch(healthUrl);
+      if (res.ok) {
+        const port =
+          typeof window !== 'undefined'
+            ? Number(window.location.port) || 3000
+            : 3000;
+        return {
+          state: 'web',
+          port,
+          preferredPort: port,
+          hosting: false,
+        };
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return {
+    state: isNativeCapacitorApp() ? 'stopped' : 'web',
+    port: isNativeCapacitorApp() ? 8080 : 3000,
+    preferredPort: isNativeCapacitorApp() ? 8080 : 3000,
+    hosting: false,
   };
 }
 
@@ -256,6 +341,8 @@ export interface PreparedP2PMedia {
   kind: 'video' | 'image' | 'audio' | 'font';
   localSrc: string;
   shareUrl: string;
+  fileSize?: number;
+  fileHash?: string;
 }
 
 export async function uploadFileForP2P(
@@ -264,6 +351,13 @@ export async function uploadFileForP2P(
 ): Promise<PreparedP2PMedia> {
   const safeBase = file.name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'media.bin';
   const stampedName = `${Date.now()}-${safeBase}`;
+  let localHash: string | undefined;
+  try {
+    localHash = await sha256Hex(await file.arrayBuffer());
+  } catch {
+    localHash = undefined;
+  }
+  const localSize = file.size;
 
   // 1. Native Android Ktor HTTP streaming (/media/upload -> /media/{fileName})
   if (hasNativeLanPlugin()) {
@@ -281,6 +375,8 @@ export async function uploadFileForP2P(
           fileName: string;
           localUrl: string;
           shareUrl: string;
+          fileSize?: number;
+          fileHash?: string;
         };
         const shareIp = pickBestShareIpForRemoteHost(
           srv.interfaces || [],
@@ -293,6 +389,8 @@ export async function uploadFileForP2P(
           kind: fallbackKind,
           localSrc: data.localUrl,
           shareUrl,
+          fileSize: data.fileSize ?? localSize,
+          fileHash: data.fileHash ?? localHash,
         };
       }
     } catch {
@@ -312,6 +410,8 @@ export async function uploadFileForP2P(
         kind?: 'video' | 'image' | 'audio' | 'font';
         fileName?: string;
         src?: string;
+        sizeBytes?: number;
+        fileHash?: string;
       };
       if (res.ok && data.src) {
         const fileName = data.fileName || data.src.split('/').pop() || stampedName;
@@ -328,6 +428,8 @@ export async function uploadFileForP2P(
           kind: data.kind || fallbackKind,
           localSrc: data.src,
           shareUrl,
+          fileSize: data.sizeBytes ?? localSize,
+          fileHash: data.fileHash ?? localHash,
         };
       }
     } catch {
@@ -342,28 +444,123 @@ export async function uploadFileForP2P(
     kind: fallbackKind,
     localSrc: blobUrl,
     shareUrl: blobUrl,
+    fileSize: localSize,
+    fileHash: localHash,
   };
+}
+
+async function fetchAndVerifyMediaOnce(opts: {
+  url: string;
+  expectedSize?: number;
+  expectedHash?: string;
+  onProgress?: (pct: number) => void;
+}): Promise<Blob> {
+  const {url, expectedSize, expectedHash, onProgress} = opts;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+
+  const headerSize = Number(
+    res.headers.get('x-file-size') || res.headers.get('content-length') || 0
+  );
+  const headerHash = res.headers.get('x-content-sha256')?.trim().toLowerCase();
+  const requiredSize =
+    expectedSize && expectedSize > 0
+      ? expectedSize
+      : Number.isFinite(headerSize) && headerSize > 0
+        ? headerSize
+        : 0;
+  const requiredHash = (expectedHash || headerHash || '').toLowerCase();
+
+  let buffer: ArrayBuffer;
+  const mime = res.headers.get('content-type') || 'application/octet-stream';
+
+  if (res.body) {
+    const reader = res.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let loaded = 0;
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      if (value) {
+        chunks.push(value);
+        loaded += value.byteLength;
+        if (requiredSize > 0) {
+          onProgress?.(Math.min(98, Math.round((loaded / requiredSize) * 98)));
+        }
+      }
+    }
+    const merged = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    buffer = merged.buffer;
+  } else {
+    buffer = await res.arrayBuffer();
+  }
+
+  if (requiredSize > 0 && buffer.byteLength !== requiredSize) {
+    throw new Error(
+      `Размер файла не совпал: получено ${buffer.byteLength} Б, ожидалось ${requiredSize} Б`
+    );
+  }
+  if (headerSize > 0 && buffer.byteLength !== headerSize) {
+    throw new Error(
+      `Размер ответа HTTP не совпал: получено ${buffer.byteLength} Б, заголовок ${headerSize} Б`
+    );
+  }
+
+  if (requiredHash || headerHash) {
+    const actualHash = await sha256Hex(buffer);
+    if (requiredHash && actualHash !== requiredHash) {
+      throw new Error('Контрольная сумма файла (SHA-256) не совпала');
+    }
+    if (headerHash && actualHash !== headerHash) {
+      throw new Error('Контрольная сумма сервера (SHA-256) не совпала');
+    }
+  }
+
+  onProgress?.(100);
+  return new Blob([buffer], {type: mime});
 }
 
 export async function downloadMediaInBackground(opts: {
   layerId: string;
   remoteUrl: string;
   fileName: string;
+  expectedSize?: number;
+  expectedHash?: string;
+  serverBaseOverride?: string;
+  maxAttempts?: number;
   onProgress?: (pct: number) => void;
+  onAttempt?: (attempt: number, maxAttempts: number) => void;
 }): Promise<string> {
-  const {layerId, remoteUrl, fileName, onProgress} = opts;
+  const {
+    layerId,
+    remoteUrl,
+    fileName,
+    expectedSize,
+    expectedHash,
+    serverBaseOverride,
+    maxAttempts = 3,
+    onProgress,
+    onAttempt,
+  } = opts;
 
   if (!remoteUrl || remoteUrl.startsWith('blob:') || remoteUrl.startsWith('data:')) {
     return remoteUrl;
   }
 
-  // Resolve relative /media/... or /uploads/... URLs against connected server
-  const resolvedUrl =
-    remoteUrl.startsWith('/') && isNativeCapacitorApp() && getSavedServerUrl()
-      ? `${getSavedServerUrl()}${remoteUrl}`
-      : remoteUrl.startsWith('/')
-        ? `${window.location.origin}${remoteUrl}`
-        : remoteUrl;
+  const candidates = resolveMediaCandidateUrls(
+    remoteUrl,
+    fileName,
+    serverBaseOverride
+  );
+  const primaryUrl = candidates[0] || remoteUrl;
+  const fallbackUrl = candidates[1];
 
   if (hasNativeLanPlugin()) {
     return new Promise<string>((resolve, reject) => {
@@ -408,8 +605,12 @@ export async function downloadMediaInBackground(opts: {
 
         await LanSync.downloadMedia({
           layerId,
-          url: resolvedUrl,
+          url: primaryUrl,
+          fallbackUrl,
           fileName,
+          expectedSize: expectedSize && expectedSize > 0 ? expectedSize : undefined,
+          expectedHash: expectedHash || undefined,
+          maxRetries: maxAttempts,
         });
       };
 
@@ -423,37 +624,28 @@ export async function downloadMediaInBackground(opts: {
     });
   }
 
-  // Browser / PWA fallback: stream fetch with progress and return cached Blob URL
-  const res = await fetch(resolvedUrl);
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
-  }
-  const total = Number(res.headers.get('content-length') || 0);
-  if (!res.body || !total) {
-    const blob = await res.blob();
-    onProgress?.(100);
-    return URL.createObjectURL(blob);
-  }
-  const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let loaded = 0;
-  while (true) {
-    const {done, value} = await reader.read();
-    if (done) break;
-    if (value) {
-      chunks.push(value);
-      loaded += value.byteLength;
-      onProgress?.(Math.min(99, Math.round((loaded / total) * 100)));
+  // Browser / PWA / Node path: stream fetch with size + SHA-256 verification and up to 3 attempts
+  let lastError: Error = new Error('Не удалось скачать медиафайл');
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    onAttempt?.(attempt, maxAttempts);
+    const targetUrl = candidates[(attempt - 1) % candidates.length] || primaryUrl;
+    try {
+      const blob = await fetchAndVerifyMediaOnce({
+        url: targetUrl,
+        expectedSize,
+        expectedHash,
+        onProgress,
+      });
+      return URL.createObjectURL(blob);
+    } catch (err) {
+      lastError =
+        err instanceof Error ? err : new Error('Ошибка загрузки по сети');
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, 350 * attempt));
+      }
     }
   }
-  const mime = res.headers.get('content-type') || 'application/octet-stream';
-  const blobParts: BlobPart[] = chunks.map(
-    (c) =>
-      c.buffer.slice(c.byteOffset, c.byteOffset + c.byteLength) as ArrayBuffer
-  );
-  const blob = new Blob(blobParts, {type: mime});
-  onProgress?.(100);
-  return URL.createObjectURL(blob);
+  throw lastError;
 }
 
 export interface CompressedMediaResult {
@@ -500,6 +692,8 @@ export async function extractAudioNative(opts: {
   localSrc: string;
   shareUrl: string;
   durationSec: number;
+  fileSize?: number;
+  fileHash?: string;
 } | null> {
   if (!hasNativeLanPlugin()) return null;
   const res = await LanSync.extractAudio({
@@ -513,6 +707,8 @@ export async function extractAudioNative(opts: {
     localSrc: res.localUrl,
     shareUrl: res.shareUrl,
     durationSec: res.durationSec,
+    fileSize: res.fileSize,
+    fileHash: res.fileHash,
   };
 }
 

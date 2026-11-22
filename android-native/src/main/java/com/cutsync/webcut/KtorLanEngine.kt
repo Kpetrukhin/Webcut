@@ -67,6 +67,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -74,6 +75,7 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 data class NetIfaceInfo(
@@ -90,13 +92,21 @@ data class RoomPeerSession(
     var userJson: JSONObject
 )
 
+data class LayerLockEntry(
+    val lockJson: JSONObject,
+    var lastActivityMs: Long
+)
+
 class KtorLanEngine(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mediaDir = File(context.cacheDir, "cutsync_media").apply { mkdirs() }
     private val registeredFiles = ConcurrentHashMap<String, File>()
+    private val fileHashCache = ConcurrentHashMap<String, String>()
 
     private var server: ApplicationEngine? = null
     private var serverPort: Int = 8080
+    private var serverState: String = "stopped"
+    private var serverError: String? = null
     private var isHostingRoom: Boolean = false
 
     private var hostRoomState: JSONObject = JSONObject().apply {
@@ -114,10 +124,11 @@ class KtorLanEngine(private val context: Context) {
     }
 
     private val wsSessions = ConcurrentHashMap<String, RoomPeerSession>()
-    private val layerLocks = ConcurrentHashMap<String, JSONObject>()
+    private val layerLocks = ConcurrentHashMap<String, LayerLockEntry>()
 
     private var beaconJob: Job? = null
     private var udpListenerJob: Job? = null
+    private var lockExpiryJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
     private val httpClient = HttpClient(ClientCIO) {
@@ -150,14 +161,18 @@ class KtorLanEngine(private val context: Context) {
                     if (addr is Inet4Address && !addr.isLoopbackAddress) {
                         val ip = addr.hostAddress ?: continue
                         val lower = name.lowercase()
+                        val isVpnIface = lower.startsWith("zt") || lower.startsWith("tun") || lower.startsWith("tap")
+                        val isWifiIface = lower.startsWith("wlan") || lower.startsWith("ap") || lower.startsWith("swlan") || lower.startsWith("wifi")
                         val type = when {
-                            lower.startsWith("zt") -> "zerotier"
-                            lower.startsWith("wlan") || lower.startsWith("ap") || lower.startsWith("swlan") -> "wifi"
+                            isVpnIface -> "zerotier"
+                            isWifiIface || ip.startsWith("192.168.") -> "wifi"
+                            ip.startsWith("10.") -> "zerotier"
                             else -> "lan"
                         }
-                        val label = when (type) {
-                            "zerotier" -> "ZeroTier ($name)"
-                            "wifi" -> "Wi-Fi ($name)"
+                        val label = when {
+                            lower.startsWith("zt") -> "ZeroTier ($name)"
+                            type == "zerotier" -> "VPN / ZeroTier ($name)"
+                            type == "wifi" -> "Wi-Fi ($name)"
                             else -> "LAN ($name)"
                         }
                         result.add(
@@ -193,6 +208,46 @@ class KtorLanEngine(private val context: Context) {
     }
 
     fun getBoundPort(): Int = serverPort
+
+    fun getServerStatusJson(): JSONObject {
+        return JSONObject().apply {
+            put("state", serverState)
+            put("port", serverPort)
+            put("preferredPort", 8080)
+            put("hosting", isHostingRoom)
+            if (!serverError.isNullOrBlank()) {
+                put("error", serverError)
+            }
+        }
+    }
+
+    private fun computeFileSha256(file: File): String {
+        val cacheKey = "${file.name}:${file.length()}:${file.lastModified()}"
+        fileHashCache[cacheKey]?.let { return it }
+        return try {
+            val digest = MessageDigest.getInstance("SHA-256")
+            val buf = ByteArray(32 * 1024)
+            FileInputStream(file).use { fis ->
+                while (true) {
+                    val read = fis.read(buf)
+                    if (read <= 0) break
+                    digest.update(buf, 0, read)
+                }
+            }
+            val hex = digest.digest().joinToString("") { "%02x".format(it) }
+            fileHashCache[cacheKey] = hex
+            hex
+        } catch (_: Throwable) {
+            ""
+        }
+    }
+
+    fun getCachedFileMetadata(fileName: String): Pair<Long, String> {
+        val safe = File(fileName).name
+        val target = registeredFiles[safe] ?: File(mediaDir, safe)
+        if (!target.exists()) return 0L to ""
+        return target.length() to computeFileSha256(target)
+    }
 
     private fun findAvailablePort(preferred: Int = 8080): Int {
         return try {
@@ -290,6 +345,11 @@ class KtorLanEngine(private val context: Context) {
         val chosenPort = findAvailablePort(preferredPort)
         serverPort = chosenPort
         isHostingRoom = asHost
+        serverError = if (chosenPort != preferredPort) {
+            "Порт $preferredPort занят, используется $chosenPort"
+        } else {
+            null
+        }
 
         val engine = embeddedServer(ServerCIO, port = chosenPort, host = "0.0.0.0") {
             install(WebSockets) {
@@ -311,9 +371,11 @@ class KtorLanEngine(private val context: Context) {
                         put("ok", true)
                         put("app", "CutSync")
                         put("engine", "Ktor-CIO")
+                        put("state", serverState)
                         put("port", serverPort)
                         put("hosting", isHostingRoom)
                         put("participants", wsSessions.size)
+                        if (!serverError.isNullOrBlank()) put("error", serverError)
                     }
                     call.respondText(info.toString(), ContentType.Application.Json)
                 }
@@ -337,8 +399,13 @@ class KtorLanEngine(private val context: Context) {
                         call.respond(HttpStatusCode.NotFound, "Media not found")
                         return@get
                     }
+                    val sha = computeFileSha256(file)
                     call.response.header(HttpHeaders.AcceptRanges, "bytes")
                     call.response.header(HttpHeaders.ContentType, contentTypeForFile(file).toString())
+                    call.response.header("X-File-Size", file.length().toString())
+                    if (sha.isNotEmpty()) {
+                        call.response.header("X-Content-Sha256", sha)
+                    }
                     call.respondFile(file)
                 }
 
@@ -355,10 +422,13 @@ class KtorLanEngine(private val context: Context) {
                         }
                     }
                     registeredFiles[safeName] = destFile
+                    val sha = computeFileSha256(destFile)
                     val bestIp = getPrimaryIp()
                     val resp = JSONObject().apply {
                         put("ok", true)
                         put("fileName", safeName)
+                        put("fileSize", destFile.length())
+                        if (sha.isNotEmpty()) put("fileHash", sha)
                         put("localUrl", "http://127.0.0.1:$serverPort/media/$safeName")
                         put("shareUrl", "http://$bestIp:$serverPort/media/$safeName")
                     }
@@ -375,9 +445,44 @@ class KtorLanEngine(private val context: Context) {
             }
         }
 
-        engine.start(wait = false)
-        server = engine
+        try {
+            engine.start(wait = false)
+            server = engine
+            serverState = "running"
+            startLockExpirySweeper()
+        } catch (err: Throwable) {
+            server = null
+            serverState = "port_error"
+            serverError = err.message ?: "Ошибка запуска порта $chosenPort"
+        }
         return chosenPort
+    }
+
+    private fun startLockExpirySweeper() {
+        if (lockExpiryJob?.isActive == true) return
+        lockExpiryJob = scope.launch {
+            while (isActive) {
+                delay(1000L)
+                val now = System.currentTimeMillis()
+                val expired = layerLocks.entries
+                    .filter { now - it.value.lastActivityMs >= 5000L }
+                    .map { it.key to it.value }
+                for ((layerId, entry) in expired) {
+                    layerLocks.remove(layerId, entry)
+                    val ownerId = entry.lockJson.optString("userId", "")
+                    applyLockToHostClips(layerId, null, null, null)
+                    val unlockMsg = JSONObject().apply {
+                        put("type", "LAYER_LOCK")
+                        put("layerId", layerId)
+                        put("userId", ownerId)
+                        put("userName", "")
+                        put("userColor", "")
+                        put("locked", false)
+                    }
+                    broadcastAll(unlockMsg.toString())
+                }
+            }
+        }
     }
 
     private suspend fun handleWebSocketClient(ws: DefaultWebSocketSession) {
@@ -473,18 +578,50 @@ class KtorLanEngine(private val context: Context) {
                         broadcastAll(out.toString(), excludeConnId = connId)
                     }
 
+                    "ping" -> {
+                        val pongMsg = JSONObject().apply {
+                            put("type", "pong")
+                            put("ts", msg.optLong("ts", System.currentTimeMillis()))
+                            put("serverTime", System.currentTimeMillis())
+                        }
+                        ws.send(Frame.Text(pongMsg.toString()))
+                    }
+
+                    "SYNC_FULL_STATE" -> {
+                        val syncMsg = JSONObject().apply {
+                            put("type", "SYNC_FULL_STATE")
+                            put("project", hostRoomState)
+                            put("collaborators", buildCollaboratorsArray())
+                            put("rooms", JSONArray().apply {
+                                if (isHostingRoom) put(buildRoomSummaryJson())
+                            })
+                        }
+                        ws.send(Frame.Text(syncMsg.toString()))
+                    }
+
                     "LAYER_LOCK" -> {
                         val layerId = msg.optString("layerId", "")
                         val locked = msg.optBoolean("locked", false)
                         val userId = msg.optString("userId", "")
                         if (layerId.isNotEmpty()) {
                             if (locked) {
-                                layerLocks[layerId] = JSONObject(msg.toString())
+                                val existing = layerLocks[layerId]
+                                if (existing != null &&
+                                    existing.lockJson.optString("userId") != userId &&
+                                    System.currentTimeMillis() - existing.lastActivityMs < 5000L
+                                ) {
+                                    continue
+                                }
+                                layerLocks[layerId] = LayerLockEntry(
+                                    lockJson = JSONObject(msg.toString()),
+                                    lastActivityMs = System.currentTimeMillis()
+                                )
                             } else {
                                 val existing = layerLocks[layerId]
-                                if (existing == null || existing.optString("userId") == userId) {
-                                    layerLocks.remove(layerId)
+                                if (existing != null && existing.lockJson.optString("userId") != userId) {
+                                    continue
                                 }
+                                layerLocks.remove(layerId)
                             }
                             applyLockToHostClips(
                                 layerId,
@@ -497,6 +634,8 @@ class KtorLanEngine(private val context: Context) {
                     }
 
                     "LAYER_MEDIA_UPDATED" -> {
+                        val layerId = msg.optString("layerId", "")
+                        layerLocks[layerId]?.let { it.lastActivityMs = System.currentTimeMillis() }
                         val senderId = wsSessions[connId]?.userJson?.optString("id") ?: msg.optString("senderId", "")
                         msg.put("senderId", senderId)
                         val rev = hostRoomState.optInt("revision", 1) + 1
@@ -508,6 +647,10 @@ class KtorLanEngine(private val context: Context) {
 
                     else -> {
                         if (type.startsWith("op:")) {
+                            if (type == "op:clip_update") {
+                                val clipId = msg.optString("clipId", "")
+                                layerLocks[clipId]?.let { it.lastActivityMs = System.currentTimeMillis() }
+                            }
                             val senderId = wsSessions[connId]?.userJson?.optString("id") ?: ""
                             val rev = hostRoomState.optInt("revision", 1) + 1
                             hostRoomState.put("revision", rev)
@@ -525,7 +668,7 @@ class KtorLanEngine(private val context: Context) {
             val removedUserId = removed?.userJson?.optString("id") ?: ""
             if (removedUserId.isNotEmpty()) {
                 val unlockedLayers = layerLocks.entries
-                    .filter { it.value.optString("userId") == removedUserId }
+                    .filter { it.value.lockJson.optString("userId") == removedUserId }
                     .map { it.key }
                 for (lid in unlockedLayers) {
                     layerLocks.remove(lid)
@@ -719,6 +862,77 @@ class KtorLanEngine(private val context: Context) {
                 }
                 hostRoomState.put("tracks", reordered)
             }
+            "op:clip_split" -> {
+                val clipId = msg.optString("clipId")
+                val newClipId = msg.optString("newClipId")
+                val splitTime = msg.optDouble("splitTime", 0.0)
+                val clips = hostRoomState.optJSONArray("clips") ?: return
+                var targetIdx = -1
+                var targetClip: JSONObject? = null
+                for (i in 0 until clips.length()) {
+                    val c = clips.optJSONObject(i) ?: continue
+                    if (c.optString("id") == newClipId) return
+                    if (c.optString("id") == clipId) {
+                        targetIdx = i
+                        targetClip = c
+                    }
+                }
+                if (targetIdx == -1 || targetClip == null) return
+                val start = targetClip.optDouble("start", 0.0)
+                val duration = targetClip.optDouble("duration", 0.0)
+                val relOffset = splitTime - start
+                if (relOffset <= 0.15 || relOffset >= duration - 0.15) return
+                val speed = targetClip.optDouble("speed", 1.0)
+                val trimStart = targetClip.optDouble("trimStart", 0.0)
+
+                val firstHalf = JSONObject(targetClip.toString()).apply {
+                    put("duration", Math.round(relOffset * 100.0) / 100.0)
+                    targetClip.optJSONArray("keyframes")?.let { kfs ->
+                        val nextKfs = JSONArray()
+                        for (k in 0 until kfs.length()) {
+                            val kf = kfs.optJSONObject(k) ?: continue
+                            if (kf.optDouble("timeOffset", 0.0) <= relOffset) {
+                                nextKfs.put(JSONObject(kf.toString()))
+                            }
+                        }
+                        put("keyframes", nextKfs)
+                    }
+                }
+
+                val secondHalf = JSONObject(targetClip.toString()).apply {
+                    put("id", newClipId)
+                    put("name", "${targetClip.optString("name")} (2)")
+                    put("start", Math.round(splitTime * 100.0) / 100.0)
+                    put("duration", Math.round((duration - relOffset) * 100.0) / 100.0)
+                    put("trimStart", Math.round((trimStart + relOffset * speed) * 100.0) / 100.0)
+                    put("transitionIn", "none")
+                    targetClip.optJSONArray("keyframes")?.let { kfs ->
+                        val nextKfs = JSONArray()
+                        for (k in 0 until kfs.length()) {
+                            val kf = kfs.optJSONObject(k) ?: continue
+                            val to = kf.optDouble("timeOffset", 0.0)
+                            if (to >= relOffset) {
+                                nextKfs.put(JSONObject(kf.toString()).apply {
+                                    put("id", "kf-${System.nanoTime().toString(36).takeLast(6)}-$k")
+                                    put("timeOffset", Math.round((to - relOffset) * 100.0) / 100.0)
+                                })
+                            }
+                        }
+                        put("keyframes", nextKfs)
+                    }
+                }
+
+                val nextClips = JSONArray()
+                for (i in 0 until clips.length()) {
+                    if (i == targetIdx) {
+                        nextClips.put(firstHalf)
+                        nextClips.put(secondHalf)
+                    } else {
+                        nextClips.put(clips.get(i))
+                    }
+                }
+                hostRoomState.put("clips", nextClips)
+            }
             "op:clip_duplicate" -> {
                 val clipId = msg.optString("clipId")
                 val newClipId = msg.optString("newClipId")
@@ -744,6 +958,16 @@ class KtorLanEngine(private val context: Context) {
                     remove("lockedByUserId")
                     remove("lockedByUserName")
                     remove("lockedByUserColor")
+                    optJSONArray("keyframes")?.let { kfs ->
+                        val nextKfs = JSONArray()
+                        for (k in 0 until kfs.length()) {
+                            val kf = kfs.optJSONObject(k) ?: continue
+                            nextKfs.put(JSONObject(kf.toString()).apply {
+                                put("id", "kf-${System.nanoTime().toString(36).takeLast(6)}-$k")
+                            })
+                        }
+                        put("keyframes", nextKfs)
+                    }
                 }
                 val nextClips = JSONArray()
                 for (i in 0 until clips.length()) {
@@ -780,7 +1004,16 @@ class KtorLanEngine(private val context: Context) {
         val keys = patch.keys()
         while (keys.hasNext()) {
             val k = keys.next()
-            target.put(k, patch.get(k))
+            if (k == "id") continue
+            if (patch.isNull(k)) {
+                if (k.startsWith("lockedBy")) {
+                    target.put(k, JSONObject.NULL)
+                } else {
+                    target.remove(k)
+                }
+            } else {
+                target.put(k, patch.get(k))
+            }
         }
     }
 
@@ -942,48 +1175,102 @@ class KtorLanEngine(private val context: Context) {
         if (!isHostingRoom) releaseMulticastLock()
     }
 
-    fun downloadMediaToCache(layerId: String, remoteUrl: String, fileName: String) {
+    fun downloadMediaToCache(
+        layerId: String,
+        remoteUrl: String,
+        fileName: String,
+        fallbackUrl: String? = null,
+        expectedSize: Long = -1L,
+        expectedHash: String? = null,
+        maxRetries: Int = 3
+    ) {
         scope.launch {
-            try {
-                val safeName = File(fileName).name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                val targetFile = File(mediaDir, safeName)
-                val tempFile = File(mediaDir, "$safeName.part")
+            val safeName = File(fileName).name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            val targetFile = File(mediaDir, safeName)
+            val tempFile = File(mediaDir, "$safeName.part")
+            val candidates = listOfNotNull(
+                remoteUrl.takeIf { it.isNotBlank() },
+                fallbackUrl?.takeIf { it.isNotBlank() && it != remoteUrl }
+            )
+            val totalAttempts = maxRetries.coerceIn(1, 5)
+            var lastError: String = "Download failed"
 
-                httpClient.prepareGet(remoteUrl).execute { response ->
-                    val totalBytes = response.headers[HttpHeaders.ContentLength]?.toLongOrNull() ?: -1L
-                    val channel = response.bodyAsChannel()
+            for (attempt in 1..totalAttempts) {
+                val attemptUrl = candidates.getOrElse((attempt - 1) % candidates.size.coerceAtLeast(1)) { remoteUrl }
+                try {
+                    if (tempFile.exists()) tempFile.delete()
+                    var headerExpectedSize = -1L
+                    var headerExpectedHash = ""
+                    val digest = MessageDigest.getInstance("SHA-256")
                     var downloaded = 0L
-                    var lastPct = -1
 
-                    FileOutputStream(tempFile).use { fos ->
-                        while (!channel.isClosedForRead) {
-                            val packet = channel.readRemaining(32 * 1024)
-                            while (!packet.isEmpty) {
-                                val bytes = packet.readBytes()
-                                fos.write(bytes)
-                                downloaded += bytes.size
-                                if (totalBytes > 0) {
-                                    val pct = ((downloaded * 100) / totalBytes).toInt().coerceIn(0, 99)
-                                    if (pct != lastPct) {
-                                        lastPct = pct
-                                        onDownloadProgress?.invoke(layerId, pct)
+                    httpClient.prepareGet(attemptUrl).execute { response ->
+                        if (response.status.value !in 200..299) {
+                            throw IllegalStateException("HTTP ${response.status.value}")
+                        }
+                        val xSize = response.headers["X-File-Size"]?.toLongOrNull() ?: -1L
+                        val cLen = response.headers[HttpHeaders.ContentLength]?.toLongOrNull() ?: -1L
+                        headerExpectedSize = if (xSize > 0) xSize else cLen
+                        headerExpectedHash = response.headers["X-Content-Sha256"]?.trim()?.lowercase() ?: ""
+                        val totalBytes = if (expectedSize > 0) expectedSize else headerExpectedSize
+
+                        val channel = response.bodyAsChannel()
+                        var lastPct = -1
+
+                        FileOutputStream(tempFile).use { fos ->
+                            while (!channel.isClosedForRead) {
+                                val packet = channel.readRemaining(32 * 1024)
+                                while (!packet.isEmpty) {
+                                    val bytes = packet.readBytes()
+                                    fos.write(bytes)
+                                    digest.update(bytes)
+                                    downloaded += bytes.size
+                                    if (totalBytes > 0) {
+                                        val pct = ((downloaded * 100) / totalBytes).toInt().coerceIn(0, 99)
+                                        if (pct != lastPct) {
+                                            lastPct = pct
+                                            onDownloadProgress?.invoke(layerId, pct)
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+
+                    val reqSize = if (expectedSize > 0) expectedSize else headerExpectedSize
+                    if (reqSize > 0 && downloaded != reqSize) {
+                        throw IllegalStateException("Размер файла не совпал ($downloaded != $reqSize)")
+                    }
+                    if (headerExpectedSize > 0 && downloaded != headerExpectedSize) {
+                        throw IllegalStateException("Размер ответа HTTP не совпал ($downloaded != $headerExpectedSize)")
+                    }
+                    val reqHash = (expectedHash?.takeIf { it.isNotBlank() } ?: headerExpectedHash).lowercase()
+                    val actualHash = digest.digest().joinToString("") { "%02x".format(it) }
+                    if (reqHash.isNotEmpty() && actualHash != reqHash) {
+                        throw IllegalStateException("Контрольная сумма SHA-256 не совпала")
+                    }
+                    if (headerExpectedHash.isNotEmpty() && actualHash != headerExpectedHash) {
+                        throw IllegalStateException("Контрольная сумма сервера SHA-256 не совпала")
+                    }
+
+                    if (targetFile.exists()) targetFile.delete()
+                    tempFile.renameTo(targetFile)
+                    registeredFiles[safeName] = targetFile
+                    fileHashCache["${targetFile.name}:${targetFile.length()}:${targetFile.lastModified()}"] = actualHash
+                    ensureMediaServerStarted()
+
+                    val localUrl = "http://127.0.0.1:$serverPort/media/$safeName"
+                    onDownloadComplete?.invoke(layerId, safeName, localUrl)
+                    return@launch
+                } catch (err: Throwable) {
+                    if (tempFile.exists()) tempFile.delete()
+                    lastError = err.message ?: "Download failed"
+                    if (attempt < totalAttempts) {
+                        delay(350L * attempt)
+                    }
                 }
-
-                if (targetFile.exists()) targetFile.delete()
-                tempFile.renameTo(targetFile)
-                registeredFiles[safeName] = targetFile
-                ensureMediaServerStarted()
-
-                val localUrl = "http://127.0.0.1:$serverPort/media/$safeName"
-                onDownloadComplete?.invoke(layerId, safeName, localUrl)
-            } catch (err: Throwable) {
-                onDownloadError?.invoke(layerId, err.message ?: "Download failed")
             }
+            onDownloadError?.invoke(layerId, lastError)
         }
     }
 
@@ -1299,6 +1586,8 @@ class KtorLanEngine(private val context: Context) {
 
     fun stopServer() {
         stopHostServer()
+        lockExpiryJob?.cancel()
+        lockExpiryJob = null
         mainHandler.post {
             for (t in activeTransformers.values) {
                 try {
@@ -1313,5 +1602,6 @@ class KtorLanEngine(private val context: Context) {
         } catch (_: Throwable) {
         }
         server = null
+        serverState = "stopped"
     }
 }

@@ -1,14 +1,18 @@
 import React, {useEffect, useRef, useState} from 'react';
 import {
+  Activity,
+  AlertTriangle,
   Check,
   Copy,
   Diamond,
+  Download,
   Film,
   FlipHorizontal,
   Layers,
   Minimize2,
   Music,
   Plus,
+  RefreshCw,
   Scissors,
   Send,
   Sparkles,
@@ -32,7 +36,11 @@ import {
   isNativeMedia3Available,
   uploadFileForP2P,
 } from '../lib/lanSyncBridge.ts';
-import type {CompressedMediaResult} from '../lib/lanSyncBridge.ts';
+import type {
+  CompressedMediaResult,
+  KtorServerStatus,
+} from '../lib/lanSyncBridge.ts';
+import type {DownloadQueueItem} from '../hooks/useCollaborativeRoom.ts';
 import {
   applyFilterPresetToClipPatch,
   findBuiltinPreset,
@@ -71,6 +79,8 @@ async function uploadOrLocalMedia(
   kind: 'video' | 'image' | 'audio' | 'font';
   src: string;
   shareUrl: string;
+  fileSize?: number;
+  fileHash?: string;
 }> {
   const prepared = await uploadFileForP2P(file, fallbackKind);
   return {
@@ -79,6 +89,8 @@ async function uploadOrLocalMedia(
     kind: prepared.kind,
     src: prepared.localSrc,
     shareUrl: prepared.shareUrl,
+    fileSize: prepared.fileSize,
+    fileHash: prepared.fileHash,
   };
 }
 
@@ -363,6 +375,8 @@ interface MediaPanelProps {
     src: string;
     fileName?: string;
     remoteUrl?: string;
+    fileSize?: number;
+    fileHash?: string;
     duration: number;
     track: 'video' | 'overlay';
     forceNewTrack?: boolean;
@@ -405,6 +419,8 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
           src: uploaded.src,
           fileName: uploaded.fileName,
           remoteUrl: uploaded.shareUrl,
+          fileSize: uploaded.fileSize,
+          fileHash: uploaded.fileHash,
           duration: Math.min(30, dur),
           track: targetTrack,
           forceNewTrack,
@@ -1149,6 +1165,9 @@ interface TeamPanelProps {
   networkInterfaces: NetworkInterfaceInfo[];
   hostPort: number;
   udpRooms: DiscoveredUdpRoom[];
+  pingMs?: number | null;
+  ktorStatus?: KtorServerStatus;
+  downloadQueue?: DownloadQueueItem[];
   user: {id: string; name: string; color: string};
   allCollaborators: Collaborator[];
   availableRooms: RoomSummary[];
@@ -1163,6 +1182,8 @@ interface TeamPanelProps {
   onStopHost: () => Promise<void>;
   onConnectToHostIp: (ipOrUrl: string, targetRoomId?: string) => void;
   onRefreshNetwork: () => void;
+  onForceSyncProject?: () => void;
+  onRetryDownload?: (clipId: string) => void;
 }
 
 const PROFILE_COLORS = [
@@ -1181,6 +1202,9 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
   networkInterfaces,
   hostPort,
   udpRooms,
+  pingMs = null,
+  ktorStatus,
+  downloadQueue = [],
   user,
   allCollaborators,
   availableRooms,
@@ -1194,6 +1218,8 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
   onStopHost,
   onConnectToHostIp,
   onRefreshNetwork,
+  onForceSyncProject,
+  onRetryDownload,
 }) => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [nameInput, setNameInput] = useState(user.name);
@@ -1223,8 +1249,111 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
     }
   };
 
+  const activeDownloadCount = downloadQueue.filter(
+    (d) => d.status === 'DOWNLOADING'
+  ).length;
+  const errorDownloadItems = downloadQueue.filter((d) => d.status === 'ERROR');
+  const ktorLabel =
+    ktorStatus?.state === 'port_error'
+      ? `Ошибка порта (${ktorStatus.port})`
+      : ktorStatus?.state === 'running'
+        ? `Ktor запущен :${ktorStatus.port}`
+        : ktorStatus?.state === 'web'
+          ? `HTTP :${ktorStatus.port} · OK`
+          : 'Ktor остановлен';
+  const ktorBadgeClass =
+    ktorStatus?.state === 'port_error'
+      ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+      : ktorStatus?.state === 'running' || ktorStatus?.state === 'web'
+        ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-300'
+        : 'border-zinc-700 bg-zinc-900 text-zinc-400';
+
   return (
     <div className="space-y-4">
+      {/* Compact Connection & Sync Diagnostics Bar */}
+      <div className="space-y-2 rounded-xl border border-cyan-500/30 bg-zinc-950/90 p-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
+          <div className="flex items-center gap-1.5">
+            <Activity
+              className={`h-3.5 w-3.5 ${
+                status === 'connected'
+                  ? 'text-emerald-400'
+                  : status === 'reconnecting'
+                    ? 'text-amber-400 animate-pulse'
+                    : 'text-rose-400'
+              }`}
+            />
+            <span className="font-mono font-semibold text-white">
+              Пинг: {pingMs !== null ? `${pingMs} мс` : status === 'reconnecting' ? 'Повтор...' : '—'}
+            </span>
+          </div>
+
+          <span
+            className={`rounded-md border px-2 py-0.5 text-[10px] font-semibold ${ktorBadgeClass}`}
+            title={ktorStatus?.error || ktorLabel}
+          >
+            {ktorLabel}
+          </span>
+
+          <span
+            className={`flex items-center gap-1 rounded-md border px-2 py-0.5 text-[10px] font-semibold ${
+              errorDownloadItems.length > 0
+                ? 'border-rose-500/40 bg-rose-500/15 text-rose-300'
+                : activeDownloadCount > 0
+                  ? 'border-cyan-500/40 bg-cyan-500/15 text-cyan-300'
+                  : 'border-white/10 bg-zinc-900 text-zinc-400'
+            }`}
+          >
+            <Download className="h-3 w-3" />
+            <span>
+              Очередь: {activeDownloadCount}
+              {errorDownloadItems.length > 0
+                ? ` · Ошибок: ${errorDownloadItems.length}`
+                : ''}
+            </span>
+          </span>
+        </div>
+
+        {errorDownloadItems.length > 0 && (
+          <div className="space-y-1 rounded-lg border border-rose-500/30 bg-rose-950/30 p-2">
+            {errorDownloadItems.map((item) => (
+              <div
+                key={item.layerId}
+                className="flex items-center justify-between gap-2 text-[10px] text-rose-200"
+              >
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <AlertTriangle className="h-3 w-3 shrink-0 text-rose-400" />
+                  <span className="truncate">
+                    {item.fileName}: {item.error || 'Сбой сети'}
+                  </span>
+                </div>
+                {onRetryDownload && (
+                  <button
+                    type="button"
+                    onClick={() => onRetryDownload(item.layerId)}
+                    className="shrink-0 rounded bg-rose-500 px-2 py-0.5 font-semibold text-white hover:bg-rose-400"
+                  >
+                    Перекачать
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+
+        {onForceSyncProject && (
+          <button
+            type="button"
+            onClick={onForceSyncProject}
+            disabled={status === 'offline'}
+            className="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg border border-cyan-500/35 bg-cyan-500/10 text-[11px] font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-45"
+          >
+            <RefreshCw className="h-3.5 w-3.5" />
+            <span>Принудительно синхронизировать проект</span>
+          </button>
+        )}
+      </div>
+
       {/* P2P Host & Client Control Panel (Ktor 8080 + UDP 8081 + ZeroTier) */}
       <div className="space-y-3 rounded-xl border border-emerald-500/35 bg-gradient-to-br from-emerald-950/30 via-zinc-900/90 to-zinc-950 p-3">
         <div className="flex items-center justify-between gap-2">

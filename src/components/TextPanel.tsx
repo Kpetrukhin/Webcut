@@ -267,16 +267,24 @@ export const TextPanel: React.FC<TextPanelProps> = ({
     try {
       const prepared = await uploadFileForP2P(file, 'font');
       const family = sanitizeFontFamilyName(prepared.name);
-      await loadCustomFont(family, prepared.localSrc);
+      await loadCustomFont(family, prepared.localSrc, {
+        fileName: prepared.fileName,
+        fileSize: prepared.fileSize,
+        fileHash: prepared.fileHash,
+      });
+      const sharedSrc = prepared.shareUrl || prepared.localSrc;
       const newFont: ProjectFont = {
         id: `font-${Math.random().toString(36).slice(2, 8)}`,
         name: family,
         fontFamily: family,
-        src: prepared.localSrc,
+        src: sharedSrc,
+        fileName: prepared.fileName,
+        fileSize: prepared.fileSize,
+        fileHash: prepared.fileHash,
       };
       onAddCustomFont(newFont);
       if (isTextSelected && selectedClip) {
-        updateStyle({fontFamily: family, fontSrc: prepared.localSrc});
+        updateStyle({fontFamily: family, fontSrc: sharedSrc});
       }
     } catch (err) {
       setFontError(

@@ -40,6 +40,8 @@ interface AudioPanelProps {
     src: string;
     fileName?: string;
     remoteUrl?: string;
+    fileSize?: number;
+    fileHash?: string;
     duration: number;
     startTime?: number;
     forceNewTrack?: boolean;
@@ -92,6 +94,8 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
         src: prepared.localSrc,
         fileName: prepared.fileName,
         remoteUrl: prepared.shareUrl,
+        fileSize: prepared.fileSize,
+        fileHash: prepared.fileHash,
         duration: Math.max(0.5, Math.min(300, dur)),
         forceNewTrack: false,
       });
@@ -116,6 +120,8 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
         let extractedSrc = '';
         let extractedFileName = '';
         let extractedShareUrl = '';
+        let extractedFileSize: number | undefined;
+        let extractedFileHash: string | undefined;
         let extractedDur = selectedClip.duration;
 
         try {
@@ -130,6 +136,8 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
               extractedSrc = nativeRes.localSrc;
               extractedFileName = nativeRes.fileName;
               extractedShareUrl = nativeRes.shareUrl;
+              extractedFileSize = nativeRes.fileSize;
+              extractedFileHash = nativeRes.fileHash;
               extractedDur = Math.min(
                 selectedClip.duration,
                 nativeRes.durationSec || selectedClip.duration
@@ -147,6 +155,8 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
           extractedSrc = prepared.localSrc;
           extractedFileName = prepared.fileName;
           extractedShareUrl = prepared.shareUrl;
+          extractedFileSize = prepared.fileSize;
+          extractedFileHash = prepared.fileHash;
           extractedDur = webDur;
         }
 
@@ -158,6 +168,8 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
           src: extractedSrc,
           fileName: extractedFileName,
           remoteUrl: extractedShareUrl,
+          fileSize: extractedFileSize,
+          fileHash: extractedFileHash,
           duration: extractedDur,
           startTime: selectedClip.start,
           forceNewTrack: false,
@@ -178,6 +190,8 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
           src: prepared.localSrc,
           fileName: prepared.fileName,
           remoteUrl: prepared.shareUrl,
+          fileSize: prepared.fileSize,
+          fileHash: prepared.fileHash,
           duration: mixDur,
           startTime: 0,
           forceNewTrack: true,

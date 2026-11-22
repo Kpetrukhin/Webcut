@@ -78,7 +78,7 @@ export function getApiUrl(path: string): string {
 export function getWebSocketUrl(overrideBaseUrl?: string): string | null {
   const base = overrideBaseUrl ? normalizeServerUrl(overrideBaseUrl) : getSavedServerUrl();
   if (!base) {
-    if (!isNativeCapacitorApp()) {
+    if (!isNativeCapacitorApp() && typeof window !== 'undefined') {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       return `${proto}//${window.location.host}/sync`;
     }
@@ -103,6 +103,66 @@ export function resolveMediaSrc(src: string | undefined): string | undefined {
     if (base) return `${base}${src}`;
   }
   return src;
+}
+
+export function extractMediaFileName(
+  src?: string,
+  explicitFileName?: string
+): string {
+  if (explicitFileName && explicitFileName.trim()) {
+    return explicitFileName.split(/[\\/]/).pop() || explicitFileName;
+  }
+  if (!src) return '';
+  const withoutQuery = src.split('?')[0];
+  const lastSeg = withoutQuery.split('/').pop() || '';
+  try {
+    return decodeURIComponent(lastSeg);
+  } catch {
+    return lastSeg;
+  }
+}
+
+export function resolveMediaCandidateUrls(
+  remoteUrl: string,
+  fileName?: string,
+  serverBaseOverride?: string
+): string[] {
+  const candidates = new Set<string>();
+  const savedBase = serverBaseOverride
+    ? normalizeServerUrl(serverBaseOverride)
+    : getSavedServerUrl();
+  const originBase =
+    savedBase ||
+    (!isNativeCapacitorApp() && typeof window !== 'undefined'
+      ? window.location.origin
+      : '');
+
+  if (remoteUrl) {
+    if (remoteUrl.startsWith('/')) {
+      if (originBase) {
+        candidates.add(`${originBase}${remoteUrl}`);
+      } else {
+        candidates.add(remoteUrl);
+      }
+    } else if (
+      !remoteUrl.startsWith('http://127.0.0.1') &&
+      !remoteUrl.startsWith('http://localhost')
+    ) {
+      candidates.add(remoteUrl);
+    } else if (isNativeCapacitorApp() && !savedBase) {
+      candidates.add(remoteUrl);
+    }
+  }
+
+  const safeName = extractMediaFileName(remoteUrl, fileName);
+  if (safeName && originBase) {
+    candidates.add(`${originBase}/media/${encodeURIComponent(safeName)}`);
+  }
+
+  if (remoteUrl && candidates.size === 0) {
+    candidates.add(remoteUrl);
+  }
+  return Array.from(candidates);
 }
 
 export interface DiscoveredServer {
