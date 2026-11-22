@@ -854,6 +854,10 @@ export function normalizeProjectTracks(project: ProjectState): ProjectState {
   return {
     ...project,
     backgroundColor: project.backgroundColor || '#09090b',
+    canvasBackground: project.canvasBackground ?? {
+      type: 'solid',
+      color: project.backgroundColor || '#09090b',
+    },
     customFonts: Array.isArray(project.customFonts) ? project.customFonts : [],
     isPublicLan: project.isPublicLan ?? true,
     tracks,
@@ -1106,6 +1110,25 @@ function cloneColorAdjustments(
   };
 }
 
+function cloneShapeStyle(style?: ShapeStyle): ShapeStyle | undefined {
+  if (!style) return undefined;
+  return {...style};
+}
+
+function cloneWarp(warp?: ClipWarp): ClipWarp | undefined {
+  if (!warp) return undefined;
+  return {
+    ...warp,
+    corners: [
+      {...warp.corners[0]},
+      {...warp.corners[1]},
+      {...warp.corners[2]},
+      {...warp.corners[3]},
+    ],
+    meshPoints: warp.meshPoints.map((p) => ({...p})),
+  };
+}
+
 export function applyClipSplit(
   clips: Clip[],
   clipId: string,
@@ -1125,13 +1148,18 @@ export function applyClipSplit(
   const firstHalf: Clip = {
     ...target,
     textStyle: cloneTextStyle(target.textStyle),
+    shapeStyle: cloneShapeStyle(target.shapeStyle),
+    warp: cloneWarp(target.warp),
     colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
     crop: target.crop ? {...target.crop} : undefined,
     mask: target.mask ? {...target.mask} : undefined,
     duration: Math.round(relOffset * 100) / 100,
     keyframes: target.keyframes
       ?.filter((k) => k.timeOffset <= relOffset)
-      .map((k) => ({...k})),
+      .map((k) => ({
+        ...k,
+        warp: cloneWarp(k.warp),
+      })),
   };
 
   const secondHalf: Clip = {
@@ -1139,9 +1167,14 @@ export function applyClipSplit(
     id: newClipId,
     name: `${target.name} (2)`,
     textStyle: cloneTextStyle(target.textStyle),
+    shapeStyle: cloneShapeStyle(target.shapeStyle),
+    warp: cloneWarp(target.warp),
     colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
     crop: target.crop ? {...target.crop} : undefined,
     mask: target.mask ? {...target.mask} : undefined,
+    lockedByUserId: null,
+    lockedByUserName: null,
+    lockedByUserColor: null,
     start: Math.round(splitTime * 100) / 100,
     duration: Math.round((target.duration - relOffset) * 100) / 100,
     trimStart:
@@ -1153,6 +1186,7 @@ export function applyClipSplit(
       ?.filter((k) => k.timeOffset >= relOffset)
       .map((k) => ({
         ...k,
+        warp: cloneWarp(k.warp),
         id: `kf-${Math.random().toString(36).slice(2, 8)}`,
         timeOffset: Math.round((k.timeOffset - relOffset) * 100) / 100,
       })),
@@ -1199,12 +1233,15 @@ export function applyClipDuplicate(
 
   const clonedKeyframes = target.keyframes?.map((kf) => ({
     ...kf,
+    warp: cloneWarp(kf.warp),
     id: `kf-${Math.random().toString(36).slice(2, 8)}`,
   }));
 
   const copy: Clip = {
     ...target,
     textStyle: cloneTextStyle(target.textStyle),
+    shapeStyle: cloneShapeStyle(target.shapeStyle),
+    warp: cloneWarp(target.warp),
     colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
     crop: target.crop ? {...target.crop} : undefined,
     mask: target.mask ? {...target.mask} : undefined,

@@ -647,11 +647,15 @@ class KtorLanEngine(private val context: Context) {
 
                     else -> {
                         if (type.startsWith("op:")) {
+                            val senderId = wsSessions[connId]?.userJson?.optString("id") ?: ""
                             if (type == "op:clip_update") {
                                 val clipId = msg.optString("clipId", "")
-                                layerLocks[clipId]?.let { it.lastActivityMs = System.currentTimeMillis() }
+                                layerLocks[clipId]?.let { lock ->
+                                    if (lock.lockJson.optString("userId") == senderId) {
+                                        lock.lastActivityMs = System.currentTimeMillis()
+                                    }
+                                }
                             }
-                            val senderId = wsSessions[connId]?.userJson?.optString("id") ?: ""
                             val rev = hostRoomState.optInt("revision", 1) + 1
                             hostRoomState.put("revision", rev)
                             msg.put("revision", rev)
@@ -717,10 +721,28 @@ class KtorLanEngine(private val context: Context) {
         }
     }
 
+    private fun insertTrackAt(tracks: JSONArray, newTrack: JSONObject, insertAt: Int): JSONArray {
+        val next = JSONArray()
+        val len = tracks.length()
+        val idx = if (insertAt in 0..len) insertAt else len
+        for (i in 0 until idx) {
+            next.put(tracks.get(i))
+        }
+        next.put(newTrack)
+        for (i in idx until len) {
+            next.put(tracks.get(i))
+        }
+        return next
+    }
+
     private fun applyMediaUpdateToHostState(msg: JSONObject) {
         val layerId = msg.optString("layerId", "")
         val fileName = msg.optString("fileName", "")
         val mediaUrl = msg.optString("mediaUrl", "")
+        val hasFileSize = msg.has("fileSize") && !msg.isNull("fileSize")
+        val fileSize = msg.optLong("fileSize", -1L)
+        val fileHash = msg.optString("fileHash", "")
+        val insertAt = msg.optInt("insertAt", -1)
         val newTrack = msg.optJSONObject("newTrack")
         if (newTrack != null) {
             val tracks = hostRoomState.optJSONArray("tracks") ?: JSONArray()
@@ -732,8 +754,7 @@ class KtorLanEngine(private val context: Context) {
                 }
             }
             if (!hasTrack) {
-                tracks.put(newTrack)
-                hostRoomState.put("tracks", tracks)
+                hostRoomState.put("tracks", insertTrackAt(tracks, newTrack, insertAt))
             }
         }
 
@@ -745,6 +766,9 @@ class KtorLanEngine(private val context: Context) {
                 c.put("mediaRemoteUrl", mediaUrl)
                 c.put("mediaFileName", fileName)
                 c.put("src", mediaUrl)
+                c.remove("mediaError")
+                if (hasFileSize && fileSize > 0) c.put("mediaFileSize", fileSize)
+                if (fileHash.isNotEmpty()) c.put("mediaFileHash", fileHash)
                 val incomingClip = msg.optJSONObject("clip")
                 if (incomingClip != null) {
                     if (incomingClip.has("name")) c.put("name", incomingClip.optString("name"))
@@ -762,6 +786,9 @@ class KtorLanEngine(private val context: Context) {
                 incomingClip.put("src", mediaUrl)
                 incomingClip.put("mediaRemoteUrl", mediaUrl)
                 incomingClip.put("mediaFileName", fileName)
+                incomingClip.remove("mediaError")
+                if (hasFileSize && fileSize > 0) incomingClip.put("mediaFileSize", fileSize)
+                if (fileHash.isNotEmpty()) incomingClip.put("mediaFileHash", fileHash)
                 clips.put(incomingClip)
                 hostRoomState.put("clips", clips)
             }
@@ -773,8 +800,11 @@ class KtorLanEngine(private val context: Context) {
             "op:track_add" -> {
                 val t = msg.optJSONObject("track") ?: return
                 val tracks = hostRoomState.optJSONArray("tracks") ?: JSONArray()
-                tracks.put(t)
-                hostRoomState.put("tracks", tracks)
+                val tid = t.optString("id")
+                for (i in 0 until tracks.length()) {
+                    if (tracks.optJSONObject(i)?.optString("id") == tid) return
+                }
+                hostRoomState.put("tracks", insertTrackAt(tracks, t, msg.optInt("insertAt", -1)))
             }
             "op:track_update" -> {
                 val trackId = msg.optString("trackId")
@@ -810,8 +840,7 @@ class KtorLanEngine(private val context: Context) {
                 val nt = msg.optJSONObject("newTrack")
                 if (nt != null) {
                     val tracks = hostRoomState.optJSONArray("tracks") ?: JSONArray()
-                    tracks.put(nt)
-                    hostRoomState.put("tracks", tracks)
+                    hostRoomState.put("tracks", insertTrackAt(tracks, nt, msg.optInt("insertAt", -1)))
                 }
                 val clips = hostRoomState.optJSONArray("clips") ?: JSONArray()
                 clips.put(c)
@@ -904,8 +933,15 @@ class KtorLanEngine(private val context: Context) {
                     put("name", "${targetClip.optString("name")} (2)")
                     put("start", Math.round(splitTime * 100.0) / 100.0)
                     put("duration", Math.round((duration - relOffset) * 100.0) / 100.0)
-                    put("trimStart", Math.round((trimStart + relOffset * speed) * 100.0) / 100.0)
+                    put(
+                        "trimStart",
+                        if (targetClip.optString("kind") == "adjustment") 0.0
+                        else Math.round((trimStart + relOffset * speed) * 100.0) / 100.0
+                    )
                     put("transitionIn", "none")
+                    remove("lockedByUserId")
+                    remove("lockedByUserName")
+                    remove("lockedByUserColor")
                     targetClip.optJSONArray("keyframes")?.let { kfs ->
                         val nextKfs = JSONArray()
                         for (k in 0 until kfs.length()) {

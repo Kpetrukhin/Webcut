@@ -418,10 +418,13 @@ export class MediaPool {
         activeClip.trimStart +
         (time - activeClip.start) * (activeClip.speed || 1);
       try {
-        vid.playbackRate = Math.max(
+        const targetRate = Math.max(
           0.0625,
           Math.min(16, activeClip.speed || 1)
         );
+        if (Math.abs(vid.playbackRate - targetRate) > 0.001) {
+          vid.playbackRate = targetRate;
+        }
       } catch {
         // Ignore unsupported browser playbackRate extremes
       }

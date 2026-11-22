@@ -599,7 +599,8 @@ app.use(
 );
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({noServer: true});
+let wss = new WebSocketServer({noServer: true});
+let wssClosed = false;
 
 server.on('upgrade', (request, socket, head) => {
   const pathname = (request.url || '').split('?')[0];
@@ -649,7 +650,8 @@ function removeSession(session: ClientSession | null) {
   }
 }
 
-wss.on('connection', (ws) => {
+function attachWssConnectionHandler(targetWss: WebSocketServer) {
+targetWss.on('connection', (ws) => {
   allSockets.add(ws);
   let session: ClientSession | null = null;
 
@@ -1212,58 +1214,70 @@ wss.on('connection', (ws) => {
     session = null;
   });
 });
+}
 
-const wsHealthTimer = setInterval(() => {
-  for (const set of roomConnections.values()) {
-    for (const conn of set) {
-      if (!conn.isAlive) {
-        conn.ws.terminate();
-        removeSession(conn);
-        continue;
-      }
-      conn.isAlive = false;
-      conn.ws.ping();
-    }
-  }
-}, 25000);
-wsHealthTimer.unref?.();
+attachWssConnectionHandler(wss);
 
-const lockSweepTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [roomId, layerMap] of roomLockTimestamps.entries()) {
-    const project = rooms.get(roomId);
-    if (!project) {
-      roomLockTimestamps.delete(roomId);
-      continue;
-    }
-    for (const [layerId, lastActive] of layerMap.entries()) {
-      if (now - lastActive < lockTimeoutMs) continue;
-      layerMap.delete(layerId);
-      const idx = project.clips.findIndex((c) => c.id === layerId);
-      if (idx !== -1 && project.clips[idx].lockedByUserId) {
-        const ownerId = project.clips[idx].lockedByUserId!;
-        project.clips[idx] = {
-          ...project.clips[idx],
-          lockedByUserId: null,
-          lockedByUserName: null,
-          lockedByUserColor: null,
-        };
-        broadcastToRoom(roomId, {
-          type: 'LAYER_LOCK',
-          layerId,
-          userId: ownerId,
-          userName: '',
-          userColor: '',
-          locked: false,
-        });
+let wsHealthTimer: ReturnType<typeof setInterval> | null = null;
+let lockSweepTimer: ReturnType<typeof setInterval> | null = null;
+
+function ensureServerTimers() {
+  if (!wsHealthTimer) {
+    wsHealthTimer = setInterval(() => {
+      for (const set of roomConnections.values()) {
+        for (const conn of set) {
+          if (!conn.isAlive) {
+            conn.ws.terminate();
+            removeSession(conn);
+            continue;
+          }
+          conn.isAlive = false;
+          conn.ws.ping();
+        }
       }
-    }
-    if (layerMap.size === 0) {
-      roomLockTimestamps.delete(roomId);
-    }
+    }, 25000);
+    wsHealthTimer.unref?.();
   }
-}, 500);
-lockSweepTimer.unref?.();
+
+  if (!lockSweepTimer) {
+    lockSweepTimer = setInterval(() => {
+      const now = Date.now();
+      for (const [roomId, layerMap] of roomLockTimestamps.entries()) {
+        const project = rooms.get(roomId);
+        if (!project) {
+          roomLockTimestamps.delete(roomId);
+          continue;
+        }
+        for (const [layerId, lastActive] of layerMap.entries()) {
+          if (now - lastActive < lockTimeoutMs) continue;
+          layerMap.delete(layerId);
+          const idx = project.clips.findIndex((c) => c.id === layerId);
+          if (idx !== -1 && project.clips[idx].lockedByUserId) {
+            const ownerId = project.clips[idx].lockedByUserId!;
+            project.clips[idx] = {
+              ...project.clips[idx],
+              lockedByUserId: null,
+              lockedByUserName: null,
+              lockedByUserColor: null,
+            };
+            broadcastToRoom(roomId, {
+              type: 'LAYER_LOCK',
+              layerId,
+              userId: ownerId,
+              userName: '',
+              userColor: '',
+              locked: false,
+            });
+          }
+        }
+        if (layerMap.size === 0) {
+          roomLockTimestamps.delete(roomId);
+        }
+      }
+    }, 500);
+    lockSweepTimer.unref?.();
+  }
+}
 
 // Minecraft-style UDP LAN discovery beacon on port 8081
 let udpBeaconSocket: dgram.Socket | null = null;
@@ -1326,6 +1340,13 @@ export async function startServer(opts?: {
   disableVite?: boolean;
   disableBeacon?: boolean;
 }): Promise<{port: number; server: http.Server}> {
+  if (wssClosed) {
+    wss = new WebSocketServer({noServer: true});
+    wssClosed = false;
+    attachWssConnectionHandler(wss);
+  }
+  ensureServerTimers();
+
   if (typeof opts?.lockTimeoutMs === 'number' && opts.lockTimeoutMs > 0) {
     lockTimeoutMs = opts.lockTimeoutMs;
   }
@@ -1368,8 +1389,14 @@ export async function startServer(opts?: {
 }
 
 export async function stopServer(): Promise<void> {
-  clearInterval(wsHealthTimer);
-  clearInterval(lockSweepTimer);
+  if (wsHealthTimer) {
+    clearInterval(wsHealthTimer);
+    wsHealthTimer = null;
+  }
+  if (lockSweepTimer) {
+    clearInterval(lockSweepTimer);
+    lockSweepTimer = null;
+  }
   if (udpBeaconInterval) {
     clearInterval(udpBeaconInterval);
     udpBeaconInterval = null;
@@ -1390,6 +1417,7 @@ export async function stopServer(): Promise<void> {
     }
   }
   allSockets.clear();
+  wssClosed = true;
   await new Promise<void>((resolve) => {
     wss.close(() => {
       server.close(() => resolve());

@@ -278,6 +278,13 @@ export default function App() {
     [project.clips, selectedClipId]
   );
 
+  const selectedClipRef = useRef(selectedClip);
+  selectedClipRef.current = selectedClip;
+  const projectRef = useRef(project);
+  projectRef.current = project;
+  const durationRef = useRef(duration);
+  durationRef.current = duration;
+
   useEffect(() => {
     setTitleDraft(project.title);
   }, [project.title]);
@@ -288,8 +295,14 @@ export default function App() {
     }
   }, [project.clips, selectedClipId]);
 
+  const selectedClipIdValue = selectedClip?.id ?? null;
+  const selectedClipTrackValue = selectedClip?.track ?? null;
+  const selectedClipKindValue = selectedClip?.kind ?? null;
+  const selectedClipCurvePoints = selectedClip?.textStyle?.curvePoints;
+
   useEffect(() => {
-    if (!selectedClip) {
+    const clip = selectedClipRef.current;
+    if (!clip || !selectedClipIdValue) {
       setShowOpacitySlider(false);
       setShowChromaKeyPanel(false);
       setShowTrackpad(false);
@@ -304,22 +317,10 @@ export default function App() {
     }
 
     setTextColorPicker((cur) =>
-      cur && cur.clipId === selectedClip.id && selectedClip.track === 'text'
-        ? cur
-        : null
+      cur && cur.clipId === clip.id && clip.track === 'text' ? cur : null
     );
 
-    if (selectedClip.track !== 'text') {
-      setSelectedCurvePointId(null);
-    } else {
-      setSelectedCurvePointId((cur) => {
-        const pts = selectedClip.textStyle?.curvePoints ?? [];
-        if (cur && pts.some((p) => p.id === cur)) return cur;
-        return pts[0]?.id ?? null;
-      });
-    }
-
-    if (selectedClip.track === 'audio') {
+    if (clip.track === 'audio') {
       setShowOpacitySlider(false);
       setShowTrackpad(false);
       setTrackpadSnapGuides({x: false, y: false});
@@ -330,10 +331,7 @@ export default function App() {
       return;
     }
 
-    if (
-      selectedClip.track === 'adjustment' ||
-      selectedClip.kind === 'adjustment'
-    ) {
+    if (clip.track === 'adjustment' || clip.kind === 'adjustment') {
       setShowChromaKeyPanel(false);
       setShowCompressModal(false);
       setShowCropModal(false);
@@ -355,7 +353,7 @@ export default function App() {
       return;
     }
 
-    if (selectedClip.kind !== 'image' && selectedClip.kind !== 'video') {
+    if (clip.kind !== 'image' && clip.kind !== 'video') {
       setShowChromaKeyPanel(false);
       setShowCompressModal(false);
       setShowCropModal(false);
@@ -365,10 +363,10 @@ export default function App() {
         cur === 'adjust' ||
         cur === 'filters' ||
         cur === 'keyframes' ||
-        (cur === 'shape' && selectedClip.kind === 'shape') ||
+        (cur === 'shape' && clip.kind === 'shape') ||
         cur === 'audio_speed' ||
         cur === 'audio_fx' ||
-        (cur === 'text' && selectedClip.track === 'text')
+        (cur === 'text' && clip.track === 'text')
           ? cur
           : null
       );
@@ -379,31 +377,57 @@ export default function App() {
         cur === 'filters' ||
         cur === 'opacity' ||
         cur === 'keyframes' ||
-        (cur === 'shape' && selectedClip.kind === 'shape')
+        (cur === 'shape' && clip.kind === 'shape')
           ? cur
           : 'menu'
       );
     }
-  }, [selectedClip]);
+  }, [selectedClipIdValue, selectedClipTrackValue, selectedClipKindValue]);
 
   useEffect(() => {
-    if (screen !== 'editor') return;
-    const next = upsertLocalProject({
-      roomId: project.roomId || roomId,
-      title: project.title,
-      aspectRatio: project.aspectRatio,
-      backgroundColor: project.backgroundColor || '#09090b',
-      canvasBackground: project.canvasBackground,
-      updatedAt: Date.now(),
-      clipsCount: project.clips.length,
-      tracksCount: project.tracks.length,
-      snapshot: {
-        tracks: project.tracks,
-        clips: project.clips,
-        customFonts: project.customFonts,
-      },
+    if (selectedClipTrackValue !== 'text') {
+      setSelectedCurvePointId(null);
+      return;
+    }
+    const pts = selectedClipCurvePoints ?? [];
+    setSelectedCurvePointId((cur) => {
+      if (cur && pts.some((p) => p.id === cur)) return cur;
+      return pts[0]?.id ?? null;
     });
-    setLocalProjects(next);
+  }, [selectedClipIdValue, selectedClipTrackValue, selectedClipCurvePoints]);
+
+  useEffect(() => {
+    if (screen !== 'editor') {
+      setLocalProjects(getLocalProjects());
+      return;
+    }
+    const flushSave = () => {
+      const p = projectRef.current;
+      return upsertLocalProject({
+        roomId: p.roomId || roomId,
+        title: p.title,
+        aspectRatio: p.aspectRatio,
+        backgroundColor: p.backgroundColor || '#09090b',
+        canvasBackground: p.canvasBackground,
+        updatedAt: Date.now(),
+        clipsCount: p.clips.length,
+        tracksCount: p.tracks.length,
+        snapshot: {
+          tracks: p.tracks,
+          clips: p.clips,
+          customFonts: p.customFonts,
+        },
+      });
+    };
+    const timer = setTimeout(() => {
+      flushSave();
+    }, 1200);
+    window.addEventListener('beforeunload', flushSave);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('beforeunload', flushSave);
+      flushSave();
+    };
   }, [screen, project, roomId]);
 
   useEffect(() => {
@@ -424,11 +448,17 @@ export default function App() {
       lastTs = now;
       setCurrentTime((prev) => {
         const next = prev + dt;
-        if (next >= duration) {
+        if (next >= durationRef.current) {
           setIsPlaying(false);
           return 0;
         }
-        audioEngineRef.current?.sync(project.clips, next, true, project.tracks);
+        const curProject = projectRef.current;
+        audioEngineRef.current?.sync(
+          curProject.clips,
+          next,
+          true,
+          curProject.tracks
+        );
         return next;
       });
       raf = requestAnimationFrame(tick);
@@ -439,20 +469,21 @@ export default function App() {
       cancelAnimationFrame(raf);
       audioEngineRef.current?.stopAll();
     };
-  }, [isPlaying, duration, project.clips, project.tracks]);
+  }, [isPlaying]);
 
   const handleSeek = useCallback(
     (time: number) => {
-      const clamped = Math.max(0, Math.min(duration, time));
+      const clamped = Math.max(0, Math.min(durationRef.current, time));
       setCurrentTime(clamped);
+      const curProject = projectRef.current;
       audioEngineRef.current?.sync(
-        project.clips,
+        curProject.clips,
         clamped,
         isPlaying,
-        project.tracks
+        curProject.tracks
       );
     },
-    [duration, project.clips, project.tracks, isPlaying]
+    [isPlaying]
   );
 
   const handleSplitSelectedOrCurrent = useCallback(() => {
@@ -597,7 +628,7 @@ export default function App() {
 
       const isSticker = Boolean(opts.isSticker);
       const hasRemoteMedia = Boolean(opts.remoteUrl);
-      const {clip, newTrack} = addClip(
+      const {clip, newTrack, insertAt} = addClip(
         {
           id: `clip-${Math.random().toString(36).slice(2, 9)}`,
           track: opts.track,
@@ -628,8 +659,8 @@ export default function App() {
               ? 'kenburns-in'
               : 'none',
           mediaScale: isSticker ? 0.36 : opts.track === 'overlay' ? 0.55 : 1,
-          mediaX: isSticker ? 0.5 : opts.track === 'overlay' ? 0.5 : 0.5,
-          mediaY: isSticker ? 0.5 : opts.track === 'overlay' ? 0.5 : 0.5,
+          mediaX: 0.5,
+          mediaY: 0.5,
           rotation: 0,
           borderRadius: 0,
           blendMode: 'source-over',
@@ -651,6 +682,7 @@ export default function App() {
           fileHash: opts.fileHash,
           clip,
           newTrack,
+          insertAt,
         });
       }
 
@@ -699,6 +731,8 @@ export default function App() {
             src: prepared.localSrc,
             fileName: prepared.fileName,
             remoteUrl: prepared.shareUrl,
+            fileSize: prepared.fileSize,
+            fileHash: prepared.fileHash,
             duration: dur,
             track: 'overlay',
             forceNewTrack: false,
@@ -799,24 +833,16 @@ export default function App() {
 
   const handleUpdateClipWarp = useCallback(
     (clipId: string, warp: ClipWarp, commit: boolean) => {
-      const target = project.clips.find((c) => c.id === clipId);
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
       if (!target) return;
       if (target.keyframes && target.keyframes.length > 0) {
         const {keyframes} = upsertKeyframeAtTime(target, currentTime, {warp});
-        updateClip(
-          clipId,
-          {warp, keyframes},
-          {skipUndo: !commit, skipSync: !commit}
-        );
+        updateClip(clipId, {warp, keyframes}, {skipUndo: !commit});
         return;
       }
-      updateClip(
-        clipId,
-        {warp},
-        {skipUndo: !commit, skipSync: !commit}
-      );
+      updateClip(clipId, {warp}, {skipUndo: !commit});
     },
-    [project.clips, currentTime, updateClip]
+    [currentTime, updateClip]
   );
 
   const handleAddAdjustmentLayer = useCallback(() => {
@@ -1043,11 +1069,7 @@ export default function App() {
       } else if (textColorPicker.field === 'shadowColor') {
         nextStyle.shadow = true;
       }
-      updateClip(
-        target.id,
-        {textStyle: nextStyle},
-        {skipUndo: !commit, skipSync: !commit}
-      );
+      updateClip(target.id, {textStyle: nextStyle}, {skipUndo: !commit});
     },
     [textColorPicker, project.clips, updateClip]
   );
@@ -1067,7 +1089,7 @@ export default function App() {
 
   const handleUpdateCurvePoints = useCallback(
     (clipId: string, points: TextCurvePoint[], commit: boolean) => {
-      const target = project.clips.find((c) => c.id === clipId);
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
       if (!target || target.track !== 'text') return;
       const base = normalizeTextStyle(target.textStyle);
       const nextStyle: NonNullable<Clip['textStyle']> = {
@@ -1075,13 +1097,9 @@ export default function App() {
         curveMode: 'custom',
         curvePoints: points,
       };
-      updateClip(
-        target.id,
-        {textStyle: nextStyle},
-        {skipUndo: !commit, skipSync: !commit}
-      );
+      updateClip(target.id, {textStyle: nextStyle}, {skipUndo: !commit});
     },
-    [project.clips, updateClip]
+    [updateClip]
   );
 
   const handleAddAudioClip = useCallback(
@@ -1102,7 +1120,7 @@ export default function App() {
         Math.round((opts.startTime ?? currentTime) * 100) / 100
       );
       const hasRemote = Boolean(opts.remoteUrl);
-      const {clip, newTrack} = addClip(
+      const {clip, newTrack, insertAt} = addClip(
         {
           id: `clip-${Math.random().toString(36).slice(2, 9)}`,
           track: 'audio',
@@ -1145,6 +1163,7 @@ export default function App() {
           fileHash: opts.fileHash,
           clip,
           newTrack,
+          insertAt,
         });
       }
 
@@ -1155,7 +1174,7 @@ export default function App() {
 
   const handleTransformClipOnCanvas = useCallback(
     (clipId: string, patch: CanvasTransformPatch, commit: boolean) => {
-      const target = project.clips.find((c) => c.id === clipId);
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
       if (!target) return;
 
       if (target.keyframes && target.keyframes.length > 0) {
@@ -1165,11 +1184,7 @@ export default function App() {
           ...(patch.scale !== undefined ? {scale: patch.scale} : {}),
           ...(patch.rotation !== undefined ? {rotation: patch.rotation} : {}),
         });
-        updateClip(
-          clipId,
-          {keyframes},
-          {skipUndo: !commit, skipSync: !commit}
-        );
+        updateClip(clipId, {keyframes}, {skipUndo: !commit});
         return;
       }
 
@@ -1190,7 +1205,7 @@ export default function App() {
             ...(patch.scale !== undefined ? {mediaScale: patch.scale} : {}),
             ...(patch.rotation !== undefined ? {rotation: patch.rotation} : {}),
           },
-          {skipUndo: !commit, skipSync: !commit}
+          {skipUndo: !commit}
         );
       } else {
         updateClip(
@@ -1201,11 +1216,11 @@ export default function App() {
             ...(patch.scale !== undefined ? {mediaScale: patch.scale} : {}),
             ...(patch.rotation !== undefined ? {rotation: patch.rotation} : {}),
           },
-          {skipUndo: !commit, skipSync: !commit}
+          {skipUndo: !commit}
         );
       }
     },
-    [project.clips, currentTime, updateClip]
+    [currentTime, updateClip]
   );
 
   const handleAddKeyframeAtPlayhead = useCallback(() => {
@@ -1225,22 +1240,18 @@ export default function App() {
         updateClip(
           selectedClip.id,
           {opacity: clamped, keyframes},
-          {skipUndo: !commit, skipSync: !commit}
+          {skipUndo: !commit}
         );
         return;
       }
-      updateClip(
-        selectedClip.id,
-        {opacity: clamped},
-        {skipUndo: !commit, skipSync: !commit}
-      );
+      updateClip(selectedClip.id, {opacity: clamped}, {skipUndo: !commit});
     },
     [selectedClip, currentTime, updateClip]
   );
 
   const handlePickChromaKeyColor = useCallback(
     (clipId: string, hexColor: string, commit: boolean) => {
-      const target = project.clips.find((c) => c.id === clipId);
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
       if (!target) return;
       updateClip(
         clipId,
@@ -1253,10 +1264,10 @@ export default function App() {
               : 0.35,
           chromaKeySmoothness: target.chromaKeySmoothness ?? 0.15,
         },
-        {skipUndo: !commit, skipSync: !commit}
+        {skipUndo: !commit}
       );
     },
-    [project.clips, updateClip]
+    [updateClip]
   );
 
   const handleUpdateChromaKey = useCallback(
@@ -1273,34 +1284,23 @@ export default function App() {
       >,
       commit: boolean
     ) => {
-      updateClip(clipId, patch, {skipUndo: !commit, skipSync: !commit});
+      updateClip(clipId, patch, {skipUndo: !commit});
     },
     [updateClip]
   );
 
   const handleTransformMaskOnCanvas = useCallback(
     (clipId: string, patch: Partial<ClipMask>, commit: boolean) => {
-      const target = project.clips.find((c) => c.id === clipId);
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
       if (!target?.mask) return;
-      updateClip(
-        clipId,
-        {mask: {...target.mask, ...patch}},
-        {skipUndo: !commit, skipSync: !commit}
-      );
+      updateClip(clipId, {mask: {...target.mask, ...patch}}, {skipUndo: !commit});
     },
-    [project.clips, updateClip]
+    [updateClip]
   );
 
-  const lastTimelineSyncRef = useRef(0);
   const handleClipTransform = useCallback(
     (clipId: string, patch: Partial<Clip>, commit: boolean) => {
-      const now = Date.now();
-      const shouldSync = commit || now - lastTimelineSyncRef.current >= 70;
-      if (shouldSync) lastTimelineSyncRef.current = now;
-      updateClip(clipId, patch, {
-        skipUndo: !commit,
-        skipSync: !shouldSync,
-      });
+      updateClip(clipId, patch, {skipUndo: !commit});
     },
     [updateClip]
   );

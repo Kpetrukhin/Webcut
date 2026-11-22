@@ -7,6 +7,7 @@ import {
   Layers,
   Music,
   Plus,
+  RefreshCw,
   Search,
   Sparkles,
   Trash2,
@@ -44,6 +45,7 @@ interface TimelineProps {
     opts?: {commit?: boolean; undoTracks?: Track[]}
   ) => void;
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
+  onRetryDownload?: (clipId: string) => void;
   onClipTransform: (
     clipId: string,
     patch: Partial<Clip>,
@@ -111,6 +113,7 @@ export const Timeline: React.FC<TimelineProps> = ({
   onDeleteTrack,
   onReorderTracks,
   onLockLayer,
+  onRetryDownload,
   onClipTransform,
 }) => {
   const rulerRef = useRef<HTMLDivElement | null>(null);
@@ -788,6 +791,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                             (u) => u.selectedClipId === clip.id
                           );
                     const isDownloading = clip.mediaStatus === 'DOWNLOADING';
+                    const isDownloadError = clip.mediaStatus === 'ERROR';
                     const leftPx = clip.start * pxPerSec;
                     const widthPx = Math.max(28, clip.duration * pxPerSec);
 
@@ -810,11 +814,13 @@ export const Timeline: React.FC<TimelineProps> = ({
                           width: `${widthPx}px`,
                           boxShadow: peerLock
                             ? `0 0 0 2px ${peerLock.color}`
-                            : isSelected
-                              ? '0 0 0 2px #22d3ee'
-                              : track.type === 'adjustment'
-                                ? 'inset 0 0 0 1px rgba(192,132,252,0.35)'
-                                : 'inset 0 0 0 1px rgba(255,255,255,0.12)',
+                            : isDownloadError
+                              ? '0 0 0 2px #f43f5e'
+                              : isSelected
+                                ? '0 0 0 2px #22d3ee'
+                                : track.type === 'adjustment'
+                                  ? 'inset 0 0 0 1px rgba(192,132,252,0.35)'
+                                  : 'inset 0 0 0 1px rgba(255,255,255,0.12)',
                         }}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -835,7 +841,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                             }}
                           />
                         )}
-                        {clip.kind === 'image' && clip.src && !isDownloading && (
+                        {clip.kind === 'image' && clip.src && !isDownloading && !isDownloadError && (
                           <div
                             className="pointer-events-none absolute inset-0 opacity-45"
                             style={{
@@ -905,19 +911,17 @@ export const Timeline: React.FC<TimelineProps> = ({
                         )}
 
                         {track.type === 'audio' && (
-                          <div className="pointer-events-none absolute inset-0 flex items-center gap-[2px] px-2 opacity-35">
-                            {Array.from({
-                              length: Math.max(6, Math.floor(widthPx / 6)),
-                            }).map((_, idx) => (
-                              <span
-                                key={idx}
-                                className="w-[2px] rounded-full bg-emerald-300"
-                                style={{
-                                  height: `${28 + ((idx * 37) % 58)}%`,
-                                }}
-                              />
-                            ))}
-                          </div>
+                          <div
+                            className="pointer-events-none absolute inset-x-2 inset-y-2.5 opacity-40"
+                            style={{
+                              backgroundImage:
+                                'repeating-linear-gradient(90deg, rgba(110,231,183,0.95) 0px, rgba(110,231,183,0.95) 2px, transparent 2px, transparent 5px)',
+                              maskImage:
+                                'linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.45) 22%, #000 50%, rgba(0,0,0,0.45) 78%, transparent 100%)',
+                              WebkitMaskImage:
+                                'linear-gradient(180deg, transparent 0%, rgba(0,0,0,0.45) 22%, #000 50%, rgba(0,0,0,0.45) 78%, transparent 100%)',
+                            }}
+                          />
                         )}
 
                         {clip.adjustmentMask && (
@@ -940,18 +944,40 @@ export const Timeline: React.FC<TimelineProps> = ({
                         )}
 
                         <div className="relative z-10 flex w-full items-center justify-between gap-1 px-2 text-[11px] font-medium text-white drop-shadow">
-                          <span className="truncate">
+                          <span
+                            className={`truncate ${isDownloadError ? 'text-rose-300' : ''}`}
+                            title={isDownloadError ? clip.mediaError || 'Ошибка загрузки файла' : undefined}
+                          >
                             {isDownloading
                               ? `⬇ ${clip.downloadProgress ?? 0}% · ${clip.name}`
-                              : clip.adjustmentMask
-                                ? `◐ ${clip.kind === 'text' ? clip.text || clip.name : clip.name}`
-                                : clip.kind === 'text'
-                                  ? clip.text || clip.name
-                                  : clip.name}
+                              : isDownloadError
+                                ? `⚠ ${clip.name}`
+                                : clip.adjustmentMask
+                                  ? `◐ ${clip.kind === 'text' ? clip.text || clip.name : clip.name}`
+                                  : clip.kind === 'text'
+                                    ? clip.text || clip.name
+                                    : clip.name}
                           </span>
-                          <span className="shrink-0 font-mono text-[10px] text-zinc-200/80 tabular-nums">
-                            {clip.duration.toFixed(1)}с
-                          </span>
+                          <div className="flex shrink-0 items-center gap-1">
+                            {isDownloadError && onRetryDownload && (
+                              <button
+                                type="button"
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  onRetryDownload(clip.id);
+                                }}
+                                title={clip.mediaError || 'Повторить скачивание'}
+                                className="inline-flex items-center gap-0.5 rounded bg-rose-500/85 px-1.5 py-0.5 text-[9px] font-semibold text-white transition hover:bg-rose-400 active:scale-95"
+                              >
+                                <RefreshCw className="h-2.5 w-2.5" />
+                                Повтор
+                              </button>
+                            )}
+                            <span className="font-mono text-[10px] text-zinc-200/80 tabular-nums">
+                              {clip.duration.toFixed(1)}с
+                            </span>
+                          </div>
                         </div>
 
                         {/* Keyframe Diamond Markers on Clip */}

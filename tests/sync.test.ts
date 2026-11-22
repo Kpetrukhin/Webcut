@@ -227,6 +227,10 @@ test('JSON Sync: полная сериализация всех слоёв, ма
     revision: 42,
     updatedAt: 1700000000000,
     chat: [],
+    canvasBackground: {
+      type: 'solid',
+      color: '#121826',
+    },
   };
 
   const roundTripped = normalizeProjectTracks(
@@ -843,3 +847,423 @@ test('WebSocket Sync E2E: Ping/Pong, HTTP Media Upload/Broadcast, SYNC_FULL_STAT
     }
   }
 });
+
+test('JSON Sync: фигуры, деформация (warp + keyframe.warp), корр. слои, canvasBackground и выход за границы холста', () => {
+  const proj: ProjectState = {
+    roomId: 'audit-room-2',
+    title: 'Проверка фигур, деформации и координат',
+    aspectRatio: '9:16',
+    backgroundColor: '#111827',
+    canvasBackground: {
+      type: 'gradient',
+      colors: ['#0f172a', '#164e63'],
+      angle: 135,
+      label: 'Неон',
+    },
+    fps: 30,
+    isPublicLan: true,
+    customFonts: [],
+    tracks: [
+      {id: 'track-video-1', type: 'video', name: 'Основное видео'},
+      {id: 'track-overlay-1', type: 'overlay', name: 'Слой 1'},
+      {id: 'track-text-1', type: 'text', name: 'Титры 1'},
+      {id: 'track-adj-1', type: 'adjustment', name: 'Коррекция 1'},
+    ],
+    clips: [
+      {
+        id: 'shape-oob',
+        track: 'overlay',
+        trackId: 'track-overlay-1',
+        kind: 'shape',
+        name: 'Стрелка',
+        start: 0,
+        duration: 6,
+        trimStart: 0,
+        sourceDuration: 3600,
+        speed: 1,
+        volume: 0,
+        opacity: 0.9,
+        filter: 'none',
+        brightness: 1,
+        contrast: 1,
+        saturate: 1,
+        transitionIn: 'none',
+        motionEffect: 'none',
+        mediaScale: 0.45,
+        mediaX: -0.35,
+        mediaY: 1.24,
+        rotation: 12,
+        shapeStyle: {
+          shapeType: 'arrow',
+          fillColor: '#22d3ee',
+          fillOpacity: 0.85,
+          strokeColor: '#ffffff',
+          strokeWidth: 4,
+          cornerRadius: 8,
+        },
+        adjustmentMask: true,
+        colorAdjustments: {
+          sharpness: 15,
+          shadows: -10,
+          hue: 25,
+          temperature: -15,
+          fade: 5,
+          grain: 0,
+          invert: 80,
+        },
+        warp: {
+          mode: 'perspective',
+          corners: [
+            {x: -0.25, y: -0.15},
+            {x: 1.35, y: 0.05},
+            {x: 1.15, y: 1.4},
+            {x: -0.1, y: 0.95},
+          ],
+          meshSize: 3,
+          meshPoints: Array.from({length: 9}, (_, idx) => ({
+            x: (idx % 3) / 2,
+            y: Math.floor(idx / 3) / 2,
+          })),
+        },
+        keyframes: [
+          {
+            id: 'kf-1',
+            timeOffset: 0.5,
+            x: -0.35,
+            y: 1.24,
+            scale: 0.45,
+            rotation: 12,
+            opacity: 0.9,
+            warp: {
+              mode: 'perspective',
+              corners: [
+                {x: -0.25, y: -0.15},
+                {x: 1.35, y: 0.05},
+                {x: 1.15, y: 1.4},
+                {x: -0.1, y: 0.95},
+              ],
+              meshSize: 3,
+              meshPoints: Array.from({length: 9}, (_, idx) => ({
+                x: (idx % 3) / 2,
+                y: Math.floor(idx / 3) / 2,
+              })),
+            },
+            easing: 'ease-out',
+          },
+          {
+            id: 'kf-2',
+            timeOffset: 4.0,
+            x: 1.42,
+            y: -0.18,
+            scale: 0.65,
+            rotation: -18,
+            opacity: 1,
+            easing: 'linear',
+          },
+        ],
+      },
+      {
+        id: 'adj-layer-1',
+        track: 'adjustment',
+        trackId: 'track-adj-1',
+        kind: 'adjustment',
+        name: 'Корр. слой',
+        start: 1,
+        duration: 4,
+        trimStart: 0,
+        sourceDuration: 3600,
+        speed: 1,
+        volume: 0,
+        opacity: 0.75,
+        filter: 'cinema',
+        brightness: 1.12,
+        contrast: 1.2,
+        saturate: 0.9,
+        transitionIn: 'none',
+        motionEffect: 'none',
+        colorAdjustments: {
+          sharpness: 30,
+          shadows: 12,
+          hue: 0,
+          temperature: 10,
+          fade: 15,
+          grain: 8,
+          invert: 100,
+        },
+      },
+    ],
+    revision: 5,
+    updatedAt: Date.now(),
+    chat: [],
+  };
+
+  const wire = JSON.parse(JSON.stringify(proj)) as ProjectState;
+  const restored = normalizeProjectTracks(wire);
+
+  assert.deepEqual(restored.canvasBackground, proj.canvasBackground);
+  const restoredShape = restored.clips.find((c) => c.id === 'shape-oob')!;
+  assert.equal(restoredShape.mediaX, -0.35);
+  assert.equal(restoredShape.mediaY, 1.24);
+  assert.equal(restoredShape.adjustmentMask, true);
+  assert.equal(restoredShape.shapeStyle?.shapeType, 'arrow');
+  assert.equal(restoredShape.colorAdjustments?.invert, 80);
+  assert.equal(restoredShape.warp?.corners[1].x, 1.35);
+  assert.equal(restoredShape.keyframes?.[0].warp?.corners[0].x, -0.25);
+
+  // Split & duplicate must deep-clone shapeStyle and warp (including kf.warp)
+  const splitClips = applyClipSplit(restored.clips, 'shape-oob', 2.5, 'shape-oob-2');
+  const firstHalf = splitClips.find((c) => c.id === 'shape-oob')!;
+  const secondHalf = splitClips.find((c) => c.id === 'shape-oob-2')!;
+  secondHalf.shapeStyle!.fillColor = '#f43f5e';
+  secondHalf.warp!.corners[0].x = 0.25;
+  assert.equal(firstHalf.shapeStyle?.fillColor, '#22d3ee');
+  assert.equal(firstHalf.warp?.corners[0].x, -0.25);
+
+  const dupClips = applyClipDuplicate(restored.clips, 'shape-oob', 'shape-oob-copy');
+  const dup = dupClips.find((c) => c.id === 'shape-oob-copy')!;
+  dup.warp!.corners[2].y = 0.5;
+  dup.keyframes![0].warp!.corners[0].x = 0.0;
+  assert.equal(restoredShape.warp?.corners[2].y, 1.4);
+  assert.equal(restoredShape.keyframes?.[0].warp?.corners[0].x, -0.25);
+
+  // Patch clear test for shapeStyle / warp / adjustmentMask
+  const clearPatch = encodePatchForSync<Clip>({
+    warp: undefined,
+    adjustmentMask: undefined,
+    mediaX: 1.55,
+    mediaY: -0.4,
+  });
+  const wireClear = JSON.parse(JSON.stringify(clearPatch)) as Record<string, unknown>;
+  const patched = applyClipPatch(restoredShape, wireClear);
+  assert.equal('warp' in patched, false);
+  assert.equal('adjustmentMask' in patched, false);
+  assert.equal(patched.mediaX, 1.55);
+  assert.equal(patched.mediaY, -0.4);
+});
+
+test('E2E Concurrent Multi-User: 2 участника одновременно редактируют разные объекты (включая выход за границы)', async () => {
+  const roomsFile = path.join(process.cwd(), 'data', 'rooms.json');
+  const hadRoomsFile = fs.existsSync(roomsFile);
+  const prevRoomsContent = hadRoomsFile
+    ? fs.readFileSync(roomsFile, 'utf-8')
+    : null;
+
+  process.env.CUTSYNC_NO_AUTOSTART = '1';
+  const {startServer, stopServer} = await import('../server.ts');
+
+  const {port} = await startServer({
+    port: 0,
+    isProd: true,
+    lockTimeoutMs: 1200,
+    disableVite: true,
+    disableBeacon: true,
+  });
+  const baseWs = `ws://127.0.0.1:${port}/ws`;
+
+  let aliceWs: WebSocket | null = null;
+  let bobWs: WebSocket | null = null;
+
+  const connectPeer = async (
+    id: string,
+    name: string,
+    roomId: string
+  ): Promise<{
+    ws: WebSocket;
+    waitFor: <T extends ServerWsMessage['type']>(
+      type: T,
+      predicate?: (m: Extract<ServerWsMessage, {type: T}>) => boolean,
+      timeoutMs?: number
+    ) => Promise<Extract<ServerWsMessage, {type: T}>>;
+  }> => {
+    const queue: ServerWsMessage[] = [];
+    const waiters: Array<{
+      type: ServerWsMessage['type'];
+      predicate?: (m: ServerWsMessage) => boolean;
+      resolve: (m: ServerWsMessage) => void;
+      reject: (err: Error) => void;
+    }> = [];
+
+    const ws = new WebSocket(baseWs);
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString()) as ServerWsMessage;
+      const idx = waiters.findIndex(
+        (w) => w.type === msg.type && (!w.predicate || w.predicate(msg))
+      );
+      if (idx !== -1) {
+        const w = waiters.splice(idx, 1)[0];
+        w.resolve(msg);
+      } else {
+        queue.push(msg);
+      }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => {
+        ws.send(
+          JSON.stringify({
+            type: 'join',
+            roomId,
+            user: {id, name, color: '#22d3ee'},
+          })
+        );
+        resolve();
+      });
+      ws.once('error', reject);
+    });
+
+    const waitFor = <T extends ServerWsMessage['type']>(
+      type: T,
+      predicate?: (m: Extract<ServerWsMessage, {type: T}>) => boolean,
+      timeoutMs = 4000
+    ) => {
+      const qIdx = queue.findIndex(
+        (m) =>
+          m.type === type &&
+          (!predicate || predicate(m as Extract<ServerWsMessage, {type: T}>))
+      );
+      if (qIdx !== -1) {
+        return Promise.resolve(
+          queue.splice(qIdx, 1)[0] as Extract<ServerWsMessage, {type: T}>
+        );
+      }
+      return new Promise<Extract<ServerWsMessage, {type: T}>>(
+        (resolve, reject) => {
+          const timer = setTimeout(() => {
+            const wIdx = waiters.indexOf(entry);
+            if (wIdx !== -1) waiters.splice(wIdx, 1);
+            reject(new Error(`Timeout waiting for ${type}`));
+          }, timeoutMs);
+          const entry = {
+            type,
+            predicate: predicate as ((m: ServerWsMessage) => boolean) | undefined,
+            resolve: (m: ServerWsMessage) => {
+              clearTimeout(timer);
+              resolve(m as Extract<ServerWsMessage, {type: T}>);
+            },
+            reject: (err: Error) => {
+              clearTimeout(timer);
+              reject(err);
+            },
+          };
+          waiters.push(entry);
+        }
+      );
+    };
+
+    await waitFor('room:init');
+    return {ws, waitFor};
+  };
+
+  try {
+    const roomId = `e2e-concurrent-${Date.now()}`;
+    const alice = await connectPeer('alice-c', 'Алиса', roomId);
+    aliceWs = alice.ws;
+    const bob = await connectPeer('bob-c', 'Боб', roomId);
+    bobWs = bob.ws;
+
+    // Alice edits clip-o1 (pushing off left/bottom edge + warp), while Bob simultaneously edits clip-t1 (pushing off right/top edge)
+    alice.ws.send(
+      JSON.stringify({
+        type: 'LAYER_LOCK',
+        layerId: 'clip-o1',
+        userId: 'alice-c',
+        userName: 'Алиса',
+        userColor: '#22d3ee',
+        locked: true,
+      })
+    );
+    bob.ws.send(
+      JSON.stringify({
+        type: 'LAYER_LOCK',
+        layerId: 'clip-t1',
+        userId: 'bob-c',
+        userName: 'Боб',
+        userColor: '#f97316',
+        locked: true,
+      })
+    );
+
+    await Promise.all([
+      bob.waitFor('LAYER_LOCK', (m) => m.layerId === 'clip-o1' && m.locked),
+      alice.waitFor('LAYER_LOCK', (m) => m.layerId === 'clip-t1' && m.locked),
+    ]);
+
+    for (let step = 1; step <= 10; step++) {
+      const oobX = -(step * 0.04); // up to -0.40 outside left edge
+      alice.ws.send(
+        JSON.stringify({
+          type: 'op:clip_update',
+          clipId: 'clip-o1',
+          patch: {mediaX: oobX, mediaY: 1.15, rotation: step * 3},
+        })
+      );
+      bob.ws.send(
+        JSON.stringify({
+          type: 'op:clip_update',
+          clipId: 'clip-t1',
+          patch: {
+            textStyle: {
+              fontSize: 54,
+              color: '#ffffff',
+              bgColor: 'rgba(9, 9, 11, 0.72)',
+              fontWeight: 'bold',
+              fontFamily: 'Plus Jakarta Sans',
+              shadow: true,
+              x: 1.0 + step * 0.03, // up to 1.30 outside right edge
+              y: -0.12,
+              align: 'center',
+            },
+          },
+        })
+      );
+    }
+
+    await Promise.all([
+      bob.waitFor(
+        'op:clip_update',
+        (m) => m.clipId === 'clip-o1' && m.patch.mediaX === -0.4
+      ),
+      alice.waitFor(
+        'op:clip_update',
+        (m) =>
+          m.clipId === 'clip-t1' &&
+          Math.abs((m.patch.textStyle?.x ?? 0) - 1.3) < 0.001
+      ),
+    ]);
+
+    alice.ws.send(JSON.stringify({type: 'SYNC_FULL_STATE'}));
+    const full = await alice.waitFor('SYNC_FULL_STATE');
+    const cO1 = full.project.clips.find((c) => c.id === 'clip-o1');
+    const cT1 = full.project.clips.find((c) => c.id === 'clip-t1');
+    assert.ok(cO1);
+    assert.ok(cT1);
+    assert.equal(cO1.mediaX, -0.4);
+    assert.equal(cO1.mediaY, 1.15);
+    assert.equal(cO1.rotation, 30);
+    assert.ok(Math.abs((cT1.textStyle?.x ?? 0) - 1.3) < 0.001);
+    assert.equal(cT1.textStyle?.y, -0.12);
+  } finally {
+    try {
+      aliceWs?.terminate();
+    } catch {
+      // ignore
+    }
+    try {
+      bobWs?.terminate();
+    } catch {
+      // ignore
+    }
+    await stopServer();
+    await new Promise((r) => setTimeout(r, 350));
+    try {
+      if (hadRoomsFile && prevRoomsContent !== null) {
+        fs.writeFileSync(roomsFile, prevRoomsContent, 'utf-8');
+      } else if (!hadRoomsFile && fs.existsSync(roomsFile)) {
+        fs.unlinkSync(roomsFile);
+      }
+    } catch {
+      // ignore
+    }
+  }
+});
+

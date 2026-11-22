@@ -340,37 +340,90 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
 
   const maskEditClipId = maskEditActive ? selectedClipId : null;
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
+  const renderStateRef = useRef({
+    width,
+    height,
+    clips,
+    currentTime,
+    mediaPool,
+    renderedSelectedId,
+    collaborators,
+    tracks,
+    backgroundColor,
+    effectiveSnapGuides,
+    currentUserId,
+    maskEditClipId,
+    canvasBackground,
+  });
+  renderStateRef.current = {
+    width,
+    height,
+    clips,
+    currentTime,
+    mediaPool,
+    renderedSelectedId,
+    collaborators,
+    tracks,
+    backgroundColor,
+    effectiveSnapGuides,
+    currentUserId,
+    maskEditClipId,
+    canvasBackground,
+  };
 
+  useEffect(() => {
     mediaPool.syncVideos(clips, currentTime, isPlaying, tracks, audioEngine);
-    renderCompositeFrame(
-      ctx,
-      width,
-      height,
-      clips,
-      currentTime,
-      mediaPool,
-      renderedSelectedId,
-      collaborators,
-      tracks,
-      backgroundColor,
-      effectiveSnapGuides,
-      currentUserId,
-      maskEditClipId,
-      canvasBackground
-    );
+  }, [tracks, clips, currentTime, isPlaying, mediaPool, audioEngine]);
+
+  const pausedRedrawRafRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (isPlaying) {
+      if (pausedRedrawRafRef.current !== null) {
+        cancelAnimationFrame(pausedRedrawRafRef.current);
+        pausedRedrawRafRef.current = null;
+      }
+      return;
+    }
+    if (pausedRedrawRafRef.current !== null) {
+      cancelAnimationFrame(pausedRedrawRafRef.current);
+    }
+    pausedRedrawRafRef.current = requestAnimationFrame(() => {
+      pausedRedrawRafRef.current = null;
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext('2d');
+      if (!canvas || !ctx) return;
+      const s = renderStateRef.current;
+      renderCompositeFrame(
+        ctx,
+        s.width,
+        s.height,
+        s.clips,
+        s.currentTime,
+        s.mediaPool,
+        s.renderedSelectedId,
+        s.collaborators,
+        s.tracks,
+        s.backgroundColor,
+        s.effectiveSnapGuides,
+        s.currentUserId,
+        s.maskEditClipId,
+        s.canvasBackground
+      );
+    });
+    return () => {
+      if (pausedRedrawRafRef.current !== null) {
+        cancelAnimationFrame(pausedRedrawRafRef.current);
+        pausedRedrawRafRef.current = null;
+      }
+    };
   }, [
+    isPlaying,
     tracks,
     clips,
     aspectRatio,
     backgroundColor,
     canvasBackground,
     currentTime,
-    isPlaying,
     renderedSelectedId,
     collaborators,
     mediaPool,
@@ -390,44 +443,29 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       const canvas = canvasRef.current;
       const ctx = canvas?.getContext('2d');
       if (canvas && ctx) {
+        const s = renderStateRef.current;
         renderCompositeFrame(
           ctx,
-          width,
-          height,
-          clips,
-          currentTime,
-          mediaPool,
-          renderedSelectedId,
-          collaborators,
-          tracks,
-          backgroundColor,
-          effectiveSnapGuides,
-          currentUserId,
-          maskEditClipId,
-          canvasBackground
+          s.width,
+          s.height,
+          s.clips,
+          s.currentTime,
+          s.mediaPool,
+          s.renderedSelectedId,
+          s.collaborators,
+          s.tracks,
+          s.backgroundColor,
+          s.effectiveSnapGuides,
+          s.currentUserId,
+          s.maskEditClipId,
+          s.canvasBackground
         );
       }
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [
-    isPlaying,
-    tracks,
-    clips,
-    backgroundColor,
-    canvasBackground,
-    currentTime,
-    width,
-    height,
-    mediaPool,
-    renderedSelectedId,
-    collaborators,
-    effectiveSnapGuides.x,
-    effectiveSnapGuides.y,
-    currentUserId,
-    maskEditClipId,
-  ]);
+  }, [isPlaying]);
 
   const findHitClip = (nx: number, ny: number): Clip | null => {
     const hiddenIds = new Set(tracks.filter((t) => t.hidden).map((t) => t.id));
@@ -577,8 +615,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     const snapNormX = 12 / Math.max(1, rect.width);
     const snapNormY = 12 / Math.max(1, rect.height);
 
-    let x = Math.max(0.02, Math.min(0.98, rawX));
-    let y = Math.max(0.02, Math.min(0.98, rawY));
+    let x = Math.max(-5, Math.min(6, rawX));
+    let y = Math.max(-5, Math.min(6, rawY));
     let snappedX = false;
     let snappedY = false;
 
@@ -1091,7 +1129,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           drag.box.rotationDeg
         );
         const clampUv = (v: number) =>
-          Math.max(-1.6, Math.min(2.6, Math.round(v * 1000) / 1000));
+          Math.max(-4.0, Math.min(5.0, Math.round(v * 1000) / 1000));
         const uv = {u: clampUv(rawUv.u), v: clampUv(rawUv.v)};
 
         let nextWarp: ClipWarp = drag.warp;
@@ -1537,7 +1575,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         className="flex h-full w-full min-h-0 min-w-0 items-center justify-center"
       >
         <div
-          className="relative overflow-hidden rounded-xl border border-white/10 shadow-2xl transition-[width,height] duration-300 ease-out"
+          className="relative rounded-xl border border-white/10 shadow-2xl transition-[width,height] duration-300 ease-out"
           style={{
             ...containerBgStyle,
             width: fittedSize ? `${fittedSize.w}px` : undefined,
@@ -1561,13 +1599,13 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           onPointerCancel={handlePointerUp}
           onPointerLeave={() => setHoverLinePos(null)}
           onWheel={handleWheel}
-          className="h-full w-full touch-none object-contain cursor-grab active:cursor-grabbing"
+          className="h-full w-full touch-none overflow-hidden rounded-xl object-contain cursor-grab active:cursor-grabbing"
         />
 
         {curveOverlay && (
           <svg
             viewBox={`0 0 ${width} ${height}`}
-            className="pointer-events-none absolute inset-0 z-10 h-full w-full"
+            className="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible"
           >
             {/* Dark contrast halo for visibility over bright or dark videos */}
             <path

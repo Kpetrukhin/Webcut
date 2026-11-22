@@ -84,8 +84,8 @@ export const TransformTrackpad: React.FC<TransformTrackpadProps> = ({
     rawX: number,
     rawY: number
   ): {x: number; y: number; snappedX: boolean; snappedY: boolean} => {
-    let x = Math.max(0.02, Math.min(0.98, rawX));
-    let y = Math.max(0.02, Math.min(0.98, rawY));
+    let x = Math.max(-5, Math.min(6, rawX));
+    let y = Math.max(-5, Math.min(6, rawY));
     let snappedX = false;
     let snappedY = false;
 
