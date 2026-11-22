@@ -12,7 +12,7 @@ Edit videos together simultaneously from desktop and mobile devices. Built with 
 [![Docker](https://shields.io)](#docker-deployment)
 [![Android APK](https://shields.io)](#android-apk-github-actions)
 
-[🇷🇺 Русская версия (Russian README)](./README.ru.md)
+[🇷🇺 Русская версия (Russian README)](./README.rus.md)
 
 </div>
 
