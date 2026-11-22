@@ -8,9 +8,34 @@ import type {
 } from '../shared/types.ts';
 import type {StudioAudioEngine} from './audioEngine.ts';
 import {applyChromaKeyShader, rgbToHex} from './chromaKeyShader.ts';
+import {applyColorGradeShader} from './colorGradeShader.ts';
+import {getClipEffectiveAdjustments} from './colorPresets.ts';
 import {loadCustomFont, preloadProjectFonts} from './fontLoader.ts';
 import {evaluateClipTransform} from './keyframeEngine.ts';
+import {applyMaskToCanvas, drawMaskInteractiveGuide} from './maskEngine.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
+
+let clipScratchCanvas: HTMLCanvasElement | null = null;
+function getClipScratchCtx(cw: number, ch: number): {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+} | null {
+  if (!clipScratchCanvas) {
+    clipScratchCanvas = document.createElement('canvas');
+  }
+  if (clipScratchCanvas.width !== cw || clipScratchCanvas.height !== ch) {
+    clipScratchCanvas.width = cw;
+    clipScratchCanvas.height = ch;
+  }
+  const sctx = clipScratchCanvas.getContext('2d');
+  if (!sctx) return null;
+  sctx.setTransform(1, 0, 0, 1, 0, 0);
+  sctx.globalAlpha = 1;
+  sctx.globalCompositeOperation = 'source-over';
+  sctx.filter = 'none';
+  sctx.clearRect(0, 0, cw, ch);
+  return {canvas: clipScratchCanvas, ctx: sctx};
+}
 
 export function getCanvasDimensions(aspect: AspectRatio): {
   width: number;
@@ -166,6 +191,9 @@ export function buildFilterString(
     case 'bw':
       parts.push('grayscale(1) contrast(1.16)');
       break;
+    case 'sepia':
+      parts.push('sepia(0.75) contrast(1.05)');
+      break;
     case 'vintage':
       parts.push('sepia(0.45) contrast(0.92) brightness(1.04)');
       break;
@@ -177,6 +205,36 @@ export function buildFilterString(
       break;
   }
   return parts.length > 0 ? parts.join(' ') : 'none';
+}
+
+function getSourceDims(
+  source: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement
+): {w: number; h: number} {
+  if (source instanceof HTMLVideoElement) {
+    return {w: source.videoWidth, h: source.videoHeight};
+  }
+  if (source instanceof HTMLImageElement) {
+    return {w: source.naturalWidth, h: source.naturalHeight};
+  }
+  return {w: source.width, h: source.height};
+}
+
+function getNormalizedCrop(clip: Clip): {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  isCropped: boolean;
+} {
+  const c = clip.crop;
+  if (!c) return {x: 0, y: 0, width: 1, height: 1, isCropped: false};
+  const x = Math.max(0, Math.min(0.95, c.x));
+  const y = Math.max(0, Math.min(0.95, c.y));
+  const width = Math.max(0.05, Math.min(1 - x, c.width));
+  const height = Math.max(0.05, Math.min(1 - y, c.height));
+  const isCropped =
+    x > 0.002 || y > 0.002 || width < 0.998 || height < 0.998;
+  return {x, y, width, height, isCropped};
 }
 
 function drawLockBadge(
@@ -295,8 +353,14 @@ function drawCoverMedia(
         : ch;
   if (!mw || !mh) return;
 
+  const crop = getNormalizedCrop(clip);
+  const effW = Math.max(1, mw * crop.width);
+  const effH = Math.max(1, mh * crop.height);
+
   const kf = evaluateClipTransform(clip, time);
-  const baseScale = Math.max(cw / mw, ch / mh);
+  const baseScale = crop.isCropped
+    ? Math.min(cw / effW, ch / effH)
+    : Math.max(cw / effW, ch / effH);
   let zoom = kf.scale;
   let offsetX = 0;
   const offsetY = 0;
@@ -346,45 +410,89 @@ function drawCoverMedia(
     }
   }
 
-  const drawW = mw * baseScale * zoom;
-  const drawH = mh * baseScale * zoom;
+  const sxFactor = clip.scaleX ?? 1;
+  const syFactor = clip.scaleY ?? 1;
+  const drawW = effW * baseScale * zoom * sxFactor;
+  const drawH = effH * baseScale * zoom * syFactor;
   const centerX = cw * kf.x + offsetX;
   const centerY = ch * kf.y + offsetY;
   const sf = cw / 720;
 
-  ctx.save();
-  ctx.globalAlpha = Math.max(0, Math.min(1, transAlpha));
-  ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
-  ctx.translate(centerX, centerY);
-  if (kf.rotation) ctx.rotate((kf.rotation * Math.PI) / 180);
+  const drawContent = (targetCtx: CanvasRenderingContext2D, alpha: number, composite: GlobalCompositeOperation) => {
+    targetCtx.save();
+    targetCtx.globalAlpha = Math.max(0, Math.min(1, alpha));
+    targetCtx.globalCompositeOperation = composite;
+    targetCtx.translate(centerX, centerY);
+    if (kf.rotation) targetCtx.rotate((kf.rotation * Math.PI) / 180);
 
-  if (clip.mediaStatus === 'DOWNLOADING' || !media) {
-    drawDownloadingStub(ctx, drawW, drawH, clip, sf);
+    if (clip.mediaStatus === 'DOWNLOADING' || !media) {
+      drawDownloadingStub(targetCtx, drawW, drawH, clip, sf);
+    } else {
+      let sourceToDraw: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement =
+        clip.chromaKeyEnabled &&
+        clip.chromaKeyColor &&
+        (clip.chromaKeyIntensity ?? 0) > 0
+          ? applyChromaKeyShader(
+              media,
+              mw,
+              mh,
+              clip.chromaKeyColor,
+              clip.chromaKeyIntensity ?? 0,
+              clip.chromaKeySmoothness ?? 0.1
+            )
+          : media;
+
+      const dimsAfterChroma = getSourceDims(sourceToDraw);
+      sourceToDraw = applyColorGradeShader(
+        sourceToDraw,
+        dimsAfterChroma.w || mw,
+        dimsAfterChroma.h || mh,
+        getClipEffectiveAdjustments(clip),
+        time
+      );
+
+      const srcDims = getSourceDims(sourceToDraw);
+      const sx = crop.x * srcDims.w;
+      const sy = crop.y * srcDims.h;
+      const sw = crop.width * srcDims.w;
+      const sh = crop.height * srcDims.h;
+
+      targetCtx.filter =
+        clip.blur && clip.blur > 0 ? `blur(${clip.blur}px)` : 'none';
+      if (clip.flipHorizontal || clip.flipVertical) {
+        targetCtx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+      }
+      targetCtx.drawImage(
+        sourceToDraw,
+        sx,
+        sy,
+        sw,
+        sh,
+        -drawW / 2,
+        -drawH / 2,
+        drawW,
+        drawH
+      );
+    }
+    targetCtx.restore();
+  };
+
+  if (clip.mask) {
+    const scratch = getClipScratchCtx(cw, ch);
+    if (scratch) {
+      drawContent(scratch.ctx, 1, 'source-over');
+      applyMaskToCanvas(scratch.canvas, cw, ch, clip.mask);
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, Math.min(1, transAlpha));
+      ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
+      ctx.drawImage(scratch.canvas, 0, 0);
+      ctx.restore();
+    } else {
+      drawContent(ctx, transAlpha, clip.blendMode ?? 'source-over');
+    }
   } else {
-    const sourceToDraw =
-      clip.chromaKeyEnabled &&
-      clip.chromaKeyColor &&
-      (clip.chromaKeyIntensity ?? 0) > 0
-        ? applyChromaKeyShader(
-            media,
-            mw,
-            mh,
-            clip.chromaKeyColor,
-            clip.chromaKeyIntensity ?? 0,
-            clip.chromaKeySmoothness ?? 0.1
-          )
-        : media;
-    ctx.filter = buildFilterString(
-      clip.filter,
-      clip.brightness,
-      clip.contrast,
-      clip.saturate,
-      clip.blur
-    );
-    if (clip.flipHorizontal) ctx.scale(-1, 1);
-    ctx.drawImage(sourceToDraw, -drawW / 2, -drawH / 2, drawW, drawH);
+    drawContent(ctx, transAlpha, clip.blendMode ?? 'source-over');
   }
-  ctx.restore();
 
   if (clip.vignette && clip.vignette > 0 && media) {
     ctx.save();
@@ -464,11 +572,17 @@ function drawOverlayClip(
         ? media.naturalHeight
         : 0;
 
+  const crop = getNormalizedCrop(clip);
+  const effW = mw * crop.width;
+  const effH = mh * crop.height;
+
   const kf = evaluateClipTransform(clip, time);
   const scale = kf.scale;
-  const aspect = mw && mh ? mw / mh : 9 / 16;
-  const pipW = cw * scale;
-  const pipH = pipW / aspect;
+  const aspect = effW && effH ? effW / effH : 9 / 16;
+  const sxFactor = clip.scaleX ?? 1;
+  const syFactor = clip.scaleY ?? 1;
+  const pipW = cw * scale * sxFactor;
+  const pipH = (cw * scale / aspect) * syFactor;
   const cx = cw * kf.x;
   const cy = ch * kf.y;
   const sf = cw / 720;
@@ -495,64 +609,109 @@ function drawOverlayClip(
   const radius = (clip.borderRadius ?? 20) * sf;
   const rotRad = (kf.rotation * Math.PI) / 180;
 
-  ctx.save();
-  ctx.translate(cx, cy);
-  if (rotRad !== 0) ctx.rotate(rotRad);
-  if (animScale !== 1) ctx.scale(animScale, animScale);
-  ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-  ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
+  const drawOverlayContent = (
+    targetCtx: CanvasRenderingContext2D,
+    layerAlpha: number,
+    composite: GlobalCompositeOperation
+  ) => {
+    targetCtx.save();
+    targetCtx.translate(cx, cy);
+    if (rotRad !== 0) targetCtx.rotate(rotRad);
+    if (animScale !== 1) targetCtx.scale(animScale, animScale);
+    targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
+    targetCtx.globalCompositeOperation = composite;
 
-  ctx.beginPath();
-  ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
-  ctx.clip();
+    targetCtx.beginPath();
+    targetCtx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
+    targetCtx.clip();
 
-  if (clip.mediaStatus === 'DOWNLOADING' || !media) {
-    drawDownloadingStub(ctx, pipW, pipH, clip, sf);
-  } else if (
-    (media instanceof HTMLImageElement || media.readyState >= 2) &&
-    mw &&
-    mh
-  ) {
-    const sourceToDraw =
-      clip.chromaKeyEnabled &&
-      clip.chromaKeyColor &&
-      (clip.chromaKeyIntensity ?? 0) > 0
-        ? applyChromaKeyShader(
-            media,
-            mw,
-            mh,
-            clip.chromaKeyColor,
-            clip.chromaKeyIntensity ?? 0,
-            clip.chromaKeySmoothness ?? 0.1
-          )
-        : media;
+    if (clip.mediaStatus === 'DOWNLOADING' || !media) {
+      drawDownloadingStub(targetCtx, pipW, pipH, clip, sf);
+    } else if (
+      (media instanceof HTMLImageElement || media.readyState >= 2) &&
+      mw &&
+      mh
+    ) {
+      let sourceToDraw: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement =
+        clip.chromaKeyEnabled &&
+        clip.chromaKeyColor &&
+        (clip.chromaKeyIntensity ?? 0) > 0
+          ? applyChromaKeyShader(
+              media,
+              mw,
+              mh,
+              clip.chromaKeyColor,
+              clip.chromaKeyIntensity ?? 0,
+              clip.chromaKeySmoothness ?? 0.1
+            )
+          : media;
 
-    ctx.save();
-    if (clip.flipHorizontal) ctx.scale(-1, 1);
-    ctx.filter = buildFilterString(
-      clip.filter,
-      clip.brightness,
-      clip.contrast,
-      clip.saturate,
-      clip.blur
-    );
-    ctx.drawImage(sourceToDraw, -pipW / 2, -pipH / 2, pipW, pipH);
-    ctx.restore();
-  }
-  ctx.restore();
+      const dimsAfterChroma = getSourceDims(sourceToDraw);
+      sourceToDraw = applyColorGradeShader(
+        sourceToDraw,
+        dimsAfterChroma.w || mw,
+        dimsAfterChroma.h || mh,
+        getClipEffectiveAdjustments(clip),
+        time
+      );
 
-  if (clip.borderWidth && clip.borderWidth > 0) {
-    ctx.save();
-    ctx.translate(cx, cy);
-    if (rotRad !== 0) ctx.rotate(rotRad);
-    if (animScale !== 1) ctx.scale(animScale, animScale);
-    ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
-    ctx.strokeStyle = clip.borderColor || '#ffffff';
-    ctx.lineWidth = clip.borderWidth * sf;
-    ctx.beginPath();
-    ctx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
-    ctx.stroke();
-    ctx.restore();
+      const srcDims = getSourceDims(sourceToDraw);
+      const sx = crop.x * srcDims.w;
+      const sy = crop.y * srcDims.h;
+      const sw = crop.width * srcDims.w;
+      const sh = crop.height * srcDims.h;
+
+      targetCtx.save();
+      if (clip.flipHorizontal || clip.flipVertical) {
+        targetCtx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+      }
+      targetCtx.filter =
+        clip.blur && clip.blur > 0 ? `blur(${clip.blur}px)` : 'none';
+      targetCtx.drawImage(
+        sourceToDraw,
+        sx,
+        sy,
+        sw,
+        sh,
+        -pipW / 2,
+        -pipH / 2,
+        pipW,
+        pipH
+      );
+      targetCtx.restore();
+    }
+    targetCtx.restore();
+
+    if (clip.borderWidth && clip.borderWidth > 0) {
+      targetCtx.save();
+      targetCtx.translate(cx, cy);
+      if (rotRad !== 0) targetCtx.rotate(rotRad);
+      if (animScale !== 1) targetCtx.scale(animScale, animScale);
+      targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
+      targetCtx.strokeStyle = clip.borderColor || '#ffffff';
+      targetCtx.lineWidth = clip.borderWidth * sf;
+      targetCtx.beginPath();
+      targetCtx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
+      targetCtx.stroke();
+      targetCtx.restore();
+    }
+  };
+
+  if (clip.mask) {
+    const scratch = getClipScratchCtx(cw, ch);
+    if (scratch) {
+      drawOverlayContent(scratch.ctx, 1, 'source-over');
+      applyMaskToCanvas(scratch.canvas, cw, ch, clip.mask);
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+      ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
+      ctx.drawImage(scratch.canvas, 0, 0);
+      ctx.restore();
+    } else {
+      drawOverlayContent(ctx, alpha, clip.blendMode ?? 'source-over');
+    }
+  } else {
+    drawOverlayContent(ctx, alpha, clip.blendMode ?? 'source-over');
   }
 
   const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
@@ -655,37 +814,75 @@ function drawTextClip(
   if (style.align === 'right') localBoxX = -boxW + padX;
   const localBoxY = -boxH / 2;
 
-  ctx.translate(anchorX, anchorY);
-  if (kf.rotation !== 0) {
-    ctx.rotate((kf.rotation * Math.PI) / 180);
-  }
+  const sxFactor = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
+  const syFactor = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
 
-  if (style.bgColor && style.bgColor !== 'transparent') {
-    ctx.fillStyle = style.bgColor;
-    ctx.beginPath();
-    ctx.roundRect(localBoxX, localBoxY, boxW, boxH, 16 * scaleFactor);
-    ctx.fill();
-  }
+  const drawTextBody = (targetCtx: CanvasRenderingContext2D, layerAlpha: number) => {
+    targetCtx.save();
+    targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
+    targetCtx.font = `${style.fontWeight === 'bold' ? '700' : '500'} ${fontSize}px ${fontFamily}`;
+    targetCtx.textAlign = style.align;
+    targetCtx.textBaseline = 'middle';
 
-  ctx.fillStyle = style.color;
-  if (style.shadow !== false) {
-    ctx.shadowColor = 'rgba(0,0,0,0.65)';
-    ctx.shadowBlur = 10 * scaleFactor;
-  }
-
-  lines.forEach((line, i) => {
-    const ly = -((lines.length - 1) * lineHeight) / 2 + i * lineHeight;
-    if (style.outline) {
-      ctx.lineWidth = Math.max(2, fontSize * 0.08);
-      ctx.strokeStyle = '#09090b';
-      ctx.strokeText(line, 0, ly);
+    targetCtx.translate(anchorX, anchorY);
+    if (kf.rotation !== 0) {
+      targetCtx.rotate((kf.rotation * Math.PI) / 180);
     }
-    ctx.fillText(line, 0, ly);
-  });
+    if (sxFactor !== 1 || syFactor !== 1) {
+      targetCtx.scale(sxFactor, syFactor);
+    }
+
+    if (style.bgColor && style.bgColor !== 'transparent') {
+      targetCtx.fillStyle = style.bgColor;
+      targetCtx.beginPath();
+      targetCtx.roundRect(localBoxX, localBoxY, boxW, boxH, 16 * scaleFactor);
+      targetCtx.fill();
+    }
+
+    targetCtx.fillStyle = style.color;
+    if (style.shadow !== false) {
+      targetCtx.shadowColor = 'rgba(0,0,0,0.65)';
+      targetCtx.shadowBlur = 10 * scaleFactor;
+    }
+
+    lines.forEach((line, i) => {
+      const ly = -((lines.length - 1) * lineHeight) / 2 + i * lineHeight;
+      if (style.outline) {
+        targetCtx.lineWidth = Math.max(2, fontSize * 0.08);
+        targetCtx.strokeStyle = '#09090b';
+        targetCtx.strokeText(line, 0, ly);
+      }
+      targetCtx.fillText(line, 0, ly);
+    });
+    targetCtx.restore();
+  };
+
+  if (clip.mask) {
+    const scratch = getClipScratchCtx(cw, ch);
+    if (scratch) {
+      drawTextBody(scratch.ctx, 1);
+      applyMaskToCanvas(scratch.canvas, cw, ch, clip.mask);
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+      ctx.drawImage(scratch.canvas, 0, 0);
+      ctx.restore();
+    } else {
+      drawTextBody(ctx, alpha);
+    }
+  } else {
+    drawTextBody(ctx, alpha);
+  }
 
   const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
   if (clip.id === selectedClipId || peerLock) {
-    ctx.shadowBlur = 0;
+    ctx.save();
+    ctx.translate(anchorX, anchorY);
+    if (kf.rotation !== 0) {
+      ctx.rotate((kf.rotation * Math.PI) / 180);
+    }
+    if (sxFactor !== 1 || syFactor !== 1) {
+      ctx.scale(sxFactor, syFactor);
+    }
     ctx.strokeStyle = peerLock ? peerLock.color : '#22d3ee';
     ctx.lineWidth = (peerLock ? 3 : 2.5) * scaleFactor;
     ctx.strokeRect(
@@ -704,6 +901,7 @@ function drawTextClip(
         scaleFactor
       );
     }
+    ctx.restore();
   }
 
   ctx.restore();
@@ -745,27 +943,43 @@ export function sampleClipColorAtNormalizedPoint(
   sctx.save();
   sctx.translate(-nx * cw, -ny * ch);
 
+  const crop = getNormalizedCrop(clip);
+  const effW = Math.max(1, mw * crop.width);
+  const effH = Math.max(1, mh * crop.height);
+  const sx = crop.x * mw;
+  const sy = crop.y * mh;
+  const sw = crop.width * mw;
+  const sh = crop.height * mh;
+
   const kf = evaluateClipTransform(clip, time);
+  const sxFactor = clip.scaleX ?? 1;
+  const syFactor = clip.scaleY ?? 1;
   if (clip.track === 'overlay') {
-    const aspect = mw / mh;
-    const pipW = cw * kf.scale;
-    const pipH = pipW / aspect;
+    const aspect = effW / effH;
+    const pipW = cw * kf.scale * sxFactor;
+    const pipH = (cw * kf.scale / aspect) * syFactor;
     const cx = cw * kf.x;
     const cy = ch * kf.y;
     sctx.translate(cx, cy);
     if (kf.rotation) sctx.rotate((kf.rotation * Math.PI) / 180);
-    if (clip.flipHorizontal) sctx.scale(-1, 1);
-    sctx.drawImage(media, -pipW / 2, -pipH / 2, pipW, pipH);
+    if (clip.flipHorizontal || clip.flipVertical) {
+      sctx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+    }
+    sctx.drawImage(media, sx, sy, sw, sh, -pipW / 2, -pipH / 2, pipW, pipH);
   } else {
-    const baseScale = Math.max(cw / mw, ch / mh);
-    const drawW = mw * baseScale * kf.scale;
-    const drawH = mh * baseScale * kf.scale;
+    const baseScale = crop.isCropped
+      ? Math.min(cw / effW, ch / effH)
+      : Math.max(cw / effW, ch / effH);
+    const drawW = effW * baseScale * kf.scale * sxFactor;
+    const drawH = effH * baseScale * kf.scale * syFactor;
     const cx = cw * kf.x;
     const cy = ch * kf.y;
     sctx.translate(cx, cy);
     if (kf.rotation) sctx.rotate((kf.rotation * Math.PI) / 180);
-    if (clip.flipHorizontal) sctx.scale(-1, 1);
-    sctx.drawImage(media, -drawW / 2, -drawH / 2, drawW, drawH);
+    if (clip.flipHorizontal || clip.flipVertical) {
+      sctx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+    }
+    sctx.drawImage(media, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
   }
   sctx.restore();
 
@@ -790,7 +1004,8 @@ export function renderCompositeFrame(
   tracks?: Track[],
   backgroundColor?: string,
   snapGuides?: {x: boolean; y: boolean},
-  currentUserId?: string
+  currentUserId?: string,
+  maskEditClipId?: string | null
 ) {
   ctx.fillStyle = backgroundColor || '#09090b';
   ctx.fillRect(0, 0, cw, ch);
@@ -901,6 +1116,14 @@ export function renderCompositeFrame(
         collaborators,
         currentUserId
       );
+    }
+  }
+
+  // Interactive Mask Guide Overlay (only while editing mask in preview)
+  if (maskEditClipId) {
+    const maskClip = activeVisualClips.find((c) => c.id === maskEditClipId);
+    if (maskClip?.mask) {
+      drawMaskInteractiveGuide(ctx, cw, ch, maskClip.mask);
     }
   }
 

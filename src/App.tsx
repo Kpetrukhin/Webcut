@@ -2,14 +2,17 @@ import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ChevronLeft,
   CopyPlus,
+  Crop,
   Download,
   Droplet,
+  FlipHorizontal2,
   Gauge,
   Home,
   Layers,
   MessageSquare,
   Minimize2,
   Move,
+  Palette,
   Pause,
   Pipette,
   Play,
@@ -17,6 +20,8 @@ import {
   RefreshCw,
   RotateCcw,
   Scissors,
+  Shapes,
+  Sliders,
   Sparkles,
   Trash2,
   Undo2,
@@ -27,8 +32,14 @@ import {
   createStarterClips,
   getProjectDuration,
 } from './shared/types.ts';
-import type {AspectRatio, Clip} from './shared/types.ts';
+import type {
+  AspectRatio,
+  Clip,
+  ClipMask,
+  ColorFilterPreset,
+} from './shared/types.ts';
 import {StudioAudioEngine} from './lib/audioEngine.ts';
+import {getCustomColorPresets} from './lib/colorPresets.ts';
 import {
   evaluateClipTransform,
   upsertKeyframeAtTime,
@@ -47,11 +58,17 @@ import {
   hasExplicitRoomInUrl,
   useCollaborativeRoom,
 } from './hooks/useCollaborativeRoom.ts';
+import {ChromaKeyPanel} from './components/ChromaKeyPanel.tsx';
+import {ColorAdjustPanel} from './components/ColorAdjustPanel.tsx';
+import {CropEditorModal} from './components/CropEditorModal.tsx';
+import {FilterStripPanel} from './components/FilterStripPanel.tsx';
 import {HomeScreen} from './components/HomeScreen.tsx';
+import {MaskPanel} from './components/MaskPanel.tsx';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
 import type {CanvasTransformPatch} from './components/PreviewCanvas.tsx';
 import {ScrubNumberField} from './components/ScrubNumberField.tsx';
 import {Timeline} from './components/Timeline.tsx';
+import {TransformPanel} from './components/TransformPanel.tsx';
 import {TransformTrackpad} from './components/TransformTrackpad.tsx';
 import {RoomsLobbyModal} from './components/RoomsLobbyModal.tsx';
 import {
@@ -144,6 +161,22 @@ export default function App() {
   const [showChromaKeyPanel, setShowChromaKeyPanel] = useState(false);
   const [showTrackpad, setShowTrackpad] = useState(false);
   const [showCompressModal, setShowCompressModal] = useState(false);
+  const [editSubMode, setEditSubMode] = useState<
+    | 'menu'
+    | 'transform'
+    | 'opacity'
+    | 'mask'
+    | 'chromakey'
+    | 'adjust'
+    | 'filters'
+  >('menu');
+  const [mobileEditTool, setMobileEditTool] = useState<
+    'transform' | 'mask' | 'adjust' | 'filters' | null
+  >(null);
+  const [showCropModal, setShowCropModal] = useState(false);
+  const [customColorPresets, setCustomColorPresets] = useState<
+    ColorFilterPreset[]
+  >(getCustomColorPresets);
   const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
   const [snapEnabled, setSnapEnabled] = useState(true);
   const [showSelectionOutline, setShowSelectionOutline] = useState(true);
@@ -193,6 +226,8 @@ export default function App() {
       setShowOpacitySlider(false);
       setShowTrackpad(false);
       setTrackpadSnapGuides({x: false, y: false});
+      setMobileEditTool(null);
+      setEditSubMode('menu');
     }
     if (
       !selectedClip ||
@@ -200,6 +235,13 @@ export default function App() {
     ) {
       setShowChromaKeyPanel(false);
       setShowCompressModal(false);
+      setShowCropModal(false);
+      setMobileEditTool((cur) =>
+        cur === 'transform' ? cur : null
+      );
+      setEditSubMode((cur) =>
+        cur === 'transform' || cur === 'opacity' ? cur : 'menu'
+      );
     }
   }, [selectedClip]);
 
@@ -741,6 +783,19 @@ export default function App() {
     [updateClip]
   );
 
+  const handleTransformMaskOnCanvas = useCallback(
+    (clipId: string, patch: Partial<ClipMask>, commit: boolean) => {
+      const target = project.clips.find((c) => c.id === clipId);
+      if (!target?.mask) return;
+      updateClip(
+        clipId,
+        {mask: {...target.mask, ...patch}},
+        {skipUndo: !commit, skipSync: !commit}
+      );
+    },
+    [project.clips, updateClip]
+  );
+
   const lastTimelineSyncRef = useRef(0);
   const handleClipTransform = useCallback(
     (clipId: string, patch: Partial<Clip>, commit: boolean) => {
@@ -926,6 +981,20 @@ export default function App() {
   const selectedOpacityValue = selectedClip
     ? evaluateClipTransform(selectedClip, currentTime).opacity
     : 1;
+
+  const isMaskEditActive = Boolean(
+    selectedClip &&
+      (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+      ((desktopTab === 'edit' && editSubMode === 'mask') ||
+        mobileEditTool === 'mask')
+  );
+
+  const isChromaKeyPickerActive = Boolean(
+    selectedClip &&
+      (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+      (showChromaKeyPanel ||
+        (desktopTab === 'edit' && editSubMode === 'chromakey'))
+  );
 
   if (screen === 'home') {
     return (
@@ -1257,6 +1326,296 @@ export default function App() {
                         Удалить
                       </button>
                     </div>
+
+                    {selectedClip.track !== 'audio' && (
+                      <>
+                        {editSubMode === 'menu' ? (
+                          <div className="space-y-3 border-t border-white/10 pt-3">
+                            {/* Section 1: Geometry, Trackpad, Opacity */}
+                            <div className="space-y-2">
+                              <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                                Трансформация и трекпад
+                              </p>
+                              <div className="grid grid-cols-3 gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('transform')}
+                                  className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-1.5 text-[11px] font-medium transition ${
+                                    selectedClip.flipHorizontal ||
+                                    selectedClip.flipVertical ||
+                                    Math.abs((selectedClip.scaleX ?? 1) - 1) >
+                                      0.01 ||
+                                    Math.abs((selectedClip.scaleY ?? 1) - 1) >
+                                      0.01
+                                      ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
+                                  }`}
+                                >
+                                  <FlipHorizontal2 className="h-4 w-4 text-cyan-400" />
+                                  <span className="truncate max-w-full">
+                                    Трансформ.
+                                  </span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setShowTrackpad((v) => !v)}
+                                  className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-1.5 text-[11px] font-medium transition ${
+                                    showTrackpad
+                                      ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
+                                  }`}
+                                >
+                                  <Move className="h-4 w-4 text-cyan-400" />
+                                  <span>Трекпад</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditSubMode('opacity')}
+                                  className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-1.5 text-[11px] font-medium transition ${
+                                    selectedOpacityValue < 0.99
+                                      ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
+                                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
+                                  }`}
+                                >
+                                  <Droplet className="h-4 w-4 text-cyan-400" />
+                                  <span>
+                                    {Math.round(selectedOpacityValue * 100)}%
+                                  </span>
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Section 2: Mask & Chroma Key (for image/video) */}
+                            {(selectedClip.kind === 'image' ||
+                              selectedClip.kind === 'video') && (
+                              <>
+                                <div className="space-y-2 border-t border-white/10 pt-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                                    Маска и вырезка фона
+                                  </p>
+                                  <div className="grid grid-cols-2 gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setShowChromaKeyPanel(false);
+                                        setEditSubMode('mask');
+                                      }}
+                                      className={`flex h-14 items-center justify-center gap-2 rounded-xl border px-2.5 text-xs font-medium transition ${
+                                        selectedClip.mask
+                                          ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
+                                          : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
+                                      }`}
+                                    >
+                                      <Shapes className="h-4 w-4 text-cyan-400" />
+                                      <span>Маска</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setShowChromaKeyPanel(true);
+                                        setEditSubMode('chromakey');
+                                      }}
+                                      className={`flex h-14 items-center justify-center gap-2 rounded-xl border px-2.5 text-xs font-medium transition ${
+                                        selectedClip.chromaKeyEnabled
+                                          ? 'border-emerald-400/60 bg-emerald-500/15 text-emerald-200'
+                                          : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-emerald-400'
+                                      }`}
+                                    >
+                                      <Pipette className="h-4 w-4 text-emerald-400" />
+                                      <span>Удалить фон</span>
+                                    </button>
+                                  </div>
+                                </div>
+
+                                <div className="space-y-2 border-t border-white/10 pt-3">
+                                  <p className="text-[11px] font-semibold uppercase tracking-wider text-zinc-400">
+                                    Цвет и кадрирование
+                                  </p>
+                                  <div className="grid grid-cols-3 gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditSubMode('adjust')}
+                                      className="flex h-16 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
+                                    >
+                                      <Sliders className="h-4 w-4 text-cyan-400" />
+                                      <span>Настроить</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setEditSubMode('filters')}
+                                      className="flex h-16 flex-col items-center justify-center gap-1 rounded-xl border border-white/10 bg-zinc-900 px-2 text-[11px] font-medium text-zinc-200 hover:border-cyan-400"
+                                    >
+                                      <Palette className="h-4 w-4 text-cyan-400" />
+                                      <span>Фильтры</span>
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => setShowCropModal(true)}
+                                      className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-2 text-[11px] font-medium transition ${
+                                        selectedClip.crop
+                                          ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
+                                          : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
+                                      }`}
+                                    >
+                                      <Crop className="h-4 w-4 text-cyan-400" />
+                                      <span>Кадрировать</span>
+                                    </button>
+                                  </div>
+                                </div>
+                              </>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="space-y-3 border-t border-white/10 pt-3">
+                            <div className="flex items-center justify-between">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (editSubMode === 'chromakey') {
+                                    setShowChromaKeyPanel(false);
+                                  }
+                                  setEditSubMode('menu');
+                                }}
+                                className="flex items-center gap-1 rounded-lg border border-white/10 bg-zinc-900 px-2.5 py-1.5 text-xs font-medium text-zinc-200 hover:border-cyan-400"
+                              >
+                                <ChevronLeft className="h-3.5 w-3.5" />
+                                Назад
+                              </button>
+                              <span className="text-xs font-semibold text-white">
+                                {editSubMode === 'transform'
+                                  ? 'Трансформация'
+                                  : editSubMode === 'opacity'
+                                    ? 'Прозрачность'
+                                    : editSubMode === 'mask'
+                                      ? 'Маска'
+                                      : editSubMode === 'chromakey'
+                                        ? 'Удалить фон (Хромакей)'
+                                        : editSubMode === 'adjust'
+                                          ? 'Цветокоррекция'
+                                          : 'Фильтры'}
+                              </span>
+                            </div>
+
+                            {editSubMode === 'transform' && (
+                              <TransformPanel
+                                clip={selectedClip}
+                                onUpdateClip={updateClip}
+                                onOpenTrackpad={() =>
+                                  setShowTrackpad((v) => !v)
+                                }
+                                trackpadActive={showTrackpad}
+                              />
+                            )}
+
+                            {editSubMode === 'opacity' && (
+                              <div className="space-y-3 rounded-xl border border-white/10 bg-zinc-900/60 p-3">
+                                <div className="flex items-center justify-between text-xs text-zinc-300">
+                                  <span>Прозрачность слоя</span>
+                                  <ScrubNumberField
+                                    compact
+                                    accent="cyan"
+                                    value={Math.round(
+                                      selectedOpacityValue * 100
+                                    )}
+                                    min={0}
+                                    max={100}
+                                    step={1}
+                                    suffix="%"
+                                    ariaLabel="Прозрачность"
+                                    onChange={(pct) =>
+                                      handleChangeSelectedOpacity(
+                                        pct / 100,
+                                        false
+                                      )
+                                    }
+                                    onCommit={(pct) =>
+                                      handleChangeSelectedOpacity(
+                                        pct / 100,
+                                        true
+                                      )
+                                    }
+                                  />
+                                </div>
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={1}
+                                  step={0.01}
+                                  value={selectedOpacityValue}
+                                  onChange={(e) =>
+                                    handleChangeSelectedOpacity(
+                                      Number(e.target.value),
+                                      false
+                                    )
+                                  }
+                                  onPointerUp={(e) =>
+                                    handleChangeSelectedOpacity(
+                                      Number(
+                                        (e.target as HTMLInputElement).value
+                                      ),
+                                      true
+                                    )
+                                  }
+                                  className="h-2 w-full cursor-pointer accent-cyan-400"
+                                />
+                                <div className="grid grid-cols-4 gap-1.5">
+                                  {[25, 50, 75, 100].map((pct) => (
+                                    <button
+                                      key={pct}
+                                      type="button"
+                                      onClick={() =>
+                                        handleChangeSelectedOpacity(
+                                          pct / 100,
+                                          true
+                                        )
+                                      }
+                                      className="h-8 rounded-lg border border-white/10 bg-zinc-900 text-[11px] font-medium text-zinc-300 hover:border-cyan-400"
+                                    >
+                                      {pct}%
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+
+                            {editSubMode === 'mask' && (
+                              <MaskPanel
+                                clip={selectedClip}
+                                currentTime={currentTime}
+                                onUpdateClip={updateClip}
+                              />
+                            )}
+
+                            {editSubMode === 'chromakey' && (
+                              <ChromaKeyPanel
+                                clip={selectedClip}
+                                onUpdateChromaKey={handleUpdateChromaKey}
+                              />
+                            )}
+
+                            {editSubMode === 'adjust' && (
+                              <ColorAdjustPanel
+                                clip={selectedClip}
+                                onUpdateClip={updateClip}
+                                onPresetsChanged={setCustomColorPresets}
+                              />
+                            )}
+
+                            {editSubMode === 'filters' && (
+                              <FilterStripPanel
+                                clip={selectedClip}
+                                customPresets={customColorPresets}
+                                onUpdateClip={(id, patch) =>
+                                  updateClip(id, patch)
+                                }
+                                onOpenAdjust={() => setEditSubMode('adjust')}
+                                onPresetsChanged={setCustomColorPresets}
+                              />
+                            )}
+                          </div>
+                        )}
+                      </>
+                    )}
                   </>
                 ) : (
                   <div className="space-y-3 rounded-xl border border-white/10 bg-zinc-900/60 p-4 text-center text-xs text-zinc-400">
@@ -1367,8 +1726,10 @@ export default function App() {
                 setShowSelectionOutline((v) => !v)
               }
               externalSnapGuides={trackpadSnapGuides}
-              chromaKeyPickerActive={showChromaKeyPanel}
+              chromaKeyPickerActive={isChromaKeyPickerActive}
               onPickChromaKeyColor={handlePickChromaKeyColor}
+              maskEditActive={isMaskEditActive}
+              onTransformMask={handleTransformMaskOnCanvas}
               onLockLayer={sendLayerLock}
               onSelectClip={setSelectedClipId}
               onTransformClip={handleTransformClipOnCanvas}
@@ -1582,7 +1943,10 @@ export default function App() {
                       <>
                         <button
                           type="button"
-                          onClick={() => setShowChromaKeyPanel((v) => !v)}
+                          onClick={() => {
+                            if (editSubMode === 'mask') setEditSubMode('menu');
+                            setShowChromaKeyPanel((v) => !v);
+                          }}
                           className={`flex h-9 flex-1 items-center justify-center gap-1.5 rounded-lg border text-xs font-medium transition ${
                             showChromaKeyPanel
                               ? 'border-emerald-400 bg-emerald-500/20 text-emerald-200'
@@ -1629,192 +1993,10 @@ export default function App() {
                   {showChromaKeyPanel &&
                     (selectedClip.kind === 'image' ||
                       selectedClip.kind === 'video') && (
-                      <div className="space-y-2.5 rounded-xl border border-emerald-500/30 bg-[#14171a] p-3">
-                        <div className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            <span
-                              className="h-5 w-5 rounded-full border border-white/80 shadow-xs"
-                              style={{
-                                backgroundColor:
-                                  selectedClip.chromaKeyColor || '#00ff00',
-                              }}
-                            />
-                            <span className="font-mono text-[11px] text-zinc-200">
-                              {(
-                                selectedClip.chromaKeyColor || '#00ff00'
-                              ).toUpperCase()}
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleUpdateChromaKey(
-                                selectedClip.id,
-                                {
-                                  chromaKeyEnabled:
-                                    !selectedClip.chromaKeyEnabled,
-                                  chromaKeyColor:
-                                    selectedClip.chromaKeyColor || '#00ff00',
-                                  chromaKeyIntensity:
-                                    selectedClip.chromaKeyIntensity ?? 0.35,
-                                  chromaKeySmoothness:
-                                    selectedClip.chromaKeySmoothness ?? 0.15,
-                                },
-                                true
-                              )
-                            }
-                            className={`rounded-md px-2 py-0.5 text-[10px] font-semibold ${
-                              selectedClip.chromaKeyEnabled
-                                ? 'bg-emerald-500/20 text-emerald-300'
-                                : 'bg-white/10 text-zinc-400'
-                            }`}
-                          >
-                            {selectedClip.chromaKeyEnabled ? 'ВКЛ' : 'ВЫКЛ'}
-                          </button>
-                        </div>
-
-                        <div className="space-y-1 text-xs text-zinc-300">
-                          <div className="flex items-center justify-between text-[11px]">
-                            <span>Интенсивность</span>
-                            <ScrubNumberField
-                              compact
-                              accent="emerald"
-                              value={selectedClip.chromaKeyIntensity ?? 0.35}
-                              min={0}
-                              max={1}
-                              step={0.01}
-                              decimals={2}
-                              ariaLabel="Интенсивность хромакея"
-                              onChange={(val) =>
-                                handleUpdateChromaKey(
-                                  selectedClip.id,
-                                  {
-                                    chromaKeyEnabled: true,
-                                    chromaKeyColor:
-                                      selectedClip.chromaKeyColor || '#00ff00',
-                                    chromaKeyIntensity: val,
-                                  },
-                                  false
-                                )
-                              }
-                              onCommit={(val) =>
-                                handleUpdateChromaKey(
-                                  selectedClip.id,
-                                  {
-                                    chromaKeyEnabled: true,
-                                    chromaKeyColor:
-                                      selectedClip.chromaKeyColor || '#00ff00',
-                                    chromaKeyIntensity: val,
-                                  },
-                                  true
-                                )
-                              }
-                            />
-                          </div>
-                          <input
-                            type="range"
-                            min={0}
-                            max={1}
-                            step={0.01}
-                            value={selectedClip.chromaKeyIntensity ?? 0.35}
-                            onChange={(e) =>
-                              handleUpdateChromaKey(
-                                selectedClip.id,
-                                {
-                                  chromaKeyEnabled: true,
-                                  chromaKeyColor:
-                                    selectedClip.chromaKeyColor || '#00ff00',
-                                  chromaKeyIntensity: Number(e.target.value),
-                                },
-                                false
-                              )
-                            }
-                            onPointerUp={(e) =>
-                              handleUpdateChromaKey(
-                                selectedClip.id,
-                                {
-                                  chromaKeyIntensity: Number(
-                                    (e.target as HTMLInputElement).value
-                                  ),
-                                },
-                                true
-                              )
-                            }
-                            className="w-full accent-emerald-400"
-                          />
-                        </div>
-
-                        <div className="space-y-1 text-xs text-zinc-300">
-                          <div className="flex items-center justify-between text-[11px]">
-                            <span>Сглаживание</span>
-                            <ScrubNumberField
-                              compact
-                              accent="emerald"
-                              value={selectedClip.chromaKeySmoothness ?? 0.15}
-                              min={0}
-                              max={1}
-                              step={0.01}
-                              decimals={2}
-                              ariaLabel="Сглаживание хромакея"
-                              onChange={(val) =>
-                                handleUpdateChromaKey(
-                                  selectedClip.id,
-                                  {
-                                    chromaKeyEnabled: true,
-                                    chromaKeyColor:
-                                      selectedClip.chromaKeyColor || '#00ff00',
-                                    chromaKeySmoothness: val,
-                                  },
-                                  false
-                                )
-                              }
-                              onCommit={(val) =>
-                                handleUpdateChromaKey(
-                                  selectedClip.id,
-                                  {
-                                    chromaKeyEnabled: true,
-                                    chromaKeyColor:
-                                      selectedClip.chromaKeyColor || '#00ff00',
-                                    chromaKeySmoothness: val,
-                                  },
-                                  true
-                                )
-                              }
-                            />
-                          </div>
-                          <input
-                            type="range"
-                            min={0}
-                            max={1}
-                            step={0.01}
-                            value={selectedClip.chromaKeySmoothness ?? 0.15}
-                            onChange={(e) =>
-                              handleUpdateChromaKey(
-                                selectedClip.id,
-                                {
-                                  chromaKeyEnabled: true,
-                                  chromaKeyColor:
-                                    selectedClip.chromaKeyColor || '#00ff00',
-                                  chromaKeySmoothness: Number(e.target.value),
-                                },
-                                false
-                              )
-                            }
-                            onPointerUp={(e) =>
-                              handleUpdateChromaKey(
-                                selectedClip.id,
-                                {
-                                  chromaKeySmoothness: Number(
-                                    (e.target as HTMLInputElement).value
-                                  ),
-                                },
-                                true
-                              )
-                            }
-                            className="w-full accent-emerald-400"
-                          />
-                        </div>
-                      </div>
+                      <ChromaKeyPanel
+                        clip={selectedClip}
+                        onUpdateChromaKey={handleUpdateChromaKey}
+                      />
                     )}
                 </div>
               )}
@@ -1904,8 +2086,8 @@ export default function App() {
         </aside>
       </div>
 
-      {/* Multi-Track Dynamic Timeline OR Alight Motion Trackpad */}
-      <div className="h-[220px] shrink-0 sm:h-[245px] lg:h-[260px]">
+      {/* Multi-Track Dynamic Timeline OR Alight Motion Trackpad / Mobile Tool Overlays */}
+      <div className="relative h-[220px] shrink-0 sm:h-[245px] lg:h-[260px]">
         {showTrackpad && selectedClip && selectedClip.track !== 'audio' ? (
           <TransformTrackpad
             clip={selectedClip}
@@ -1921,26 +2103,84 @@ export default function App() {
             }}
           />
         ) : (
-          <Timeline
-            tracks={project.tracks}
-            clips={project.clips}
-            duration={duration}
-            currentTime={currentTime}
-            pxPerSec={pxPerSec}
-            selectedClipId={selectedClipId}
-            currentUserId={user.id}
-            collaborators={collaborators}
-            onSeek={handleSeek}
-            onSelectClip={setSelectedClipId}
-            onZoomChange={setPxPerSec}
-            onAddTrack={addTrack}
-            onUpdateTrack={updateTrack}
-            onDeleteTrack={deleteTrack}
-            onReorderTracks={reorderTracks}
-            onLockLayer={sendLayerLock}
-            onClipTransform={handleClipTransform}
-          />
+          <div className="relative z-0 h-full isolate">
+            <Timeline
+              tracks={project.tracks}
+              clips={project.clips}
+              duration={duration}
+              currentTime={currentTime}
+              pxPerSec={pxPerSec}
+              selectedClipId={selectedClipId}
+              currentUserId={user.id}
+              collaborators={collaborators}
+              onSeek={handleSeek}
+              onSelectClip={setSelectedClipId}
+              onZoomChange={setPxPerSec}
+              onAddTrack={addTrack}
+              onUpdateTrack={updateTrack}
+              onDeleteTrack={deleteTrack}
+              onReorderTracks={reorderTracks}
+              onLockLayer={sendLayerLock}
+              onClipTransform={handleClipTransform}
+            />
+          </div>
         )}
+
+        {selectedClip &&
+          selectedClip.track !== 'audio' &&
+          mobileEditTool === 'transform' && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <span className="truncate text-xs font-semibold text-white">
+                  Трансформация · {selectedClip.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/15 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <TransformPanel
+                  clip={selectedClip}
+                  onUpdateClip={updateClip}
+                  onOpenTrackpad={() => {
+                    setMobileEditTool(null);
+                    setShowTrackpad(true);
+                  }}
+                  trackpadActive={showTrackpad}
+                />
+              </div>
+            </div>
+          )}
+
+        {selectedClip &&
+          (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+          mobileEditTool === 'mask' && (
+            <div className="absolute inset-0 z-30 flex flex-col border-t border-white/10 bg-[#0d0d11] lg:hidden">
+              <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-[#121217] px-3">
+                <span className="truncate text-xs font-semibold text-white">
+                  Маска · {selectedClip.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2.5 py-1 text-[11px] font-medium text-zinc-200 hover:bg-white/15 active:scale-95"
+                >
+                  Готово
+                </button>
+              </div>
+              <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
+                <MaskPanel
+                  clip={selectedClip}
+                  currentTime={currentTime}
+                  onUpdateClip={updateClip}
+                />
+              </div>
+            </div>
+          )}
       </div>
 
       {/* Mobile Bottom Thumb Toolbar */}
@@ -1997,224 +2237,70 @@ export default function App() {
         {selectedClip &&
           (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
           showChromaKeyPanel && (
-            <div className="space-y-2 border-b border-white/10 bg-[#14171a] px-3 py-2.5">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <span
-                    className="h-6 w-6 shrink-0 rounded-full border-2 border-white/85 shadow-sm"
-                    style={{
-                      backgroundColor: selectedClip.chromaKeyColor || '#00ff00',
-                    }}
-                  />
-                  <div className="leading-tight">
-                    <p className="text-[11px] font-semibold text-emerald-300">
-                      Хромакей · пипетка на кадре
-                    </p>
-                    <p className="font-mono text-[10px] text-zinc-400">
-                      {(selectedClip.chromaKeyColor || '#00ff00').toUpperCase()}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleUpdateChromaKey(
-                        selectedClip.id,
-                        {chromaKeyEnabled: !selectedClip.chromaKeyEnabled},
-                        true
-                      )
-                    }
-                    className={`rounded-md px-2 py-1 text-[10px] font-semibold ${
-                      selectedClip.chromaKeyEnabled
-                        ? 'bg-emerald-500/20 text-emerald-300'
-                        : 'bg-white/10 text-zinc-400'
-                    }`}
-                  >
-                    {selectedClip.chromaKeyEnabled ? 'ВКЛ' : 'ВЫКЛ'}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setShowChromaKeyPanel(false)}
-                    className="rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-zinc-200"
-                  >
-                    Готово
-                  </button>
-                </div>
+            <div className="border-b border-white/10 bg-[#14171a] px-3 py-2">
+              <ChromaKeyPanel
+                clip={selectedClip}
+                onUpdateChromaKey={handleUpdateChromaKey}
+                onDone={() => setShowChromaKeyPanel(false)}
+              />
+            </div>
+          )}
+        {selectedClip &&
+          (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+          mobileEditTool === 'filters' && (
+            <div className="border-b border-white/10 bg-[#141418] px-3 py-2.5">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-xs font-semibold text-white">
+                  Фильтры
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-zinc-200"
+                >
+                  Готово
+                </button>
               </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[10px] text-zinc-300">
-                    <span>Интенсивность</span>
-                    <ScrubNumberField
-                      compact
-                      accent="emerald"
-                      value={selectedClip.chromaKeyIntensity ?? 0.35}
-                      min={0}
-                      max={1}
-                      step={0.01}
-                      decimals={2}
-                      ariaLabel="Интенсивность хромакея"
-                      onChange={(val) =>
-                        handleUpdateChromaKey(
-                          selectedClip.id,
-                          {
-                            chromaKeyEnabled: true,
-                            chromaKeyColor:
-                              selectedClip.chromaKeyColor || '#00ff00',
-                            chromaKeyIntensity: val,
-                          },
-                          false
-                        )
-                      }
-                      onCommit={(val) =>
-                        handleUpdateChromaKey(
-                          selectedClip.id,
-                          {
-                            chromaKeyEnabled: true,
-                            chromaKeyColor:
-                              selectedClip.chromaKeyColor || '#00ff00',
-                            chromaKeyIntensity: val,
-                          },
-                          true
-                        )
-                      }
-                    />
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    value={selectedClip.chromaKeyIntensity ?? 0.35}
-                    onChange={(e) =>
-                      handleUpdateChromaKey(
-                        selectedClip.id,
-                        {
-                          chromaKeyEnabled: true,
-                          chromaKeyColor:
-                            selectedClip.chromaKeyColor || '#00ff00',
-                          chromaKeyIntensity: Number(e.target.value),
-                        },
-                        false
-                      )
-                    }
-                    onPointerUp={(e) =>
-                      handleUpdateChromaKey(
-                        selectedClip.id,
-                        {
-                          chromaKeyIntensity: Number(
-                            (e.target as HTMLInputElement).value
-                          ),
-                        },
-                        true
-                      )
-                    }
-                    onTouchEnd={(e) =>
-                      handleUpdateChromaKey(
-                        selectedClip.id,
-                        {
-                          chromaKeyIntensity: Number(
-                            (e.target as HTMLInputElement).value
-                          ),
-                        },
-                        true
-                      )
-                    }
-                    className="h-2 w-full cursor-pointer accent-emerald-400"
-                  />
-                </div>
-
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[10px] text-zinc-300">
-                    <span>Сглаживание</span>
-                    <ScrubNumberField
-                      compact
-                      accent="emerald"
-                      value={selectedClip.chromaKeySmoothness ?? 0.15}
-                      min={0}
-                      max={1}
-                      step={0.01}
-                      decimals={2}
-                      ariaLabel="Сглаживание хромакея"
-                      onChange={(val) =>
-                        handleUpdateChromaKey(
-                          selectedClip.id,
-                          {
-                            chromaKeyEnabled: true,
-                            chromaKeyColor:
-                              selectedClip.chromaKeyColor || '#00ff00',
-                            chromaKeySmoothness: val,
-                          },
-                          false
-                        )
-                      }
-                      onCommit={(val) =>
-                        handleUpdateChromaKey(
-                          selectedClip.id,
-                          {
-                            chromaKeyEnabled: true,
-                            chromaKeyColor:
-                              selectedClip.chromaKeyColor || '#00ff00',
-                            chromaKeySmoothness: val,
-                          },
-                          true
-                        )
-                      }
-                    />
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    value={selectedClip.chromaKeySmoothness ?? 0.15}
-                    onChange={(e) =>
-                      handleUpdateChromaKey(
-                        selectedClip.id,
-                        {
-                          chromaKeyEnabled: true,
-                          chromaKeyColor:
-                            selectedClip.chromaKeyColor || '#00ff00',
-                          chromaKeySmoothness: Number(e.target.value),
-                        },
-                        false
-                      )
-                    }
-                    onPointerUp={(e) =>
-                      handleUpdateChromaKey(
-                        selectedClip.id,
-                        {
-                          chromaKeySmoothness: Number(
-                            (e.target as HTMLInputElement).value
-                          ),
-                        },
-                        true
-                      )
-                    }
-                    onTouchEnd={(e) =>
-                      handleUpdateChromaKey(
-                        selectedClip.id,
-                        {
-                          chromaKeySmoothness: Number(
-                            (e.target as HTMLInputElement).value
-                          ),
-                        },
-                        true
-                      )
-                    }
-                    className="h-2 w-full cursor-pointer accent-emerald-400"
-                  />
-                </div>
+              <FilterStripPanel
+                clip={selectedClip}
+                customPresets={customColorPresets}
+                onUpdateClip={(id, patch) => updateClip(id, patch)}
+                onOpenAdjust={() => setMobileEditTool('adjust')}
+                onPresetsChanged={setCustomColorPresets}
+              />
+            </div>
+          )}
+        {selectedClip &&
+          (selectedClip.kind === 'image' || selectedClip.kind === 'video') &&
+          mobileEditTool === 'adjust' && (
+            <div className="studio-scrollbar max-h-[45dvh] overflow-y-auto border-b border-white/10 bg-[#141418] px-3 py-3">
+              <div className="mb-2.5 flex items-center justify-between">
+                <span className="text-xs font-semibold text-white">
+                  Настроить (Цветокоррекция)
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setMobileEditTool(null)}
+                  className="rounded-md bg-white/10 px-2 py-1 text-[10px] font-medium text-zinc-200"
+                >
+                  Готово
+                </button>
               </div>
+              <ColorAdjustPanel
+                clip={selectedClip}
+                onUpdateClip={updateClip}
+                onPresetsChanged={setCustomColorPresets}
+              />
             </div>
           )}
         {selectedClip ? (
           <div className="no-scrollbar flex h-14 items-center gap-1 overflow-x-auto px-2">
             <button
               type="button"
-              onClick={() => setSelectedClipId(null)}
+              onClick={() => {
+                setMobileEditTool(null);
+                setSelectedClipId(null);
+              }}
               className="flex h-11 min-w-[52px] shrink-0 flex-col items-center justify-center rounded-lg bg-zinc-900 px-2 text-[10px] font-medium text-zinc-300"
             >
               <ChevronLeft className="h-4 w-4" />
@@ -2297,7 +2383,37 @@ export default function App() {
             {selectedClip.track !== 'audio' && (
               <button
                 type="button"
-                onClick={() => setShowTrackpad((v) => !v)}
+                onClick={() => {
+                  setShowOpacitySlider(false);
+                  setShowChromaKeyPanel(false);
+                  setShowTrackpad(false);
+                  setTrackpadSnapGuides({x: false, y: false});
+                  setMobileEditTool((cur) =>
+                    cur === 'transform' ? null : 'transform'
+                  );
+                }}
+                className={`flex h-11 min-w-[78px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                  mobileEditTool === 'transform'
+                    ? 'bg-cyan-500/20 text-cyan-300'
+                    : selectedClip.flipHorizontal ||
+                        selectedClip.flipVertical ||
+                        Math.abs((selectedClip.scaleX ?? 1) - 1) > 0.01 ||
+                        Math.abs((selectedClip.scaleY ?? 1) - 1) > 0.01
+                      ? 'text-cyan-300 hover:bg-white/5'
+                      : 'text-zinc-200 hover:bg-white/5'
+                }`}
+              >
+                <FlipHorizontal2 className="h-4 w-4 text-cyan-400" />
+                <span>Трансформ.</span>
+              </button>
+            )}
+            {selectedClip.track !== 'audio' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileEditTool(null);
+                  setShowTrackpad((v) => !v);
+                }}
                 className={`flex h-11 min-w-[66px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
                   showTrackpad
                     ? 'bg-cyan-500/20 text-cyan-300'
@@ -2313,6 +2429,7 @@ export default function App() {
                 type="button"
                 onClick={() => {
                   setShowChromaKeyPanel(false);
+                  setMobileEditTool(null);
                   setShowOpacitySlider((v) => !v);
                 }}
                 className={`flex h-11 min-w-[78px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
@@ -2327,23 +2444,101 @@ export default function App() {
             )}
             {(selectedClip.kind === 'image' ||
               selectedClip.kind === 'video') && (
-              <button
-                type="button"
-                onClick={() => {
-                  setShowOpacitySlider(false);
-                  setShowChromaKeyPanel((v) => !v);
-                }}
-                className={`flex h-11 min-w-[68px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
-                  showChromaKeyPanel
-                    ? 'bg-emerald-500/20 text-emerald-300'
-                    : selectedClip.chromaKeyEnabled
-                      ? 'text-emerald-300 hover:bg-white/5'
+              <>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setShowChromaKeyPanel(false);
+                    setShowTrackpad(false);
+                    setTrackpadSnapGuides({x: false, y: false});
+                    setMobileEditTool((cur) =>
+                      cur === 'mask' ? null : 'mask'
+                    );
+                  }}
+                  className={`flex h-11 min-w-[58px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    mobileEditTool === 'mask'
+                      ? 'bg-cyan-500/20 text-cyan-300'
+                      : selectedClip.mask
+                        ? 'text-cyan-300 hover:bg-white/5'
+                        : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Shapes className="h-4 w-4 text-cyan-400" />
+                  <span>Маска</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setMobileEditTool(null);
+                    setShowChromaKeyPanel((v) => !v);
+                  }}
+                  className={`flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    showChromaKeyPanel
+                      ? 'bg-emerald-500/20 text-emerald-300'
+                      : selectedClip.chromaKeyEnabled
+                        ? 'text-emerald-300 hover:bg-white/5'
+                        : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Pipette className="h-4 w-4 text-emerald-400" />
+                  <span>Удалить фон</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setShowChromaKeyPanel(false);
+                    setMobileEditTool((cur) =>
+                      cur === 'adjust' ? null : 'adjust'
+                    );
+                  }}
+                  className={`flex h-11 min-w-[68px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    mobileEditTool === 'adjust'
+                      ? 'bg-cyan-500/20 text-cyan-300'
                       : 'text-zinc-200 hover:bg-white/5'
-                }`}
-              >
-                <Pipette className="h-4 w-4 text-emerald-400" />
-                <span>Хромакей</span>
-              </button>
+                  }`}
+                >
+                  <Sliders className="h-4 w-4 text-cyan-400" />
+                  <span>Настроить</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setShowChromaKeyPanel(false);
+                    setMobileEditTool((cur) =>
+                      cur === 'filters' ? null : 'filters'
+                    );
+                  }}
+                  className={`flex h-11 min-w-[64px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    mobileEditTool === 'filters'
+                      ? 'bg-cyan-500/20 text-cyan-300'
+                      : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Palette className="h-4 w-4 text-cyan-400" />
+                  <span>Фильтры</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowOpacitySlider(false);
+                    setShowChromaKeyPanel(false);
+                    setMobileEditTool(null);
+                    setShowCropModal(true);
+                  }}
+                  className={`flex h-11 min-w-[74px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
+                    selectedClip.crop
+                      ? 'text-cyan-300 hover:bg-white/5'
+                      : 'text-zinc-200 hover:bg-white/5'
+                  }`}
+                >
+                  <Crop className="h-4 w-4 text-cyan-400" />
+                  <span>Кадрировать</span>
+                </button>
+              </>
             )}
             {selectedClip.track === 'overlay' && (
               <button
@@ -2628,6 +2823,17 @@ export default function App() {
               handleApplyCompressedMedia(selectedClip, res)
             }
             onClose={() => setShowCompressModal(false)}
+          />
+        )}
+
+      {showCropModal &&
+        selectedClip &&
+        (selectedClip.kind === 'video' || selectedClip.kind === 'image') && (
+          <CropEditorModal
+            clip={selectedClip}
+            currentTime={currentTime}
+            onApplyCrop={(crop) => updateClip(selectedClip.id, {crop})}
+            onClose={() => setShowCropModal(false)}
           />
         )}
 

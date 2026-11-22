@@ -42,6 +42,10 @@ import {
 } from '../lib/lanSyncBridge.ts';
 import type {CompressedMediaResult} from '../lib/lanSyncBridge.ts';
 import {
+  applyFilterPresetToClipPatch,
+  findBuiltinPreset,
+} from '../lib/colorPresets.ts';
+import {
   SAMPLE_MEDIA_ASSETS,
   SYNTH_AUDIO_PRESETS,
 } from '../shared/types.ts';
@@ -1199,12 +1203,11 @@ interface EffectsPanelProps {
 
 const FILTER_PRESETS: Array<{id: FilterPreset; label: string}> = [
   {id: 'none', label: 'Оригинал'},
-  {id: 'cinema', label: 'Кино'},
-  {id: 'warm', label: 'Тёплый'},
-  {id: 'cool', label: 'Холод'},
-  {id: 'vivid', label: 'Яркий'},
-  {id: 'vintage', label: 'Винтаж'},
   {id: 'bw', label: 'Ч/Б'},
+  {id: 'sepia', label: 'Сепия'},
+  {id: 'cool', label: 'Холодный'},
+  {id: 'warm', label: 'Тёплый'},
+  {id: 'cinema', label: 'Кино'},
 ];
 
 const TRANSITIONS: Array<{id: TransitionType; label: string}> = [
@@ -1243,7 +1246,17 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             <button
               key={f.id}
               type="button"
-              onClick={() => onUpdateClip(selectedClip.id, {filter: f.id})}
+              onClick={() => {
+                const preset = findBuiltinPreset(f.id);
+                if (preset) {
+                  onUpdateClip(
+                    selectedClip.id,
+                    applyFilterPresetToClipPatch(preset)
+                  );
+                } else {
+                  onUpdateClip(selectedClip.id, {filter: f.id});
+                }
+              }}
               className={`min-h-[38px] rounded-lg px-3 text-xs font-medium transition whitespace-nowrap ${
                 selectedClip.filter === f.id
                   ? 'bg-cyan-500 text-zinc-950'

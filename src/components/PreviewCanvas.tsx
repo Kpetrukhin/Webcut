@@ -8,6 +8,7 @@ import {ScrubNumberField} from './ScrubNumberField.tsx';
 import type {
   AspectRatio,
   Clip,
+  ClipMask,
   Collaborator,
   ProjectFont,
   Track,
@@ -49,6 +50,12 @@ interface PreviewCanvasProps {
   onPickChromaKeyColor?: (
     clipId: string,
     hexColor: string,
+    commit: boolean
+  ) => void;
+  maskEditActive?: boolean;
+  onTransformMask?: (
+    clipId: string,
+    patch: Partial<ClipMask>,
     commit: boolean
   ) => void;
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
@@ -101,6 +108,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   externalSnapGuides,
   chromaKeyPickerActive = false,
   onPickChromaKeyColor,
+  maskEditActive = false,
+  onTransformMask,
   onLockLayer,
   onSelectClip,
   onTransformClip,
@@ -137,6 +146,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
 
   const gestureRef = useRef<{
     clipId: string;
+    target: 'clip' | 'mask';
     mode: 'pan' | 'pinch';
     startX: number;
     startY: number;
@@ -199,6 +209,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     }
   }, [snapEnabled]);
 
+  const maskEditClipId = maskEditActive ? selectedClipId : null;
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -218,7 +230,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       tracks,
       backgroundColor,
       effectiveSnapGuides,
-      currentUserId
+      currentUserId,
+      maskEditClipId
     );
   }, [
     tracks,
@@ -236,6 +249,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     effectiveSnapGuides.x,
     effectiveSnapGuides.y,
     currentUserId,
+    maskEditClipId,
   ]);
 
   useEffect(() => {
@@ -257,7 +271,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           tracks,
           backgroundColor,
           effectiveSnapGuides,
-          currentUserId
+          currentUserId,
+          maskEditClipId
         );
       }
       raf = requestAnimationFrame(loop);
@@ -278,6 +293,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     effectiveSnapGuides.x,
     effectiveSnapGuides.y,
     currentUserId,
+    maskEditClipId,
   ]);
 
   const findHitClip = (nx: number, ny: number): Clip | null => {
@@ -309,8 +325,9 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         }
       } else if (c.track === 'overlay') {
         const tr = evaluateClipTransform(c, currentTime);
-        const half = Math.max(0.12, tr.scale / 2);
-        if (Math.abs(nx - tr.x) <= half && Math.abs(ny - tr.y) <= half) {
+        const halfW = Math.max(0.12, (tr.scale * (c.scaleX ?? 1)) / 2);
+        const halfH = Math.max(0.12, (tr.scale * (c.scaleY ?? 1)) / 2);
+        if (Math.abs(nx - tr.x) <= halfW && Math.abs(ny - tr.y) <= halfH) {
           return c;
         }
       } else if (c.track === 'video') {
@@ -321,7 +338,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     return null;
   };
 
-  const beginGestureForClip = (clip: Clip) => {
+  const beginGestureForClip = (clip: Clip, target: 'clip' | 'mask' = 'clip') => {
     const pointers = Array.from(activePointersRef.current.values());
     if (pointers.length === 0) return;
 
@@ -333,7 +350,13 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       return;
     }
 
+    const mask = clip.mask;
     const tr = evaluateClipTransform(clip, currentTime);
+    const origX = target === 'mask' && mask ? mask.x : tr.x;
+    const origY = target === 'mask' && mask ? mask.y : tr.y;
+    const origScale = target === 'mask' && mask ? mask.scale : tr.scale;
+    const origRotation = target === 'mask' && mask ? mask.rotation : tr.rotation;
+
     if (pointers.length >= 2) {
       const [p1, p2] = pointers;
       const cx = (p1.x + p2.x) / 2;
@@ -342,36 +365,38 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       const angle = Math.atan2(p2.y - p1.y, p2.x - p1.x);
       gestureRef.current = {
         clipId: clip.id,
+        target,
         mode: 'pinch',
         startX: cx,
         startY: cy,
         startDist: dist,
         startAngle: angle,
-        origX: tr.x,
-        origY: tr.y,
-        origScale: tr.scale,
-        origRotation: tr.rotation,
+        origX,
+        origY,
+        origScale,
+        origRotation,
         lastCommitted: {
-          x: tr.x,
-          y: tr.y,
-          scale: tr.scale,
-          rotation: tr.rotation,
+          x: origX,
+          y: origY,
+          scale: origScale,
+          rotation: origRotation,
         },
       };
     } else {
       const [p1] = pointers;
       gestureRef.current = {
         clipId: clip.id,
+        target,
         mode: 'pan',
         startX: p1.x,
         startY: p1.y,
         startDist: 1,
         startAngle: 0,
-        origX: tr.x,
-        origY: tr.y,
-        origScale: tr.scale,
-        origRotation: tr.rotation,
-        lastCommitted: {x: tr.x, y: tr.y},
+        origX,
+        origY,
+        origScale,
+        origRotation,
+        lastCommitted: {x: origX, y: origY},
       };
     }
   };
@@ -436,20 +461,47 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         ) ?? null
       : null;
 
+    if (maskEditActive && existingSelected?.mask && onTransformMask) {
+      beginGestureForClip(existingSelected, 'mask');
+      return;
+    }
+
     if (activePointersRef.current.size >= 2 && existingSelected) {
-      beginGestureForClip(existingSelected);
+      beginGestureForClip(existingSelected, 'clip');
       return;
     }
 
     const hit = findHitClip(nx, ny);
     if (hit) {
       onSelectClip(hit.id);
-      beginGestureForClip(hit);
+      beginGestureForClip(hit, 'clip');
     } else if (existingSelected && activePointersRef.current.size === 1) {
-      beginGestureForClip(existingSelected);
+      beginGestureForClip(existingSelected, 'clip');
     } else {
       onSelectClip(null);
       gestureRef.current = null;
+    }
+  };
+
+  const commitTargetPatch = (
+    target: 'clip' | 'mask',
+    clipId: string,
+    patch: CanvasTransformPatch,
+    commit: boolean
+  ) => {
+    if (target === 'mask') {
+      onTransformMask?.(
+        clipId,
+        {
+          x: patch.x,
+          y: patch.y,
+          ...(patch.scale !== undefined ? {scale: patch.scale} : {}),
+          ...(patch.rotation !== undefined ? {rotation: patch.rotation} : {}),
+        },
+        commit
+      );
+    } else {
+      onTransformClip(clipId, patch, commit);
     }
   };
 
@@ -467,7 +519,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     if (pointers.length >= 2) {
       if (gesture.mode !== 'pinch') {
         const clip = clips.find((c) => c.id === gesture.clipId);
-        if (clip) beginGestureForClip(clip);
+        if (clip) beginGestureForClip(clip, gesture.target);
         return;
       }
       const [p1, p2] = pointers;
@@ -485,7 +537,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       );
 
       const nextScale = Math.max(
-        0.1,
+        0.08,
         Math.min(
           2.5,
           Math.round(gesture.origScale * (dist / gesture.startDist) * 100) / 100
@@ -501,7 +553,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         rotation: nextRotation,
       };
       gesture.lastCommitted = patch;
-      onTransformClip(gesture.clipId, patch, false);
+      commitTargetPatch(gesture.target, gesture.clipId, patch, false);
       return;
     }
 
@@ -516,7 +568,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       );
       const patch: CanvasTransformPatch = {x: snapped.x, y: snapped.y};
       gesture.lastCommitted = patch;
-      onTransformClip(gesture.clipId, patch, false);
+      commitTargetPatch(gesture.target, gesture.clipId, patch, false);
     }
   };
 
@@ -535,8 +587,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     if (activePointersRef.current.size === 1) {
       const clip = clips.find((c) => c.id === gesture.clipId);
       if (clip) {
-        onTransformClip(gesture.clipId, gesture.lastCommitted, true);
-        beginGestureForClip(clip);
+        commitTargetPatch(gesture.target, gesture.clipId, gesture.lastCommitted, true);
+        beginGestureForClip(clip, gesture.target);
         return;
       }
     }
@@ -544,11 +596,32 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     if (activePointersRef.current.size === 0) {
       const finalPatch = gesture.lastCommitted;
       const clipId = gesture.clipId;
+      const target = gesture.target;
       gestureRef.current = null;
       snapStateRef.current = {x: false, y: false};
       setSnapGuides({x: false, y: false});
-      onTransformClip(clipId, finalPatch, true);
+      commitTargetPatch(target, clipId, finalPatch, true);
       onLockLayer?.(clipId, false);
+    }
+  };
+
+  const handleWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
+    if (!maskEditActive || !onTransformMask || !selectedClipId) return;
+    const clip = clips.find((c) => c.id === selectedClipId);
+    if (!clip?.mask) return;
+    e.preventDefault();
+    if (e.shiftKey) {
+      const nextRot = normalizeAngleDeg(
+        clip.mask.rotation + (e.deltaY > 0 ? 5 : -5)
+      );
+      onTransformMask(clip.id, {rotation: nextRot}, true);
+    } else {
+      const factor = e.deltaY < 0 ? 1.06 : 0.94;
+      const nextScale = Math.max(
+        0.08,
+        Math.min(2.5, Math.round(clip.mask.scale * factor * 100) / 100)
+      );
+      onTransformMask(clip.id, {scale: nextScale}, true);
     }
   };
 
@@ -741,6 +814,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
+          onWheel={handleWheel}
           className="h-full w-full touch-none object-contain cursor-grab active:cursor-grabbing"
         />
 

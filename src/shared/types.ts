@@ -4,14 +4,78 @@ export type TrackType = 'video' | 'overlay' | 'text' | 'audio';
 
 export type ClipKind = 'video' | 'image' | 'text' | 'audio' | 'synth';
 
-export type FilterPreset =
+export type BuiltinFilterPreset =
   | 'none'
   | 'cinema'
   | 'warm'
   | 'cool'
   | 'bw'
+  | 'sepia'
   | 'vintage'
   | 'vivid';
+
+export type FilterPreset = BuiltinFilterPreset | (string & {});
+
+export interface CurvePoint {
+  x: number; // normalized 0..1
+  y: number; // normalized 0..1
+}
+
+export interface ColorCurves {
+  rgb: CurvePoint[];
+  r: CurvePoint[];
+  g: CurvePoint[];
+  b: CurvePoint[];
+}
+
+export interface ColorAdjustments {
+  sharpness: number; // 0..100
+  shadows: number; // -100..100
+  hue: number; // -180..180
+  temperature: number; // -100..100
+  fade: number; // 0..100
+  grain: number; // 0..100
+  curves?: ColorCurves;
+}
+
+export interface ClipCrop {
+  x: number; // normalized 0..1 from left
+  y: number; // normalized 0..1 from top
+  width: number; // normalized 0..1
+  height: number; // normalized 0..1
+  aspectPreset?: 'free' | '1:1' | '9:16' | '16:9' | '4:5';
+}
+
+export type MaskShape =
+  | 'horizon'
+  | 'mirror'
+  | 'circle'
+  | 'rectangle'
+  | 'heart'
+  | 'star';
+
+export type MaskMode = 'inside' | 'outside';
+
+export interface ClipMask {
+  shape: MaskShape;
+  mode: MaskMode;
+  x: number; // normalized 0..1 on canvas
+  y: number; // normalized 0..1 on canvas
+  scale: number; // 0.08..2.5
+  rotation: number; // degrees -180..180
+  feather: number; // 0..100
+}
+
+export interface ColorFilterPreset {
+  id: string;
+  name: string;
+  isBuiltin?: boolean;
+  brightness: number; // 0..2 (1 = 0%)
+  contrast: number; // 0..2 (1 = 0%)
+  saturate: number; // 0..2 (1 = 0%)
+  adjustments: ColorAdjustments;
+  createdAt?: number;
+}
 
 export type TransitionType = 'none' | 'fade' | 'zoom' | 'slide';
 
@@ -95,6 +159,8 @@ export interface Clip {
   brightness: number;
   contrast: number;
   saturate: number;
+  colorAdjustments?: ColorAdjustments;
+  crop?: ClipCrop;
   blur?: number;
   vignette?: number;
   transitionIn: TransitionType;
@@ -103,6 +169,8 @@ export interface Clip {
   text?: string;
   textStyle?: TextStyle;
   mediaScale?: number;
+  scaleX?: number;
+  scaleY?: number;
   mediaX?: number;
   mediaY?: number;
   rotation?: number; // degrees -180..180
@@ -110,6 +178,8 @@ export interface Clip {
   borderWidth?: number;
   borderColor?: string;
   flipHorizontal?: boolean;
+  flipVertical?: boolean;
+  mask?: ClipMask;
   blendMode?: BlendMode;
   chromaKeyEnabled?: boolean;
   chromaKeyColor?: string;
@@ -738,8 +808,28 @@ export function applyClipSplit(
     return clips;
   }
 
+  const cloneColorAdjustments = (
+    adj?: ColorAdjustments
+  ): ColorAdjustments | undefined => {
+    if (!adj) return undefined;
+    return {
+      ...adj,
+      curves: adj.curves
+        ? {
+            rgb: adj.curves.rgb.map((p) => ({...p})),
+            r: adj.curves.r.map((p) => ({...p})),
+            g: adj.curves.g.map((p) => ({...p})),
+            b: adj.curves.b.map((p) => ({...p})),
+          }
+        : undefined,
+    };
+  };
+
   const firstHalf: Clip = {
     ...target,
+    colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
+    crop: target.crop ? {...target.crop} : undefined,
+    mask: target.mask ? {...target.mask} : undefined,
     duration: Math.round(relOffset * 100) / 100,
     keyframes: target.keyframes
       ?.filter((k) => k.timeOffset <= relOffset)
@@ -750,6 +840,9 @@ export function applyClipSplit(
     ...target,
     id: newClipId,
     name: `${target.name} (2)`,
+    colorAdjustments: cloneColorAdjustments(target.colorAdjustments),
+    crop: target.crop ? {...target.crop} : undefined,
+    mask: target.mask ? {...target.mask} : undefined,
     start: Math.round(splitTime * 100) / 100,
     duration: Math.round((target.duration - relOffset) * 100) / 100,
     trimStart:
@@ -811,6 +904,21 @@ export function applyClipDuplicate(
   const copy: Clip = {
     ...target,
     textStyle: target.textStyle ? {...target.textStyle} : undefined,
+    colorAdjustments: target.colorAdjustments
+      ? {
+          ...target.colorAdjustments,
+          curves: target.colorAdjustments.curves
+            ? {
+                rgb: target.colorAdjustments.curves.rgb.map((p) => ({...p})),
+                r: target.colorAdjustments.curves.r.map((p) => ({...p})),
+                g: target.colorAdjustments.curves.g.map((p) => ({...p})),
+                b: target.colorAdjustments.curves.b.map((p) => ({...p})),
+              }
+            : undefined,
+        }
+      : undefined,
+    crop: target.crop ? {...target.crop} : undefined,
+    mask: target.mask ? {...target.mask} : undefined,
     keyframes: clonedKeyframes,
     id: newClipId,
     name: `${target.name} (копия)`,
