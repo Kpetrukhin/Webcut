@@ -55,9 +55,42 @@ export function getCanvasDimensions(aspect: AspectRatio): {
   }
 }
 
+interface DecodedAnimFrame {
+  bitmap: ImageBitmap;
+  endTimeMs: number;
+}
+
+interface DecodedAnimEntry {
+  status: 'loading' | 'animated' | 'static';
+  frames: DecodedAnimFrame[];
+  totalDurationMs: number;
+  canvas: HTMLCanvasElement | null;
+  lastFrameIdx: number;
+}
+
+interface WebCodecsDecodedResult {
+  image: VideoFrame;
+}
+
+interface WebCodecsImageDecoder {
+  completed: Promise<void>;
+  tracks: {
+    ready: Promise<void>;
+    selectedTrack: {frameCount: number; repetitionCount?: number} | null;
+  };
+  decode(opts: {frameIndex: number}): Promise<WebCodecsDecodedResult>;
+  close(): void;
+}
+
+interface WebCodecsImageDecoderCtor {
+  new (init: {data: ArrayBuffer | Uint8Array; type: string}): WebCodecsImageDecoder;
+  isTypeSupported?: (type: string) => Promise<boolean>;
+}
+
 export class MediaPool {
   private images = new Map<string, HTMLImageElement>();
   private videos = new Map<string, HTMLVideoElement>();
+  private animatedImages = new Map<string, DecodedAnimEntry>();
   private onAssetReady?: () => void;
 
   public setOnAssetReady(cb?: () => void) {
@@ -80,6 +113,135 @@ export class MediaPool {
       this.images.set(resolved, img);
     }
     return img.complete && img.naturalWidth > 0 ? img : null;
+  }
+
+  public getAnimatedImageSource(
+    src: string,
+    elapsedSec: number
+  ): HTMLCanvasElement | HTMLImageElement | null {
+    const resolved = resolveMediaSrc(src) || src;
+    const fallbackImg = this.getImage(src);
+
+    const DecoderCtor = (
+      typeof window !== 'undefined'
+        ? (window as unknown as {ImageDecoder?: WebCodecsImageDecoderCtor})
+            .ImageDecoder
+        : undefined
+    );
+    if (!DecoderCtor) {
+      return fallbackImg;
+    }
+
+    let entry = this.animatedImages.get(resolved);
+    if (!entry) {
+      entry = {
+        status: 'loading',
+        frames: [],
+        totalDurationMs: 0,
+        canvas: null,
+        lastFrameIdx: -1,
+      };
+      this.animatedImages.set(resolved, entry);
+      void this.decodeAnimatedImage(resolved, entry, DecoderCtor);
+    }
+
+    if (entry.status !== 'animated' || entry.frames.length === 0) {
+      return fallbackImg;
+    }
+
+    const loopMs = Math.max(100, entry.totalDurationMs);
+    const modMs = ((elapsedSec * 1000) % loopMs + loopMs) % loopMs;
+    let frameIdx = entry.frames.findIndex((f) => modMs < f.endTimeMs);
+    if (frameIdx < 0) frameIdx = entry.frames.length - 1;
+
+    const frame = entry.frames[frameIdx];
+    if (!entry.canvas) {
+      entry.canvas = document.createElement('canvas');
+      entry.canvas.width = frame.bitmap.width;
+      entry.canvas.height = frame.bitmap.height;
+    }
+    if (entry.lastFrameIdx !== frameIdx) {
+      const cctx = entry.canvas.getContext('2d');
+      if (cctx) {
+        cctx.clearRect(0, 0, entry.canvas.width, entry.canvas.height);
+        cctx.drawImage(frame.bitmap, 0, 0);
+      }
+      entry.lastFrameIdx = frameIdx;
+    }
+
+    return entry.canvas;
+  }
+
+  private async decodeAnimatedImage(
+    resolvedUrl: string,
+    entry: DecodedAnimEntry,
+    DecoderCtor: WebCodecsImageDecoderCtor
+  ) {
+    let decoder: WebCodecsImageDecoder | null = null;
+    try {
+      const res = await fetch(resolvedUrl);
+      if (!res.ok) {
+        entry.status = 'static';
+        return;
+      }
+      const contentType = res.headers.get('content-type')?.split(';')[0]?.trim();
+      const buffer = await res.arrayBuffer();
+      const guessedType =
+        contentType && contentType.startsWith('image/')
+          ? contentType
+          : /\.gif(\?|#|$)/i.test(resolvedUrl)
+            ? 'image/gif'
+            : 'image/webp';
+
+      if (DecoderCtor.isTypeSupported) {
+        const supported = await DecoderCtor.isTypeSupported(guessedType);
+        if (!supported) {
+          entry.status = 'static';
+          return;
+        }
+      }
+
+      decoder = new DecoderCtor({data: buffer, type: guessedType});
+      await decoder.tracks.ready;
+      const frameCount = decoder.tracks.selectedTrack?.frameCount ?? 1;
+      if (frameCount <= 1) {
+        entry.status = 'static';
+        return;
+      }
+
+      const maxFrames = Math.min(frameCount, 120);
+      const frames: DecodedAnimFrame[] = [];
+      let accumMs = 0;
+
+      for (let i = 0; i < maxFrames; i++) {
+        const result = await decoder.decode({frameIndex: i});
+        const vf = result.image;
+        const durUs = typeof vf.duration === 'number' && vf.duration > 0 ? vf.duration : 80_000;
+        const durMs = Math.max(20, durUs / 1000);
+        const bitmap = await createImageBitmap(vf);
+        vf.close();
+        accumMs += durMs;
+        frames.push({bitmap, endTimeMs: accumMs});
+      }
+
+      if (frames.length > 1) {
+        entry.frames = frames;
+        entry.totalDurationMs = accumMs;
+        entry.status = 'animated';
+        this.onAssetReady?.();
+      } else {
+        for (const f of frames) f.bitmap.close();
+        entry.status = 'static';
+      }
+    } catch {
+      entry.status = 'static';
+    } finally {
+      try {
+        decoder?.close();
+      } catch {
+        // ignore close errors
+      }
+    }
   }
 
   public getVideo(src: string): HTMLVideoElement {
@@ -564,27 +726,29 @@ function drawOverlayClip(
   collaborators: Collaborator[],
   currentUserId?: string
 ) {
-  const media =
+  const isAnimatedStickerOrWebp =
+    Boolean(clip.src) &&
+    clip.kind === 'image' &&
+    (Boolean(clip.isSticker) || /\.(webp|gif)(\?|#|$)/i.test(clip.src || ''));
+
+  const media:
+    | HTMLImageElement
+    | HTMLVideoElement
+    | HTMLCanvasElement
+    | null =
     clip.mediaStatus === 'DOWNLOADING'
       ? null
       : clip.kind === 'video' && clip.src
         ? pool.getVideo(clip.src)
         : clip.src
-          ? pool.getImage(clip.src)
+          ? isAnimatedStickerOrWebp
+            ? pool.getAnimatedImageSource(clip.src, Math.max(0, time - clip.start))
+            : pool.getImage(clip.src)
           : null;
 
-  const mw =
-    media instanceof HTMLVideoElement
-      ? media.videoWidth
-      : media instanceof HTMLImageElement
-        ? media.naturalWidth
-        : 0;
-  const mh =
-    media instanceof HTMLVideoElement
-      ? media.videoHeight
-      : media instanceof HTMLImageElement
-        ? media.naturalHeight
-        : 0;
+  const dims = media ? getSourceDims(media) : {w: 0, h: 0};
+  const mw = dims.w;
+  const mh = dims.h;
 
   const crop = getNormalizedCrop(clip);
   const effW = mw * crop.width;
@@ -592,7 +756,7 @@ function drawOverlayClip(
 
   const kf = evaluateClipTransform(clip, time);
   const scale = kf.scale;
-  const aspect = effW && effH ? effW / effH : 9 / 16;
+  const aspect = effW && effH ? effW / effH : clip.isSticker ? 1 : 9 / 16;
   const sxFactor = clip.scaleX ?? 1;
   const syFactor = clip.scaleY ?? 1;
   const pipW = cw * scale * sxFactor;
@@ -620,7 +784,7 @@ function drawOverlayClip(
     if (clip.transitionOut === 'fade') alpha *= t;
   }
 
-  const radius = (clip.borderRadius ?? 20) * sf;
+  const radius = (clip.borderRadius ?? (clip.isSticker ? 0 : 20)) * sf;
   const rotRad = (kf.rotation * Math.PI) / 180;
 
   const drawOverlayContent = (
@@ -635,14 +799,18 @@ function drawOverlayClip(
     targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
     targetCtx.globalCompositeOperation = composite;
 
-    targetCtx.beginPath();
-    targetCtx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
-    targetCtx.clip();
+    if (radius > 0) {
+      targetCtx.beginPath();
+      targetCtx.roundRect(-pipW / 2, -pipH / 2, pipW, pipH, radius);
+      targetCtx.clip();
+    }
 
     if (clip.mediaStatus === 'DOWNLOADING' || !media) {
       drawDownloadingStub(targetCtx, pipW, pipH, clip, sf);
     } else if (
-      (media instanceof HTMLImageElement || media.readyState >= 2) &&
+      (media instanceof HTMLImageElement ||
+        media instanceof HTMLCanvasElement ||
+        media.readyState >= 2) &&
       mw &&
       mh
     ) {

@@ -12,6 +12,8 @@ import {
   Pipette,
   Plus,
   RotateCcw,
+  Smile,
+  Sparkles,
   Spline,
   Trash2,
   Type,
@@ -34,6 +36,7 @@ import {
 import type {
   Clip,
   ProjectFont,
+  TextAnimationType,
   TextBgMode,
   TextCurveMode,
   TextCurvePoint,
@@ -41,7 +44,7 @@ import type {
 } from '../shared/types.ts';
 import {UnityNumberField} from './UnityNumberField.tsx';
 
-export type TextSubTab = 'font' | 'style' | 'spacing' | 'curve';
+export type TextSubTab = 'font' | 'style' | 'spacing' | 'curve' | 'anim';
 export type TextColorField = 'color' | 'strokeColor' | 'shadowColor' | 'bgColor';
 
 interface TextPanelProps {
@@ -67,6 +70,7 @@ interface TextPanelProps {
   onOpenTrackpad?: () => void;
   onAddKeyframe?: () => void;
   hasKeyframeAtPlayhead?: boolean;
+  onOpenStickers?: () => void;
   compactLayout?: boolean;
 }
 
@@ -102,6 +106,21 @@ const CURVE_MODE_OPTIONS: Array<{
     label: 'Точки',
     svgPath: 'M3 15 C8 4, 15 20, 21 8',
   },
+];
+
+const TEXT_ANIMATION_OPTIONS: Array<{
+  id: TextAnimationType;
+  label: string;
+  desc: string;
+}> = [
+  {id: 'none', label: 'Нет', desc: 'Без анимации'},
+  {id: 'fade', label: 'Плавное появление', desc: 'Fade прозрачности'},
+  {id: 'slide-up', label: 'Выезд снизу', desc: 'Slide вверх/вниз'},
+  {id: 'slide-left', label: 'Выезд слева', desc: 'Горизонтальный сдвиг'},
+  {id: 'slide-right', label: 'Выезд справа', desc: 'Горизонтальный сдвиг'},
+  {id: 'scale-pop', label: 'Увеличение / Поп-ап', desc: 'Scale Pop эффект'},
+  {id: 'typewriter', label: 'Печатная машинка', desc: 'Появление по буквам'},
+  {id: 'blur-spin', label: 'Размытие / Вращение', desc: 'Blur + Spin переход'},
 ];
 
 interface ColorPickerRowProps {
@@ -200,9 +219,11 @@ export const TextPanel: React.FC<TextPanelProps> = ({
   onOpenTrackpad,
   onAddKeyframe,
   hasKeyframeAtPlayhead = false,
+  onOpenStickers,
   compactLayout = false,
 }) => {
   const [subTab, setSubTab] = useState<TextSubTab>('style');
+  const [animPhase, setAnimPhase] = useState<'in' | 'out'>('in');
   const [forceNewTrack, setForceNewTrack] = useState(true);
   const [uploadingFont, setUploadingFont] = useState(false);
   const [fontError, setFontError] = useState<string | null>(null);
@@ -277,14 +298,27 @@ export const TextPanel: React.FC<TextPanelProps> = ({
   if (!isTextSelected || !selectedClip) {
     return (
       <div className="space-y-4">
-        <button
-          type="button"
-          onClick={() => onAddText('НОВЫЙ ТЕКСТ', forceNewTrack)}
-          className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-cyan-500 px-4 text-sm font-bold text-zinc-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-400 active:scale-[0.98]"
-        >
-          <Plus className="h-5 w-5" />
-          <span>Добавить текст</span>
-        </button>
+        <div className={onOpenStickers ? 'grid grid-cols-2 gap-2' : 'space-y-2'}>
+          <button
+            type="button"
+            onClick={() => onAddText('НОВЫЙ ТЕКСТ', forceNewTrack)}
+            className="flex h-12 w-full items-center justify-center gap-1.5 rounded-xl bg-cyan-500 px-3 text-xs font-bold text-zinc-950 shadow-lg shadow-cyan-500/20 transition hover:bg-cyan-400 active:scale-[0.98] sm:text-sm"
+          >
+            <Plus className="h-4 w-4 shrink-0" />
+            <span className="truncate">Добавить текст</span>
+          </button>
+
+          {onOpenStickers && (
+            <button
+              type="button"
+              onClick={onOpenStickers}
+              className="flex h-12 w-full items-center justify-center gap-1.5 rounded-xl border border-amber-400/40 bg-amber-500/15 px-3 text-xs font-bold text-amber-200 shadow-lg shadow-amber-500/10 transition hover:bg-amber-500/25 active:scale-[0.98] sm:text-sm"
+            >
+              <Smile className="h-4 w-4 shrink-0 text-amber-400" />
+              <span className="truncate">Стикеры</span>
+            </button>
+          )}
+        </div>
 
         <label className="flex cursor-pointer items-center justify-between rounded-xl border border-white/10 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300">
           <span>Создавать новую дорожку текста</span>
@@ -357,15 +391,29 @@ export const TextPanel: React.FC<TextPanelProps> = ({
             className="studio-scrollbar min-h-[48px] flex-1 resize-none rounded-xl border border-white/15 bg-zinc-900 px-3 py-2 text-sm text-white placeholder:text-zinc-500 focus:border-cyan-400 focus:outline-none"
           />
           <div className="flex shrink-0 flex-col gap-1.5">
-            <button
-              type="button"
-              onClick={() => onAddText('НОВЫЙ ТЕКСТ', forceNewTrack)}
-              title="Добавить ещё один текстовый слой"
-              className="flex h-8 items-center gap-1 rounded-lg bg-cyan-500 px-2.5 text-[11px] font-bold text-zinc-950 hover:bg-cyan-400 active:scale-95"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              <span>Новый</span>
-            </button>
+            <div className="flex gap-1">
+              <button
+                type="button"
+                onClick={() => onAddText('НОВЫЙ ТЕКСТ', forceNewTrack)}
+                title="Добавить ещё один текстовый слой"
+                className="flex h-8 items-center gap-1 rounded-lg bg-cyan-500 px-2.5 text-[11px] font-bold text-zinc-950 hover:bg-cyan-400 active:scale-95"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                <span>Новый</span>
+              </button>
+              {onOpenStickers && (
+                <button
+                  type="button"
+                  onClick={onOpenStickers}
+                  title="Открыть стикеры Giphy"
+                  aria-label="Стикеры"
+                  className="flex h-8 items-center gap-1 rounded-lg border border-amber-400/40 bg-amber-500/15 px-2 text-[11px] font-bold text-amber-200 hover:bg-amber-500/25 active:scale-95"
+                >
+                  <Smile className="h-3.5 w-3.5 text-amber-400" />
+                  <span>Стикеры</span>
+                </button>
+              )}
+            </div>
             <div className="flex gap-1">
               {onAddKeyframe && (
                 <button
@@ -1521,16 +1569,193 @@ export const TextPanel: React.FC<TextPanelProps> = ({
             )}
           </div>
         )}
+
+        {/* 5. АНИМАЦИЯ (Ввод / Вывод) */}
+        {subTab === 'anim' && (() => {
+          const isIn = animPhase === 'in';
+          const currentAnimType: TextAnimationType = isIn
+            ? style.animIn
+            : style.animOut;
+          const currentAnimDur = isIn
+            ? style.animInDuration
+            : style.animOutDuration;
+          const inOpt = TEXT_ANIMATION_OPTIONS.find((o) => o.id === style.animIn);
+          const outOpt = TEXT_ANIMATION_OPTIONS.find((o) => o.id === style.animOut);
+
+          const setPhaseType = (nextType: TextAnimationType) => {
+            if (isIn) {
+              updateStyle({animIn: nextType});
+            } else {
+              updateStyle({animOut: nextType});
+            }
+          };
+
+          const setPhaseDuration = (
+            nextDur: number,
+            opts?: {skipUndo?: boolean; skipSync?: boolean}
+          ) => {
+            const clamped = Math.max(
+              0.1,
+              Math.min(3.0, Math.round(nextDur * 10) / 10)
+            );
+            if (isIn) {
+              updateStyle({animInDuration: clamped}, opts);
+            } else {
+              updateStyle({animOutDuration: clamped}, opts);
+            }
+          };
+
+          return (
+            <div className="space-y-3 rounded-xl border border-white/10 bg-zinc-900/50 p-3">
+              {/* Sub-tabs: Ввод (In) | Вывод (Out) */}
+              <div className="grid grid-cols-2 gap-1.5 rounded-xl border border-white/10 bg-zinc-950 p-1">
+                <button
+                  type="button"
+                  onClick={() => setAnimPhase('in')}
+                  className={`flex flex-col items-center justify-center rounded-lg px-2 py-1.5 transition ${
+                    isIn
+                      ? 'bg-cyan-500/20 text-cyan-200 ring-1 ring-cyan-400/60'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <span className="text-[11px] font-bold">Ввод (In)</span>
+                  <span className="max-w-full truncate text-[9px] opacity-80">
+                    {style.animIn === 'none'
+                      ? 'Нет'
+                      : `${inOpt?.label ?? ''} · ${style.animInDuration.toFixed(1)}с`}
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAnimPhase('out')}
+                  className={`flex flex-col items-center justify-center rounded-lg px-2 py-1.5 transition ${
+                    !isIn
+                      ? 'bg-violet-500/20 text-violet-200 ring-1 ring-violet-400/60'
+                      : 'text-zinc-400 hover:text-zinc-200'
+                  }`}
+                >
+                  <span className="text-[11px] font-bold">Вывод (Out)</span>
+                  <span className="max-w-full truncate text-[9px] opacity-80">
+                    {style.animOut === 'none'
+                      ? 'Нет'
+                      : `${outOpt?.label ?? ''} · ${style.animOutDuration.toFixed(1)}с`}
+                  </span>
+                </button>
+              </div>
+
+              {/* Duration Slider + UnityNumberField */}
+              <div className="space-y-1.5 rounded-xl border border-white/10 bg-zinc-950/70 p-2.5">
+                <UnityNumberField
+                  label={isIn ? 'Длительность ввода' : 'Длительность вывода'}
+                  compact
+                  accent={isIn ? 'cyan' : 'indigo'}
+                  disabled={currentAnimType === 'none'}
+                  value={currentAnimDur}
+                  min={0.1}
+                  max={3.0}
+                  step={0.1}
+                  decimals={1}
+                  suffix="с"
+                  ariaLabel={
+                    isIn
+                      ? 'Длительность анимации ввода'
+                      : 'Длительность анимации вывода'
+                  }
+                  onChange={(v) =>
+                    setPhaseDuration(v, {skipUndo: true, skipSync: true})
+                  }
+                  onCommit={(v) => setPhaseDuration(v)}
+                />
+                <input
+                  type="range"
+                  min={0.1}
+                  max={3.0}
+                  step={0.1}
+                  disabled={currentAnimType === 'none'}
+                  value={currentAnimDur}
+                  onChange={(e) =>
+                    setPhaseDuration(Number(e.target.value), {
+                      skipUndo: true,
+                      skipSync: true,
+                    })
+                  }
+                  onPointerUp={(e) =>
+                    setPhaseDuration(
+                      Number((e.target as HTMLInputElement).value)
+                    )
+                  }
+                  onTouchEnd={(e) =>
+                    setPhaseDuration(
+                      Number((e.target as HTMLInputElement).value)
+                    )
+                  }
+                  className={`h-2 w-full cursor-pointer disabled:opacity-40 ${
+                    isIn ? 'accent-cyan-400' : 'accent-violet-400'
+                  }`}
+                />
+                <div className="flex items-center justify-between text-[10px] text-zinc-500">
+                  <span>0.1 с</span>
+                  <span>
+                    Длина клипа: {selectedClip.duration.toFixed(1)} с
+                  </span>
+                  <span>3.0 с</span>
+                </div>
+              </div>
+
+              {/* Animation Presets Grid */}
+              <div className="grid grid-cols-2 gap-1.5">
+                {TEXT_ANIMATION_OPTIONS.map((opt) => {
+                  const active = currentAnimType === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setPhaseType(opt.id)}
+                      className={`flex flex-col items-start rounded-xl border px-2.5 py-2 text-left transition active:scale-[0.98] ${
+                        active
+                          ? isIn
+                            ? 'border-cyan-400 bg-cyan-500/20 text-cyan-100'
+                            : 'border-violet-400 bg-violet-500/20 text-violet-100'
+                          : 'border-white/10 bg-zinc-950/70 text-zinc-200 hover:border-white/25'
+                      }`}
+                    >
+                      <div className="flex w-full items-center justify-between gap-1">
+                        <span className="truncate text-[11px] font-semibold">
+                          {opt.label}
+                        </span>
+                        {opt.id !== 'none' && (
+                          <Sparkles
+                            className={`h-3 w-3 shrink-0 ${
+                              active
+                                ? isIn
+                                  ? 'text-cyan-300'
+                                  : 'text-violet-300'
+                                : 'text-zinc-500'
+                            }`}
+                          />
+                        )}
+                      </div>
+                      <span className="mt-0.5 truncate text-[9px] text-zinc-400">
+                        {opt.desc}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })()}
       </div>
 
-      {/* Bottom Settings Tabs (Шрифт · Стиль · Отступы · Кривая) */}
-      <div className="mt-auto grid shrink-0 grid-cols-4 gap-1 border-t border-white/10 bg-[#111116] pt-2">
+      {/* Bottom Settings Tabs (Шрифт · Стиль · Отступы · Кривая · Анимация) */}
+      <div className="mt-auto grid shrink-0 grid-cols-5 gap-1 border-t border-white/10 bg-[#111116] pt-2">
         {(
           [
             {id: 'font', label: 'Шрифт'},
             {id: 'style', label: 'Стиль'},
             {id: 'spacing', label: 'Отступы'},
             {id: 'curve', label: 'Кривая'},
+            {id: 'anim', label: 'Анимация'},
           ] as const
         ).map((tab) => {
           const active = subTab === tab.id;
@@ -1544,13 +1769,13 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                   onSetCurveEditActive?.(true);
                 }
               }}
-              className={`flex h-9 items-center justify-center rounded-lg border text-[11px] font-semibold transition ${
+              className={`flex h-9 items-center justify-center rounded-lg border px-1 text-[10px] font-semibold transition sm:text-[11px] ${
                 active
                   ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
                   : 'border-white/10 bg-zinc-900 text-zinc-400 hover:text-zinc-200'
               }`}
             >
-              {tab.label}
+              <span className="truncate">{tab.label}</span>
             </button>
           );
         })}

@@ -181,7 +181,7 @@ class WebGLChromaKeyProcessor {
   }
 
   public process(
-    media: HTMLImageElement | HTMLVideoElement,
+    media: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement,
     mw: number,
     mh: number,
     keyHex: string,
@@ -237,7 +237,7 @@ class WebGLChromaKeyProcessor {
 let sharedProcessor: WebGLChromaKeyProcessor | null = null;
 
 export function applyChromaKeyShader(
-  media: HTMLImageElement | HTMLVideoElement,
+  media: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement,
   mw: number,
   mh: number,
   keyHex: string,

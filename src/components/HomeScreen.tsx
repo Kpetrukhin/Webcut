@@ -8,6 +8,7 @@ import {
   Radio,
   RefreshCw,
   Search,
+  Settings,
   Trash2,
   Users,
   Wifi,
@@ -80,6 +81,7 @@ interface HomeScreenProps {
   onConnectToHostIp: (ipOrUrl: string, targetRoomId?: string) => void;
   onRefreshNetwork: () => void;
   onRefreshRooms: () => void;
+  onOpenSettings?: () => void;
 }
 
 export const HomeScreen: React.FC<HomeScreenProps> = ({
@@ -103,6 +105,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onConnectToHostIp,
   onRefreshNetwork,
   onRefreshRooms,
+  onOpenSettings,
 }) => {
   const [activeTab, setActiveTab] = useState<'projects' | 'team'>('projects');
   const [showCreateModal, setShowCreateModal] = useState(false);
@@ -265,6 +268,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               className="w-20 bg-transparent text-xs font-medium text-white focus:outline-none sm:w-28"
             />
           </div>
+          {onOpenSettings && (
+            <button
+              type="button"
+              onClick={onOpenSettings}
+              title="Настройки приложения (Giphy API)"
+              aria-label="Настройки приложения"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-white/10 bg-zinc-900 text-zinc-300 hover:border-cyan-400 hover:text-white active:scale-95"
+            >
+              <Settings className="h-4 w-4" />
+            </button>
+          )}
         </div>
       </header>
 

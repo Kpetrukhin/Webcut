@@ -114,8 +114,20 @@ if (fs.existsSync(appGradlePath)) {
     );
   }
 
+  if (!appGradle.includes('io.coil-kt:coil')) {
+    const coilDeps = `
+    def coilVersion = '2.7.0'
+    implementation "io.coil-kt:coil:$coilVersion"
+    implementation "io.coil-kt:coil-gif:$coilVersion"
+`;
+    appGradle = appGradle.replace(
+      "implementation project(':capacitor-android')",
+      `implementation project(':capacitor-android')${coilDeps}`
+    );
+  }
+
   fs.writeFileSync(appGradlePath, appGradle, 'utf-8');
-  console.log('Patched android/app/build.gradle with Ktor 2.3.12 CIO, Media3 1.5.1 Transformer + Kotlin 21.');
+  console.log('Patched android/app/build.gradle with Ktor 2.3.12 CIO, Media3 1.5.1, Coil 2.7.0 (GIF/AnimatedWebP) + Kotlin 21.');
 }
 
 // 4. Copy native Kotlin Ktor P2P plugin files & wire MainActivity.java

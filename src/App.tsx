@@ -23,6 +23,7 @@ import {
   RefreshCw,
   RotateCcw,
   Scissors,
+  Settings,
   Shapes,
   Sliders,
   Sparkles,
@@ -71,6 +72,7 @@ import {
   useCollaborativeRoom,
 } from './hooks/useCollaborativeRoom.ts';
 import {AudioPanel} from './components/AudioPanel.tsx';
+import {AppSettingsModal} from './components/AppSettingsModal.tsx';
 import {ChromaKeyPanel} from './components/ChromaKeyPanel.tsx';
 import {ColorAdjustPanel} from './components/ColorAdjustPanel.tsx';
 import {CropEditorModal} from './components/CropEditorModal.tsx';
@@ -80,6 +82,7 @@ import {MaskPanel} from './components/MaskPanel.tsx';
 import {PreviewCanvas} from './components/PreviewCanvas.tsx';
 import type {CanvasTransformPatch} from './components/PreviewCanvas.tsx';
 import {ScrubNumberField} from './components/ScrubNumberField.tsx';
+import {StickersSheet} from './components/StickersSheet.tsx';
 import {Timeline} from './components/Timeline.tsx';
 import {TransformPanel} from './components/TransformPanel.tsx';
 import {TransformTrackpad} from './components/TransformTrackpad.tsx';
@@ -216,6 +219,9 @@ export default function App() {
     y: boolean;
   }>({x: false, y: false});
   const [showLobbyModal, setShowLobbyModal] = useState(false);
+  const [showStickersSheet, setShowStickersSheet] = useState(false);
+  const [showAppSettings, setShowAppSettings] = useState(false);
+  const [giphyKeyVersion, setGiphyKeyVersion] = useState(0);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(project.title);
   const [exportProgress, setExportProgress] = useState<number | null>(null);
@@ -503,6 +509,7 @@ export default function App() {
       duration: number;
       track: 'video' | 'overlay';
       forceNewTrack?: boolean;
+      isSticker?: boolean;
     }) => {
       const sameTrack = project.clips.filter((c) => c.track === opts.track);
       const trackEnd = sameTrack.reduce(
@@ -514,6 +521,7 @@ export default function App() {
           ? Math.round(trackEnd * 100) / 100
           : Math.round(currentTime * 100) / 100;
 
+      const isSticker = Boolean(opts.isSticker);
       const hasRemoteMedia = Boolean(opts.remoteUrl);
       const {clip, newTrack} = addClip(
         {
@@ -522,6 +530,7 @@ export default function App() {
           kind: opts.kind,
           name: opts.name,
           src: opts.src,
+          isSticker: isSticker || undefined,
           mediaFileName: opts.fileName,
           mediaRemoteUrl: opts.remoteUrl,
           mediaStatus: 'READY',
@@ -542,11 +551,11 @@ export default function App() {
             opts.kind === 'image' && opts.track === 'video'
               ? 'kenburns-in'
               : 'none',
-          mediaScale: opts.track === 'overlay' ? 0.42 : 1,
-          mediaX: opts.track === 'overlay' ? 0.72 : 0.5,
-          mediaY: opts.track === 'overlay' ? 0.26 : 0.5,
+          mediaScale: isSticker ? 0.36 : opts.track === 'overlay' ? 0.42 : 1,
+          mediaX: isSticker ? 0.5 : opts.track === 'overlay' ? 0.72 : 0.5,
+          mediaY: isSticker ? 0.5 : opts.track === 'overlay' ? 0.26 : 0.5,
           rotation: 0,
-          borderRadius: opts.track === 'overlay' ? 20 : 0,
+          borderRadius: isSticker ? 0 : opts.track === 'overlay' ? 20 : 0,
           blendMode: 'source-over',
         },
         {forceNewTrack: opts.forceNewTrack, skipWs: hasRemoteMedia}
@@ -568,6 +577,12 @@ export default function App() {
     },
     [project.clips, currentTime, addClip, sendLayerMediaUpdated]
   );
+
+  const handleOpenStickers = useCallback(() => {
+    setMobileSheet(null);
+    setMobileEditTool(null);
+    setShowStickersSheet(true);
+  }, []);
 
   const handleReplaceClipMedia = useCallback(
     async (clipId: string, file: File) => {
@@ -1281,7 +1296,14 @@ export default function App() {
           onRefreshRooms={() => {
             void refreshRooms();
           }}
+          onOpenSettings={() => setShowAppSettings(true)}
         />
+        {showAppSettings && (
+          <AppSettingsModal
+            onClose={() => setShowAppSettings(false)}
+            onKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
+          />
+        )}
         <OfflineIndicator />
       </>
     );
@@ -1406,6 +1428,16 @@ export default function App() {
           </button>
 
           <PWAInstallButton />
+
+          <button
+            type="button"
+            onClick={() => setShowAppSettings(true)}
+            title="Настройки приложения (Giphy API ключ)"
+            aria-label="Настройки приложения"
+            className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-zinc-900 text-zinc-300 hover:border-cyan-400 hover:text-white active:scale-95 sm:h-9 sm:w-9"
+          >
+            <Settings className="h-4 w-4" />
+          </button>
 
           <button
             type="button"
@@ -1914,6 +1946,7 @@ export default function App() {
                 onOpenTrackpad={() => setShowTrackpad((v) => !v)}
                 onAddKeyframe={handleAddKeyframeAtPlayhead}
                 hasKeyframeAtPlayhead={hasKeyframeAtPlayhead}
+                onOpenStickers={handleOpenStickers}
               />
             )}
             {desktopTab === 'effects' && (
@@ -2658,6 +2691,7 @@ export default function App() {
                   }}
                   onAddKeyframe={handleAddKeyframeAtPlayhead}
                   hasKeyframeAtPlayhead={hasKeyframeAtPlayhead}
+                  onOpenStickers={handleOpenStickers}
                 />
               </div>
             </div>
@@ -3275,6 +3309,7 @@ export default function App() {
             }}
             onAddKeyframe={handleAddKeyframeAtPlayhead}
             hasKeyframeAtPlayhead={hasKeyframeAtPlayhead}
+            onOpenStickers={handleOpenStickers}
           />
         </BottomSheet>
       )}
@@ -3461,6 +3496,35 @@ export default function App() {
             onClose={() => setShowCropModal(false)}
           />
         )}
+
+      {showStickersSheet && (
+        <StickersSheet
+          keyVersion={giphyKeyVersion}
+          onSelectSticker={(st) => {
+            handleAddMediaClip({
+              name: st.name,
+              kind: 'image',
+              src: st.src,
+              fileName: st.fileName,
+              remoteUrl: st.remoteUrl,
+              duration: 5,
+              track: 'overlay',
+              isSticker: true,
+            });
+            setShowStickersSheet(false);
+            showTransientNotice('Стикер добавлен на холст');
+          }}
+          onOpenSettings={() => setShowAppSettings(true)}
+          onClose={() => setShowStickersSheet(false)}
+        />
+      )}
+
+      {showAppSettings && (
+        <AppSettingsModal
+          onClose={() => setShowAppSettings(false)}
+          onKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
+        />
+      )}
 
       <OfflineIndicator />
     </div>
