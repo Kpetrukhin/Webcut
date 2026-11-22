@@ -53,7 +53,6 @@ import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
-import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
 
 data class NetIfaceInfo(
@@ -243,8 +242,8 @@ class KtorLanEngine(private val context: Context) {
 
         val engine = embeddedServer(ServerCIO, port = chosenPort, host = "0.0.0.0") {
             install(WebSockets) {
-                pingPeriod = Duration.ofSeconds(15)
-                timeout = Duration.ofSeconds(30)
+                pingPeriodMillis = 15_000L
+                timeoutMillis = 30_000L
                 maxFrameSize = Long.MAX_VALUE
                 masking = false
             }
