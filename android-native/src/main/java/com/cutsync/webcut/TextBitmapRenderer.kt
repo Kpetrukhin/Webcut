@@ -348,8 +348,14 @@ object TextBitmapRenderer {
                 if (f.exists()) customFile = f
             }
             if (customFile == null) {
-                val candidate = File(File(context.cacheDir, "cutsync_media"), File(spec.fontSrc).name)
-                if (candidate.exists()) customFile = candidate
+                val baseFontName = File(spec.fontSrc.removePrefix("media/")).name
+                val candidates = listOf(
+                    File(File(context.filesDir, "cutsync_media/media"), baseFontName),
+                    File(File(context.filesDir, "cutsync_media"), baseFontName),
+                    File(File(context.cacheDir, "cutsync_media/media"), baseFontName),
+                    File(File(context.cacheDir, "cutsync_media"), baseFontName)
+                )
+                customFile = candidates.firstOrNull { it.exists() && it.isFile }
             }
 
             if (customFile != null && customFile.exists()) {

@@ -89,48 +89,229 @@ function getActiveUploadsDir(): string {
   }
 }
 
+const FAST_FINGERPRINT_CHUNK_BYTES = 64 * 1024;
+
+function sanitizeMediaExt(originalName?: string, mimeType?: string): string {
+  const cleanName = (originalName || '').split(/[?#]/)[0].trim();
+  const dotIdx = cleanName.lastIndexOf('.');
+  if (dotIdx !== -1 && dotIdx < cleanName.length - 1) {
+    const ext = cleanName
+      .slice(dotIdx + 1)
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .slice(0, 10);
+    if (ext) return ext;
+  }
+  const mime = (mimeType || '').toLowerCase();
+  if (mime.includes('mp4')) return 'mp4';
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('quicktime')) return 'mov';
+  if (mime.includes('jpeg') || mime.includes('jpg')) return 'jpg';
+  if (mime.includes('png')) return 'png';
+  if (mime.includes('webp')) return 'webp';
+  if (mime.includes('gif')) return 'gif';
+  if (mime.includes('mpeg')) return 'mp3';
+  if (mime.includes('wav')) return 'wav';
+  if (mime.includes('aac') || mime.includes('mp4a')) return 'm4a';
+  if (mime.includes('ogg')) return 'ogg';
+  if (mime.includes('ttf')) return 'ttf';
+  if (mime.includes('otf')) return 'otf';
+  if (mime.includes('woff2')) return 'woff2';
+  if (mime.includes('woff')) return 'woff';
+  return 'bin';
+}
+
+function buildDedupBaseName(
+  hash24: string,
+  size: number,
+  originalName?: string,
+  mimeType?: string
+): string {
+  const safeHash =
+    hash24.toLowerCase().replace(/[^a-f0-9]/g, '').slice(0, 24) || '0'.repeat(24);
+  const safeSize = Math.max(0, Math.trunc(size));
+  const ext = sanitizeMediaExt(originalName, mimeType);
+  return `${safeHash}_${safeSize}.${ext}`;
+}
+
+function computeFastFileFingerprint(filePath: string): {hash: string; size: number} {
+  const stat = fs.statSync(filePath);
+  const size = stat.size;
+  const hash = crypto.createHash('sha256');
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    if (size <= FAST_FINGERPRINT_CHUNK_BYTES * 2) {
+      const buf = Buffer.allocUnsafe(size);
+      let total = 0;
+      while (total < size) {
+        const n = fs.readSync(fd, buf, total, size - total, total);
+        if (n <= 0) break;
+        total += n;
+      }
+      hash.update(buf.subarray(0, total));
+    } else {
+      const head = Buffer.allocUnsafe(FAST_FINGERPRINT_CHUNK_BYTES);
+      const headRead = fs.readSync(fd, head, 0, FAST_FINGERPRINT_CHUNK_BYTES, 0);
+      hash.update(head.subarray(0, headRead));
+      const tail = Buffer.allocUnsafe(FAST_FINGERPRINT_CHUNK_BYTES);
+      const tailRead = fs.readSync(
+        fd,
+        tail,
+        0,
+        FAST_FINGERPRINT_CHUNK_BYTES,
+        size - FAST_FINGERPRINT_CHUNK_BYTES
+      );
+      hash.update(tail.subarray(0, tailRead));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return {hash: hash.digest('hex').slice(0, 24), size};
+}
+
+function getMediaDirFor(baseDir = getActiveUploadsDir()): string {
+  const dir = path.join(baseDir, 'media');
+  fs.mkdirSync(dir, {recursive: true});
+  return dir;
+}
+
+function getProjectsDirFor(baseDir = getActiveUploadsDir()): string {
+  const dir = path.join(baseDir, 'projects');
+  fs.mkdirSync(dir, {recursive: true});
+  return dir;
+}
+
+function sanitizeProjectId(rawId: string): string {
+  const cleaned = (rawId || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+    .slice(0, 64);
+  return cleaned || 'studio-demo';
+}
+
+function normalizeBaseMediaName(rawName: string): string {
+  const clean = rawName.trim().replace(/\\/g, '/').split(/[?#]/)[0];
+  const base = clean.split('/').pop() || clean;
+  return base.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+function findExistingMediaFile(
+  rawName: string,
+  expectedSize?: number
+): {filePath: string; baseName: string; size: number} | null {
+  const baseName = normalizeBaseMediaName(rawName);
+  if (!baseName) return null;
+  const currentDir = getActiveUploadsDir();
+  const candidates = [
+    path.join(currentDir, 'media', baseName),
+    path.join(currentDir, baseName),
+    path.join(DEFAULT_UPLOADS_DIR, 'media', baseName),
+    path.join(DEFAULT_UPLOADS_DIR, baseName),
+  ];
+  for (const candidate of candidates) {
+    try {
+      const st = fs.statSync(candidate);
+      if (st.isFile() && st.size > 0) {
+        if (expectedSize && expectedSize > 0 && st.size !== expectedSize) {
+          continue;
+        }
+        return {filePath: candidate, baseName, size: st.size};
+      }
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
+function moveFileReplaceSync(src: string, dst: string) {
+  try {
+    if (fs.existsSync(dst)) fs.unlinkSync(dst);
+    fs.renameSync(src, dst);
+  } catch {
+    fs.copyFileSync(src, dst);
+    fs.unlinkSync(src);
+  }
+}
+
 function computeDirStats(dirPath: string): {filesCount: number; totalBytes: number} {
   let filesCount = 0;
   let totalBytes = 0;
-  try {
-    const entries = fs.readdirSync(dirPath, {withFileTypes: true});
-    for (const entry of entries) {
-      if (!entry.isFile()) continue;
-      if (entry.name.startsWith('.cutsync-probe-')) continue;
-      try {
-        const st = fs.statSync(path.join(dirPath, entry.name));
-        if (st.isFile()) {
-          filesCount += 1;
-          totalBytes += st.size;
+  const scanFlat = (targetDir: string, skipJson: boolean) => {
+    try {
+      const entries = fs.readdirSync(targetDir, {withFileTypes: true});
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (entry.name.startsWith('.')) continue;
+        if (entry.name.endsWith('.part')) continue;
+        if (skipJson && entry.name.toLowerCase().endsWith('.json')) continue;
+        try {
+          const st = fs.statSync(path.join(targetDir, entry.name));
+          if (st.isFile()) {
+            filesCount += 1;
+            totalBytes += st.size;
+          }
+        } catch {
+          // ignore
         }
-      } catch {
-        // ignore
       }
+    } catch {
+      // ignore
     }
-  } catch {
-    // ignore
-  }
+  };
+  scanFlat(path.join(dirPath, 'media'), false);
+  scanFlat(dirPath, true);
   return {filesCount, totalBytes};
 }
 
 function copyMediaFilesBetweenDirs(fromDir: string, toDir: string): number {
   if (path.resolve(fromDir) === path.resolve(toDir)) return 0;
   let migratedCount = 0;
+  const copyFlat = (srcDir: string, dstDir: string, overwrite: boolean) => {
+    try {
+      if (!fs.existsSync(srcDir)) return;
+      fs.mkdirSync(dstDir, {recursive: true});
+      const entries = fs.readdirSync(srcDir, {withFileTypes: true});
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (entry.name.startsWith('.')) continue;
+        if (entry.name.endsWith('.part')) continue;
+        const srcPath = path.join(srcDir, entry.name);
+        const dstPath = path.join(dstDir, entry.name);
+        try {
+          if (overwrite || !fs.existsSync(dstPath)) {
+            fs.copyFileSync(srcPath, dstPath);
+            migratedCount += 1;
+          }
+        } catch {
+          // ignore individual copy error
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+  copyFlat(path.join(fromDir, 'media'), path.join(toDir, 'media'), false);
+  copyFlat(path.join(fromDir, 'projects'), path.join(toDir, 'projects'), true);
+  // Migrate legacy flat files into structured subdirs
   try {
-    fs.mkdirSync(toDir, {recursive: true});
+    fs.mkdirSync(path.join(toDir, 'media'), {recursive: true});
     const entries = fs.readdirSync(fromDir, {withFileTypes: true});
     for (const entry of entries) {
       if (!entry.isFile()) continue;
-      if (entry.name.startsWith('.cutsync-probe-')) continue;
+      if (entry.name.startsWith('.') || entry.name.endsWith('.part')) continue;
       const srcPath = path.join(fromDir, entry.name);
-      const dstPath = path.join(toDir, entry.name);
+      const isJson = entry.name.toLowerCase().endsWith('.json');
+      const dstSub = isJson ? path.join(toDir, 'projects') : path.join(toDir, 'media');
+      fs.mkdirSync(dstSub, {recursive: true});
+      const dstPath = path.join(dstSub, entry.name);
       try {
-        if (!fs.existsSync(dstPath)) {
+        if (isJson || !fs.existsSync(dstPath)) {
           fs.copyFileSync(srcPath, dstPath);
           migratedCount += 1;
         }
       } catch {
-        // ignore individual copy error
+        // ignore
       }
     }
   } catch {
@@ -494,7 +675,7 @@ app.set('trust proxy', true);
 // Allow APK (http://localhost) and LAN devices to connect freely to API & uploads
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   res.header(
     'Access-Control-Expose-Headers',
@@ -511,16 +692,12 @@ app.use(express.json({limit: '10mb'}));
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
-    cb(null, getActiveUploadsDir());
+    cb(null, getMediaDirFor());
   },
   filename: (_req, file, cb) => {
-    const ext =
-      path
-        .extname(file.originalname)
-        .replace(/[^a-zA-Z0-9.]/g, '')
-        .slice(0, 10) || '.bin';
+    const ext = sanitizeMediaExt(file.originalname, file.mimetype);
     const token = crypto.randomBytes(8).toString('hex');
-    cb(null, `${Date.now()}-${token}${ext}`);
+    cb(null, `.upload-${Date.now()}-${token}.${ext}.part`);
   },
 });
 
@@ -575,7 +752,13 @@ const staticMediaHeaders = (
 };
 
 let cachedStaticDir = '';
-let cachedStaticHandler: express.RequestHandler | null = null;
+let cachedMediaSubHandler: express.RequestHandler | null = null;
+let cachedRootHandler: express.RequestHandler | null = null;
+const defaultMediaSubHandler = express.static(path.join(DEFAULT_UPLOADS_DIR, 'media'), {
+  acceptRanges: true,
+  maxAge: '1d',
+  setHeaders: staticMediaHeaders,
+});
 const defaultStaticHandler = express.static(DEFAULT_UPLOADS_DIR, {
   acceptRanges: true,
   maxAge: '1d',
@@ -588,29 +771,81 @@ function dynamicMediaStatic(
   next: express.NextFunction
 ) {
   const currentDir = getActiveUploadsDir();
-  if (!cachedStaticHandler || cachedStaticDir !== currentDir) {
+  if (!cachedMediaSubHandler || !cachedRootHandler || cachedStaticDir !== currentDir) {
     cachedStaticDir = currentDir;
-    cachedStaticHandler = express.static(currentDir, {
+    cachedMediaSubHandler = express.static(path.join(currentDir, 'media'), {
+      acceptRanges: true,
+      maxAge: '1d',
+      setHeaders: staticMediaHeaders,
+    });
+    cachedRootHandler = express.static(currentDir, {
       acceptRanges: true,
       maxAge: '1d',
       setHeaders: staticMediaHeaders,
     });
   }
-  cachedStaticHandler(req, res, (err) => {
+  cachedMediaSubHandler(req, res, (err) => {
     if (err) {
       next(err);
       return;
     }
-    if (path.resolve(currentDir) !== path.resolve(DEFAULT_UPLOADS_DIR)) {
-      defaultStaticHandler(req, res, next);
-      return;
-    }
-    next();
+    cachedRootHandler!(req, res, (err2) => {
+      if (err2) {
+        next(err2);
+        return;
+      }
+      if (path.resolve(currentDir) !== path.resolve(DEFAULT_UPLOADS_DIR)) {
+        defaultMediaSubHandler(req, res, (err3) => {
+          if (err3) {
+            next(err3);
+            return;
+          }
+          defaultStaticHandler(req, res, next);
+        });
+        return;
+      }
+      next();
+    });
   });
 }
 
 app.use('/uploads', dynamicMediaStatic);
 app.use('/media', dynamicMediaStatic);
+
+app.get('/api/media/exists', (req, res) => {
+  const hashParam = typeof req.query.hash === 'string' ? req.query.hash.trim() : '';
+  const sizeParam = Number(req.query.size || req.query.expectedSize || 0);
+  const extParam = typeof req.query.ext === 'string' ? req.query.ext.trim() : '';
+  const rawName =
+    (typeof req.query.fileName === 'string' ? req.query.fileName : '').trim() ||
+    (hashParam && Number.isFinite(sizeParam) && sizeParam >= 0
+      ? buildDedupBaseName(hashParam, sizeParam, `file.${extParam || 'bin'}`)
+      : '');
+  const expectedSize = sizeParam;
+  if (!rawName) {
+    res.json({exists: false});
+    return;
+  }
+  const found = findExistingMediaFile(
+    rawName,
+    Number.isFinite(expectedSize) && expectedSize > 0 ? expectedSize : undefined
+  );
+  if (!found) {
+    res.json({exists: false});
+    return;
+  }
+  const fileHash = computeFileSha256(found.filePath);
+  const relPath = `media/${found.baseName}`;
+  res.json({
+    exists: true,
+    fileName: relPath,
+    baseName: found.baseName,
+    relativePath: relPath,
+    localUrl: `/media/${found.baseName}`,
+    fileSize: found.size,
+    fileHash,
+  });
+});
 
 app.post('/media/upload', (req, res, next) => {
   const rawName = req.query.fileName;
@@ -618,42 +853,74 @@ app.post('/media/upload', (req, res, next) => {
   if (contentType.includes('multipart/form-data')) {
     return next();
   }
-  const safeBase =
+  const origName =
     typeof rawName === 'string' && rawName.trim()
       ? path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_')
       : `media-${Date.now()}.bin`;
-  const finalName = `${Date.now()}-${safeBase}`;
-  const targetDir = getActiveUploadsDir();
-  const destPath = path.resolve(targetDir, finalName);
-  if (!destPath.startsWith(path.resolve(targetDir) + path.sep)) {
+  const mediaDir = getMediaDirFor();
+  const tempPath = path.resolve(
+    mediaDir,
+    `.upload-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.part`
+  );
+  if (!tempPath.startsWith(path.resolve(mediaDir) + path.sep)) {
     res.status(400).json({error: 'Недопустимое имя файла'});
     return;
   }
-  const ws = fs.createWriteStream(destPath);
+  const ws = fs.createWriteStream(tempPath);
   req.pipe(ws);
   ws.on('finish', () => {
-    const ifaces = getNetworkInterfacesList();
-    const primaryIp =
-      ifaces.find((i) => i.type === 'wifi')?.ip ||
-      ifaces[0]?.ip ||
-      '127.0.0.1';
-    let fileSize = 0;
     try {
-      fileSize = fs.statSync(destPath).size;
-    } catch {
-      fileSize = 0;
+      const fp = computeFastFileFingerprint(tempPath);
+      const dedupBase = buildDedupBaseName(fp.hash, fp.size, origName, contentType);
+      const destPath = path.resolve(mediaDir, dedupBase);
+      let deduplicated = false;
+      if (fs.existsSync(destPath)) {
+        try {
+          if (fs.statSync(destPath).size === fp.size) {
+            fs.unlinkSync(tempPath);
+            deduplicated = true;
+          }
+        } catch {
+          // proceed to overwrite
+        }
+      }
+      if (!deduplicated) {
+        moveFileReplaceSync(tempPath, destPath);
+      }
+
+      const ifaces = getNetworkInterfacesList();
+      const primaryIp =
+        ifaces.find((i) => i.type === 'wifi')?.ip ||
+        ifaces[0]?.ip ||
+        '127.0.0.1';
+      const relPath = `media/${dedupBase}`;
+      const fileHash = computeFileSha256(destPath);
+      res.json({
+        ok: true,
+        deduplicated,
+        fileName: relPath,
+        baseName: dedupBase,
+        relativePath: relPath,
+        localUrl: `/media/${dedupBase}`,
+        shareUrl: `http://${primaryIp}:${ACTIVE_PORT}/media/${dedupBase}`,
+        fileSize: fp.size,
+        fileHash,
+      });
+    } catch (err) {
+      try {
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      } catch {
+        // ignore
+      }
+      res.status(500).json({error: err instanceof Error ? err.message : String(err)});
     }
-    const fileHash = computeFileSha256(destPath);
-    res.json({
-      ok: true,
-      fileName: finalName,
-      localUrl: `/media/${finalName}`,
-      shareUrl: `http://${primaryIp}:${ACTIVE_PORT}/media/${finalName}`,
-      fileSize,
-      fileHash,
-    });
   });
   ws.on('error', (err) => {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // ignore
+    }
     res.status(500).json({error: err.message});
   });
 });
@@ -829,6 +1096,307 @@ app.get('/api/rooms/:roomId', (req, res) => {
   });
 });
 
+function collectReferencedMediaNamesFromProjectObj(
+  proj: unknown,
+  outNames: Set<string>
+) {
+  if (!proj || typeof proj !== 'object') return;
+  const p = proj as {
+    clips?: Array<{
+      src?: string;
+      mediaFileName?: string;
+      mediaRemoteUrl?: string;
+      textStyle?: {fontSrc?: string};
+    }>;
+    customFonts?: Array<{src?: string; fileName?: string}>;
+  };
+  const addRef = (raw?: string) => {
+    if (!raw || typeof raw !== 'string') return;
+    const trimmed = raw.trim().replace(/\\/g, '/');
+    if (
+      !trimmed ||
+      trimmed.startsWith('synth:') ||
+      trimmed.startsWith('data:') ||
+      trimmed.startsWith('/src/') ||
+      trimmed.startsWith('/assets/')
+    ) {
+      return;
+    }
+    if (
+      trimmed.startsWith('media/') ||
+      trimmed.includes('/media/') ||
+      trimmed.includes('/uploads/') ||
+      !trimmed.includes('/')
+    ) {
+      const base = normalizeBaseMediaName(trimmed);
+      if (base) outNames.add(base);
+    }
+  };
+  if (Array.isArray(p.clips)) {
+    for (const c of p.clips) {
+      addRef(c.src);
+      addRef(c.mediaFileName);
+      addRef(c.mediaRemoteUrl);
+      addRef(c.textStyle?.fontSrc);
+    }
+  }
+  if (Array.isArray(p.customFonts)) {
+    for (const f of p.customFonts) {
+      addRef(f.src);
+      addRef(f.fileName);
+    }
+  }
+}
+
+function toPortableMediaRefForDisk(raw?: string, explicitFileName?: string): string | undefined {
+  const pickBase = (input?: string): string | undefined => {
+    if (!input) return undefined;
+    const trimmed = input.trim();
+    if (!trimmed) return undefined;
+    if (
+      trimmed.startsWith('synth:') ||
+      trimmed.startsWith('data:') ||
+      trimmed.startsWith('/src/') ||
+      trimmed.startsWith('/assets/')
+    ) {
+      return undefined;
+    }
+    if (trimmed.startsWith('blob:')) return undefined;
+    if (trimmed.startsWith('media/')) {
+      const base = normalizeBaseMediaName(trimmed.slice('media/'.length));
+      return base ? `media/${base}` : undefined;
+    }
+    const clean = trimmed.split(/[?#]/)[0].replace(/\\/g, '/');
+    const mediaIdx = clean.lastIndexOf('/media/');
+    if (mediaIdx !== -1) {
+      const base = normalizeBaseMediaName(clean.slice(mediaIdx + '/media/'.length));
+      return base ? `media/${base}` : undefined;
+    }
+    const uploadsIdx = clean.lastIndexOf('/uploads/');
+    if (uploadsIdx !== -1) {
+      const base = normalizeBaseMediaName(clean.slice(uploadsIdx + '/uploads/'.length));
+      return base ? `media/${base}` : undefined;
+    }
+    if (!trimmed.includes('://') && !trimmed.startsWith('/')) {
+      const base = normalizeBaseMediaName(trimmed);
+      return base ? `media/${base}` : undefined;
+    }
+    return undefined;
+  };
+  return pickBase(explicitFileName) || pickBase(raw);
+}
+
+function dehydrateProjectForDisk(project: ProjectState): ProjectState {
+  const normalized = normalizeProjectTracks(project);
+  return {
+    ...normalized,
+    customFonts: (normalized.customFonts || []).map((f) => {
+      const rel = toPortableMediaRefForDisk(f.src, f.fileName);
+      if (!rel) return f;
+      return {
+        ...f,
+        src: rel,
+        fileName: rel,
+      };
+    }),
+    clips: normalized.clips.map((c) => {
+      const next = {...c};
+      const relMedia = toPortableMediaRefForDisk(
+        next.src || next.mediaRemoteUrl,
+        next.mediaFileName
+      );
+      if (
+        relMedia &&
+        next.kind !== 'text' &&
+        next.kind !== 'shape' &&
+        next.kind !== 'adjustment' &&
+        next.kind !== 'synth'
+      ) {
+        next.src = relMedia;
+        next.mediaFileName = relMedia;
+        if (next.mediaRemoteUrl) {
+          next.mediaRemoteUrl = toPortableMediaRefForDisk(next.mediaRemoteUrl, relMedia) || relMedia;
+        }
+      }
+      if (next.textStyle?.fontSrc) {
+        const relFont = toPortableMediaRefForDisk(next.textStyle.fontSrc);
+        if (relFont) {
+          next.textStyle = {
+            ...next.textStyle,
+            fontSrc: relFont,
+          };
+        }
+      }
+      return next;
+    }),
+  };
+}
+
+function listProjectsJsonFromDisk(): ProjectState[] {
+  const projDir = path.join(getActiveUploadsDir(), 'projects');
+  if (!fs.existsSync(projDir)) return [];
+  const items: ProjectState[] = [];
+  try {
+    const entries = fs.readdirSync(projDir, {withFileTypes: true});
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.json')) continue;
+      if (entry.name.startsWith('.')) continue;
+      try {
+        const raw = fs.readFileSync(path.join(projDir, entry.name), 'utf-8');
+        const parsed = JSON.parse(raw) as ProjectState;
+        if (parsed && typeof parsed.roomId === 'string') {
+          items.push(normalizeProjectTracks(parsed));
+        }
+      } catch {
+        // ignore malformed project file
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return items.sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+}
+
+function cleanupUnusedMediaOnDisk(): {
+  ok: boolean;
+  deletedCount: number;
+  freedBytes: number;
+  remainingCount: number;
+  remainingBytes: number;
+} {
+  const referenced = new Set<string>();
+  for (const proj of listProjectsJsonFromDisk()) {
+    collectReferencedMediaNamesFromProjectObj(proj, referenced);
+  }
+  for (const [rId, proj] of rooms.entries()) {
+    if ((roomConnections.get(rId)?.size ?? 0) > 0) {
+      collectReferencedMediaNamesFromProjectObj(proj, referenced);
+    }
+  }
+
+  let deletedCount = 0;
+  let freedBytes = 0;
+  let remainingCount = 0;
+  let remainingBytes = 0;
+
+  const cleanFlatDir = (dirPath: string, skipJson: boolean) => {
+    if (!fs.existsSync(dirPath)) return;
+    try {
+      const entries = fs.readdirSync(dirPath, {withFileTypes: true});
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        if (entry.name.startsWith('.') || entry.name.endsWith('.part')) continue;
+        if (skipJson && entry.name.toLowerCase().endsWith('.json')) continue;
+        const fullPath = path.join(dirPath, entry.name);
+        let size = 0;
+        try {
+          size = fs.statSync(fullPath).size;
+        } catch {
+          size = 0;
+        }
+        if (referenced.has(entry.name)) {
+          remainingCount += 1;
+          remainingBytes += size;
+        } else {
+          try {
+            fs.unlinkSync(fullPath);
+            deletedCount += 1;
+            freedBytes += size;
+          } catch {
+            remainingCount += 1;
+            remainingBytes += size;
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const currentDir = getActiveUploadsDir();
+  cleanFlatDir(path.join(currentDir, 'media'), false);
+  cleanFlatDir(currentDir, true);
+
+  return {
+    ok: true,
+    deletedCount,
+    freedBytes,
+    remainingCount,
+    remainingBytes,
+  };
+}
+
+app.get('/api/projects', (_req, res) => {
+  res.json({projects: listProjectsJsonFromDisk()});
+});
+
+app.get('/api/projects/:projectId', (req, res) => {
+  const safeId = sanitizeProjectId(req.params.projectId);
+  const filePath = path.join(getActiveUploadsDir(), 'projects', `${safeId}.json`);
+  if (!fs.existsSync(filePath)) {
+    res.status(404).json({found: false});
+    return;
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8')) as ProjectState;
+    res.json({found: true, project: normalizeProjectTracks(parsed)});
+  } catch {
+    res.status(500).json({found: false, error: 'Не удалось прочитать проект'});
+  }
+});
+
+app.post('/api/projects/:projectId', (req, res) => {
+  const safeId = sanitizeProjectId(req.params.projectId);
+  const body = req.body as Partial<ProjectState> | undefined;
+  if (!body || typeof body !== 'object' || !Array.isArray(body.clips)) {
+    res.status(400).json({error: 'Некорректная структура проекта'});
+    return;
+  }
+  const portable = dehydrateProjectForDisk({
+    ...body,
+    roomId: safeId,
+    updatedAt: typeof body.updatedAt === 'number' ? body.updatedAt : Date.now(),
+  } as ProjectState);
+  const projDir = getProjectsDirFor();
+  const target = path.join(projDir, `${safeId}.json`);
+  const tmp = path.join(projDir, `.${safeId}-${Date.now()}.tmp`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(portable, null, 2), 'utf-8');
+    moveFileReplaceSync(tmp, target);
+    res.json({
+      ok: true,
+      projectId: safeId,
+      relativePath: `projects/${safeId}.json`,
+    });
+  } catch (err) {
+    try {
+      if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+    } catch {
+      // ignore
+    }
+    res.status(500).json({error: err instanceof Error ? err.message : String(err)});
+  }
+});
+
+app.delete('/api/projects/:projectId', (req, res) => {
+  const safeId = sanitizeProjectId(req.params.projectId);
+  const filePath = path.join(getActiveUploadsDir(), 'projects', `${safeId}.json`);
+  let deleted = false;
+  if (fs.existsSync(filePath)) {
+    try {
+      fs.unlinkSync(filePath);
+      deleted = true;
+    } catch {
+      deleted = false;
+    }
+  }
+  res.json({ok: true, deleted});
+});
+
+app.post('/api/storage/cleanup', (_req, res) => {
+  res.json(cleanupUnusedMediaOnDisk());
+});
+
 app.post('/api/upload', upload.single('file'), (req, res) => {
   const file = req.file;
   if (!file) {
@@ -854,15 +1422,44 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     displayName = file.originalname;
   }
 
-  const fileHash = computeFileSha256(file.path);
+  const mediaDir = getMediaDirFor();
+  const fp = computeFastFileFingerprint(file.path);
+  const dedupBase = buildDedupBaseName(
+    fp.hash,
+    fp.size,
+    displayName,
+    file.mimetype
+  );
+  const destPath = path.resolve(mediaDir, dedupBase);
+  let deduplicated = false;
+  if (fs.existsSync(destPath)) {
+    try {
+      if (fs.statSync(destPath).size === fp.size) {
+        fs.unlinkSync(file.path);
+        deduplicated = true;
+      }
+    } catch {
+      // proceed to overwrite
+    }
+  }
+  if (!deduplicated) {
+    moveFileReplaceSync(file.path, destPath);
+  }
+
+  const fileHash = computeFileSha256(destPath);
+  const relPath = `media/${dedupBase}`;
 
   res.json({
+    ok: true,
     id: crypto.randomBytes(6).toString('hex'),
+    deduplicated,
     name: displayName,
     kind,
-    fileName: file.filename,
-    src: `/media/${file.filename}`,
-    sizeBytes: file.size,
+    fileName: relPath,
+    baseName: dedupBase,
+    relativePath: relPath,
+    src: `/media/${dedupBase}`,
+    sizeBytes: fp.size,
     fileHash,
   });
 });

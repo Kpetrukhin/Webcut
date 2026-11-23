@@ -117,6 +117,111 @@ class KtorLanEngine(private val context: Context) {
 
     private val registeredFiles = ConcurrentHashMap<String, File>()
     private val fileHashCache = ConcurrentHashMap<String, String>()
+    private val safSubdirCache = ConcurrentHashMap<String, Uri>()
+
+    private fun mediaSubDir(baseDir: File = mediaDir): File {
+        return File(baseDir, "media").apply { mkdirs() }
+    }
+
+    private fun projectsSubDir(baseDir: File = mediaDir): File {
+        return File(baseDir, "projects").apply { mkdirs() }
+    }
+
+    private fun sanitizeExtension(rawName: String?): String {
+        val clean = (rawName ?: "").substringBefore('?').substringBefore('#').trim()
+        val dot = clean.lastIndexOf('.')
+        if (dot >= 0 && dot < clean.length - 1) {
+            val ext = clean.substring(dot + 1)
+                .lowercase()
+                .replace(Regex("[^a-z0-9]"), "")
+                .take(10)
+            if (ext.isNotEmpty()) return ext
+        }
+        return "bin"
+    }
+
+    private fun normalizeBaseMediaName(fileNameOrRel: String): String {
+        val trimmed = fileNameOrRel.trim().replace('\\', '/').substringBefore('?')
+        val stripped = if (trimmed.startsWith("media/")) trimmed.removePrefix("media/") else trimmed
+        return File(stripped).name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+    }
+
+    private fun buildDedupBaseName(hash24: String, size: Long, rawName: String?): String {
+        val ext = sanitizeExtension(rawName)
+        return "${hash24.lowercase().take(24)}_${size.coerceAtLeast(0L)}.$ext"
+    }
+
+    private fun computeFastFileFingerprint(file: File): Pair<String, Long> {
+        val size = file.length()
+        if (size <= 0L) {
+            val emptyDigest = MessageDigest.getInstance("SHA-256").digest(ByteArray(0))
+            return emptyDigest.joinToString("") { "%02x".format(it) }.take(24) to 0L
+        }
+        val chunkBytes = 64 * 1024
+        val digest = MessageDigest.getInstance("SHA-256")
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            if (size <= (chunkBytes * 2).toLong()) {
+                val buf = ByteArray(size.toInt())
+                raf.seek(0L)
+                raf.readFully(buf)
+                digest.update(buf)
+            } else {
+                val head = ByteArray(chunkBytes)
+                raf.seek(0L)
+                raf.readFully(head)
+                digest.update(head)
+
+                val tail = ByteArray(chunkBytes)
+                raf.seek(size - chunkBytes.toLong())
+                raf.readFully(tail)
+                digest.update(tail)
+            }
+        }
+        val hex = digest.digest().joinToString("") { "%02x".format(it) }
+        return hex.take(24) to size
+    }
+
+    private fun computeFastUriFingerprint(uri: Uri): Pair<String, Long>? {
+        return try {
+            val chunkBytes = 64 * 1024
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                val size = pfd.statSize
+                if (size > 0L) {
+                    val digest = MessageDigest.getInstance("SHA-256")
+                    FileInputStream(pfd.fileDescriptor).use { fis ->
+                        val ch = fis.channel
+                        if (size <= (chunkBytes * 2).toLong()) {
+                            val bb = java.nio.ByteBuffer.allocate(size.toInt())
+                            ch.position(0L)
+                            while (bb.hasRemaining()) {
+                                if (ch.read(bb) <= 0) break
+                            }
+                            digest.update(bb.array(), 0, bb.position())
+                        } else {
+                            val headBb = java.nio.ByteBuffer.allocate(chunkBytes)
+                            ch.position(0L)
+                            while (headBb.hasRemaining()) {
+                                if (ch.read(headBb) <= 0) break
+                            }
+                            digest.update(headBb.array(), 0, headBb.position())
+
+                            val tailBb = java.nio.ByteBuffer.allocate(chunkBytes)
+                            ch.position(size - chunkBytes.toLong())
+                            while (tailBb.hasRemaining()) {
+                                if (ch.read(tailBb) <= 0) break
+                            }
+                            digest.update(tailBb.array(), 0, tailBb.position())
+                        }
+                    }
+                    val hex = digest.digest().joinToString("") { "%02x".format(it) }
+                    return hex.take(24) to size
+                }
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
+    }
 
     private fun loadConfiguredMediaDir(): File {
         val custom = storagePrefs.getString("custom_media_dir", null)?.trim()
@@ -130,18 +235,19 @@ class KtorLanEngine(private val context: Context) {
         return defaultMediaDir
     }
 
-    private fun copyMediaBetweenDirs(fromDir: File, toDir: File): Int {
-        if (fromDir.absolutePath == toDir.absolutePath) return 0
+    private fun copyFlatFiles(fromDir: File, toDir: File, registerAsMedia: Boolean): Int {
         if (!fromDir.exists() || !fromDir.isDirectory) return 0
         toDir.mkdirs()
         var count = 0
         fromDir.listFiles()?.forEach { f ->
             if (f.isFile && !f.name.endsWith(".part")) {
                 val dest = File(toDir, f.name)
-                if (!dest.exists()) {
+                if (!dest.exists() || dest.length() != f.length()) {
                     try {
-                        f.copyTo(dest, overwrite = false)
-                        registeredFiles[f.name] = dest
+                        f.copyTo(dest, overwrite = true)
+                        if (registerAsMedia) {
+                            registeredFiles[f.name] = dest
+                        }
                         count++
                     } catch (_: Throwable) {
                     }
@@ -151,23 +257,140 @@ class KtorLanEngine(private val context: Context) {
         return count
     }
 
-    private fun mirrorFileToSafIfConfigured(file: File) {
+    private fun copyMediaBetweenDirs(fromDir: File, toDir: File): Int {
+        if (fromDir.absolutePath == toDir.absolutePath) return 0
+        if (!fromDir.exists() || !fromDir.isDirectory) return 0
+        toDir.mkdirs()
+        var count = 0
+        count += copyFlatFiles(File(fromDir, "media"), File(toDir, "media"), registerAsMedia = true)
+        count += copyFlatFiles(File(fromDir, "projects"), File(toDir, "projects"), registerAsMedia = false)
+        // Legacy flat files inside root -> migrate to media/ (or projects/ if json)
+        fromDir.listFiles()?.forEach { f ->
+            if (f.isFile && !f.name.endsWith(".part")) {
+                val sub = if (f.extension.equals("json", ignoreCase = true)) "projects" else "media"
+                val destDir = File(toDir, sub).apply { mkdirs() }
+                val dest = File(destDir, f.name)
+                if (!dest.exists()) {
+                    try {
+                        f.copyTo(dest, overwrite = false)
+                        if (sub == "media") registeredFiles[f.name] = dest
+                        count++
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+        return count
+    }
+
+    private data class SafChildEntry(
+        val name: String,
+        val uri: Uri,
+        val mimeType: String,
+        val size: Long
+    )
+
+    private fun querySafChildren(treeUri: Uri, parentDocId: String): List<SafChildEntry> {
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val result = mutableListOf<SafChildEntry>()
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE
+        )
+        try {
+            context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                while (cursor.moveToNext()) {
+                    val docId = if (idIdx >= 0) cursor.getString(idIdx) else continue
+                    val name = if (nameIdx >= 0) cursor.getString(nameIdx) else continue
+                    val mime = if (mimeIdx >= 0) cursor.getString(mimeIdx) ?: "" else ""
+                    val size = if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) cursor.getLong(sizeIdx) else -1L
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                    result.add(SafChildEntry(name = name, uri = docUri, mimeType = mime, size = size))
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return result
+    }
+
+    private fun getOrCreateSafSubdir(treeUri: Uri, subName: String, createIfMissing: Boolean): Uri? {
+        val cacheKey = "${treeUri}::$subName"
+        safSubdirCache[cacheKey]?.let { cached ->
+            return cached
+        }
+        return try {
+            val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+            val existing = querySafChildren(treeUri, rootDocId).firstOrNull {
+                it.name == subName && it.mimeType == DocumentsContract.Document.MIME_TYPE_DIR
+            }
+            if (existing != null) {
+                safSubdirCache[cacheKey] = existing.uri
+                return existing.uri
+            }
+            if (!createIfMissing) return null
+            val rootDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+            val created = DocumentsContract.createDocument(
+                context.contentResolver,
+                rootDocUri,
+                DocumentsContract.Document.MIME_TYPE_DIR,
+                subName
+            )
+            if (created != null) {
+                safSubdirCache[cacheKey] = created
+            }
+            created
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun mirrorFileToSafIfConfigured(
+        file: File,
+        subFolder: String = "media",
+        overwriteExisting: Boolean = false
+    ) {
         val uriStr = safTreeUriString ?: return
         if (!file.exists() || !file.isFile) return
         try {
             val treeUri = Uri.parse(uriStr)
-            val parentDocUri = DocumentsContract.buildDocumentUriUsingTree(
-                treeUri,
-                DocumentsContract.getTreeDocumentId(treeUri)
-            )
-            val mime = contentTypeForFile(file).toString()
+            val parentUri = getOrCreateSafSubdir(treeUri, subFolder, createIfMissing = true)
+                ?: DocumentsContract.buildDocumentUriUsingTree(
+                    treeUri,
+                    DocumentsContract.getTreeDocumentId(treeUri)
+                )
+            val parentDocId = DocumentsContract.getDocumentId(parentUri)
+            val existing = querySafChildren(treeUri, parentDocId).firstOrNull { it.name == file.name }
+            if (existing != null) {
+                if (!overwriteExisting && existing.size == file.length()) {
+                    return
+                }
+                if (overwriteExisting) {
+                    try {
+                        DocumentsContract.deleteDocument(context.contentResolver, existing.uri)
+                    } catch (_: Throwable) {
+                    }
+                } else if (existing.size > 0L) {
+                    return
+                }
+            }
+            val mime = if (file.extension.equals("json", ignoreCase = true)) {
+                "application/json"
+            } else {
+                contentTypeForFile(file).toString()
+            }
             val createdUri = DocumentsContract.createDocument(
                 context.contentResolver,
-                parentDocUri,
+                parentUri,
                 mime,
                 file.name
             ) ?: return
-            context.contentResolver.openOutputStream(createdUri)?.use { out ->
+            context.contentResolver.openOutputStream(createdUri, "wt")?.use { out ->
                 FileInputStream(file).use { input ->
                     input.copyTo(out)
                 }
@@ -176,9 +399,81 @@ class KtorLanEngine(private val context: Context) {
         }
     }
 
+    private fun restoreFileFromSaf(safeName: String, subFolder: String, expectedSize: Long = -1L): File? {
+        val uriStr = safTreeUriString ?: return null
+        return try {
+            val treeUri = Uri.parse(uriStr)
+            val subUri = getOrCreateSafSubdir(treeUri, subFolder, createIfMissing = false)
+            val searchParents = listOfNotNull(
+                subUri?.let { DocumentsContract.getDocumentId(it) },
+                DocumentsContract.getTreeDocumentId(treeUri)
+            )
+            for (pid in searchParents) {
+                val match = querySafChildren(treeUri, pid).firstOrNull {
+                    it.name == safeName && it.mimeType != DocumentsContract.Document.MIME_TYPE_DIR
+                } ?: continue
+                if (expectedSize > 0L && match.size > 0L && match.size != expectedSize) {
+                    continue
+                }
+                val targetDir = if (subFolder == "projects") projectsSubDir() else mediaSubDir()
+                val dest = File(targetDir, safeName)
+                val part = File(targetDir, "$safeName.part")
+                context.contentResolver.openInputStream(match.uri)?.use { inp ->
+                    FileOutputStream(part).use { out -> inp.copyTo(out) }
+                } ?: continue
+                if (dest.exists()) dest.delete()
+                if (!part.renameTo(dest)) {
+                    part.copyTo(dest, overwrite = true)
+                    part.delete()
+                }
+                if (subFolder == "media") {
+                    registeredFiles[safeName] = dest
+                }
+                return dest
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun restoreAllProjectsFromSafIfConfigured() {
+        val uriStr = safTreeUriString ?: return
+        try {
+            val treeUri = Uri.parse(uriStr)
+            val projDirUri = getOrCreateSafSubdir(treeUri, "projects", createIfMissing = false) ?: return
+            val projDocId = DocumentsContract.getDocumentId(projDirUri)
+            val localProjDir = projectsSubDir()
+            for (child in querySafChildren(treeUri, projDocId)) {
+                if (!child.name.endsWith(".json", ignoreCase = true)) continue
+                val dest = File(localProjDir, child.name)
+                if (!dest.exists() || (child.size > 0L && dest.length() != child.size)) {
+                    try {
+                        context.contentResolver.openInputStream(child.uri)?.use { inp ->
+                            FileOutputStream(dest).use { out -> inp.copyTo(out) }
+                        }
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun listAllMediaFiles(baseDir: File = mediaDir): List<File> {
+        val mediaFolder = File(baseDir, "media")
+        val mediaFiles = if (mediaFolder.exists() && mediaFolder.isDirectory) {
+            mediaFolder.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") } ?: emptyList()
+        } else emptyList()
+        val legacyRootFiles = baseDir.listFiles()?.filter {
+            it.isFile && !it.name.endsWith(".part") && !it.extension.equals("json", ignoreCase = true)
+        } ?: emptyList()
+        return mediaFiles + legacyRootFiles
+    }
+
     fun getStorageConfigJson(): JSONObject {
         val active = mediaDir
-        val files = active.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") } ?: emptyList()
+        val files = listAllMediaFiles(active)
         val totalBytes = files.sumOf { it.length() }
         val isSaf = !safTreeUriString.isNullOrBlank()
         val isDefault = !isSaf && active.absolutePath == defaultMediaDir.absolutePath
@@ -228,6 +523,7 @@ class KtorLanEngine(private val context: Context) {
         mediaDir = target
         safTreeUriString = null
         safDisplayName = null
+        safSubdirCache.clear()
         val isDefault = target.absolutePath == defaultMediaDir.absolutePath
         storagePrefs.edit().apply {
             if (isDefault) remove("custom_media_dir") else putString("custom_media_dir", target.absolutePath)
@@ -253,19 +549,25 @@ class KtorLanEngine(private val context: Context) {
         val display = docId.substringAfter(':').ifEmpty { docId }
         safTreeUriString = treeUri.toString()
         safDisplayName = display
+        safSubdirCache.clear()
         storagePrefs.edit()
             .putString("saf_tree_uri", treeUri.toString())
             .putString("saf_display_name", display)
             .apply()
         var migrated = 0
         if (migrateExisting) {
-            mediaDir.listFiles()?.forEach { f ->
-                if (f.isFile && !f.name.endsWith(".part")) {
-                    mirrorFileToSafIfConfigured(f)
+            listAllMediaFiles(mediaDir).forEach { f ->
+                mirrorFileToSafIfConfigured(f, subFolder = "media", overwriteExisting = false)
+                migrated++
+            }
+            projectsSubDir().listFiles()?.forEach { pf ->
+                if (pf.isFile && pf.extension.equals("json", ignoreCase = true)) {
+                    mirrorFileToSafIfConfigured(pf, subFolder = "projects", overwriteExisting = true)
                     migrated++
                 }
             }
         }
+        restoreAllProjectsFromSafIfConfigured()
         return getStorageConfigJson() to migrated
     }
 
@@ -274,6 +576,7 @@ class KtorLanEngine(private val context: Context) {
         mediaDir = defaultMediaDir.apply { mkdirs() }
         safTreeUriString = null
         safDisplayName = null
+        safSubdirCache.clear()
         storagePrefs.edit()
             .remove("custom_media_dir")
             .remove("saf_tree_uri")
@@ -422,12 +725,24 @@ class KtorLanEngine(private val context: Context) {
         }
     }
 
+    private fun findMediaFileByBaseName(safeName: String, allowSafRestore: Boolean = true): File? {
+        if (safeName.isBlank()) return null
+        registeredFiles[safeName]?.takeIf { it.exists() && it.isFile }?.let { return it }
+        File(File(mediaDir, "media"), safeName).takeIf { it.exists() && it.isFile }?.let { return it }
+        File(mediaDir, safeName).takeIf { it.exists() && it.isFile }?.let { return it }
+        File(File(defaultMediaDir, "media"), safeName).takeIf { it.exists() && it.isFile }?.let { return it }
+        File(defaultMediaDir, safeName).takeIf { it.exists() && it.isFile }?.let { return it }
+        File(File(legacyCacheDir, "media"), safeName).takeIf { it.exists() && it.isFile }?.let { return it }
+        File(legacyCacheDir, safeName).takeIf { it.exists() && it.isFile }?.let { return it }
+        if (allowSafRestore && !safTreeUriString.isNullOrBlank()) {
+            return restoreFileFromSaf(safeName, "media")
+        }
+        return null
+    }
+
     fun getCachedFileMetadata(fileName: String): Pair<Long, String> {
-        val safe = File(fileName).name
-        val target = registeredFiles[safe]
-            ?: File(mediaDir, safe).takeIf { it.exists() }
-            ?: File(defaultMediaDir, safe).takeIf { it.exists() }
-            ?: File(legacyCacheDir, safe)
+        val safe = normalizeBaseMediaName(fileName)
+        val target = findMediaFileByBaseName(safe, allowSafRestore = false) ?: return 0L to ""
         if (!target.exists()) return 0L to ""
         return target.length() to computeFileSha256(target)
     }
@@ -475,24 +790,24 @@ class KtorLanEngine(private val context: Context) {
 
     fun resolveCachedMediaFile(sourceUrl: String?, fileName: String? = null): File? {
         if (!fileName.isNullOrEmpty()) {
-            val safe = File(fileName).name
-            registeredFiles[safe]?.takeIf { it.exists() }?.let { return it }
-            File(mediaDir, safe).takeIf { it.exists() }?.let { return it }
-            File(defaultMediaDir, safe).takeIf { it.exists() }?.let { return it }
-            File(legacyCacheDir, safe).takeIf { it.exists() }?.let { return it }
+            val safe = normalizeBaseMediaName(fileName)
+            findMediaFileByBaseName(safe)?.let { return it }
         }
-        if (!sourceUrl.isNullOrEmpty() && sourceUrl.contains("/media/")) {
-            val rawPart = sourceUrl.substringAfterLast("/media/").substringBefore("?")
-            val decoded = try {
-                java.net.URLDecoder.decode(rawPart, "UTF-8")
-            } catch (_: Throwable) {
-                rawPart
+        if (!sourceUrl.isNullOrEmpty()) {
+            val trimmed = sourceUrl.trim().replace('\\', '/')
+            if (trimmed.contains("/media/")) {
+                val rawPart = trimmed.substringAfterLast("/media/").substringBefore("?")
+                val decoded = try {
+                    java.net.URLDecoder.decode(rawPart, "UTF-8")
+                } catch (_: Throwable) {
+                    rawPart
+                }
+                val safe = normalizeBaseMediaName(decoded)
+                findMediaFileByBaseName(safe)?.let { return it }
+            } else if (trimmed.startsWith("media/")) {
+                val safe = normalizeBaseMediaName(trimmed)
+                findMediaFileByBaseName(safe)?.let { return it }
             }
-            val safe = File(decoded).name
-            registeredFiles[safe]?.takeIf { it.exists() }?.let { return it }
-            File(mediaDir, safe).takeIf { it.exists() }?.let { return it }
-            File(defaultMediaDir, safe).takeIf { it.exists() }?.let { return it }
-            File(legacyCacheDir, safe).takeIf { it.exists() }?.let { return it }
         }
         return null
     }
@@ -577,17 +892,15 @@ class KtorLanEngine(private val context: Context) {
                     call.respondText(resp.toString(), ContentType.Application.Json)
                 }
 
-                get("/media/{fileName}") {
+                suspend fun serveMediaByRawName(call: ApplicationCall, rawName: String) {
                     applyCors(call)
-                    val rawName = call.parameters["fileName"] ?: ""
-                    val safeName = File(rawName).name
-                    val file = registeredFiles[safeName]?.takeIf { it.exists() }
-                        ?: File(mediaDir, safeName).takeIf { it.exists() }
-                        ?: File(defaultMediaDir, safeName).takeIf { it.exists() }
-                        ?: File(legacyCacheDir, safeName)
-                    if (!file.exists() || !file.isFile) {
+                    val safeName = normalizeBaseMediaName(rawName)
+                    val file = withContext(Dispatchers.IO) {
+                        findMediaFileByBaseName(safeName)
+                    }
+                    if (file == null || !file.exists() || !file.isFile) {
                         call.respond(HttpStatusCode.NotFound, "Media not found")
-                        return@get
+                        return
                     }
                     val sha = computeFileSha256(file)
                     call.response.header(HttpHeaders.AcceptRanges, "bytes")
@@ -599,30 +912,62 @@ class KtorLanEngine(private val context: Context) {
                     call.respondFile(file)
                 }
 
+                get("/media/{fileName}") {
+                    serveMediaByRawName(call, call.parameters["fileName"] ?: "")
+                }
+
+                get("/media/media/{fileName}") {
+                    serveMediaByRawName(call, call.parameters["fileName"] ?: "")
+                }
+
                 post("/media/upload") {
                     applyCors(call)
                     val rawName = call.request.queryParameters["fileName"]
                         ?: "clip-${System.currentTimeMillis()}.bin"
-                    val safeName = File(rawName).name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                    val activeDir = mediaDir.apply { mkdirs() }
-                    val destFile = File(activeDir, safeName)
+                    val activeMediaDir = mediaSubDir()
+                    val tempFile = File(activeMediaDir, ".upload-${System.nanoTime()}.part")
                     val channel: ByteReadChannel = call.receiveChannel()
+                    var deduplicated = false
+                    var baseName = ""
+                    var destFile: File = tempFile
                     withContext(Dispatchers.IO) {
-                        FileOutputStream(destFile).use { fos ->
-                            channel.copyTo(fos)
+                        try {
+                            FileOutputStream(tempFile).use { fos ->
+                                channel.copyTo(fos)
+                            }
+                            val (fastHash, size) = computeFastFileFingerprint(tempFile)
+                            baseName = buildDedupBaseName(fastHash, size, rawName)
+                            destFile = File(activeMediaDir, baseName)
+                            if (destFile.exists() && destFile.isFile && destFile.length() == size) {
+                                tempFile.delete()
+                                deduplicated = true
+                            } else {
+                                if (destFile.exists()) destFile.delete()
+                                if (!tempFile.renameTo(destFile)) {
+                                    tempFile.copyTo(destFile, overwrite = true)
+                                    tempFile.delete()
+                                }
+                                mirrorFileToSafIfConfigured(destFile, subFolder = "media", overwriteExisting = false)
+                            }
+                        } catch (err: Throwable) {
+                            if (tempFile.exists()) tempFile.delete()
+                            throw err
                         }
-                        mirrorFileToSafIfConfigured(destFile)
                     }
-                    registeredFiles[safeName] = destFile
+                    registeredFiles[baseName] = destFile
                     val sha = computeFileSha256(destFile)
                     val bestIp = getPrimaryIp()
+                    val relPath = "media/$baseName"
                     val resp = JSONObject().apply {
                         put("ok", true)
-                        put("fileName", safeName)
+                        put("deduplicated", deduplicated)
+                        put("fileName", relPath)
+                        put("baseName", baseName)
+                        put("relativePath", relPath)
                         put("fileSize", destFile.length())
                         if (sha.isNotEmpty()) put("fileHash", sha)
-                        put("localUrl", "http://127.0.0.1:$serverPort/media/$safeName")
-                        put("shareUrl", "http://$bestIp:$serverPort/media/$safeName")
+                        put("localUrl", "http://127.0.0.1:$serverPort/media/$baseName")
+                        put("shareUrl", "http://$bestIp:$serverPort/media/$baseName")
                     }
                     call.respondText(resp.toString(), ContentType.Application.Json)
                 }
@@ -1444,6 +1789,282 @@ class KtorLanEngine(private val context: Context) {
         if (!isHostingRoom) releaseMulticastLock()
     }
 
+    fun checkMediaExists(fileName: String, expectedSize: Long = -1L): JSONObject {
+        val safeName = normalizeBaseMediaName(fileName)
+        val existing = findMediaFileByBaseName(safeName, allowSafRestore = true)
+        if (existing != null && existing.exists() && existing.isFile &&
+            (expectedSize <= 0L || existing.length() == expectedSize)
+        ) {
+            ensureMediaServerStarted()
+            val sha = computeFileSha256(existing)
+            val bestIp = getPrimaryIp()
+            val relPath = "media/$safeName"
+            return JSONObject().apply {
+                put("exists", true)
+                put("fileName", relPath)
+                put("baseName", safeName)
+                put("relativePath", relPath)
+                put("fileSize", existing.length())
+                if (sha.isNotEmpty()) put("fileHash", sha)
+                put("localUrl", "http://127.0.0.1:$serverPort/media/$safeName")
+                put("shareUrl", "http://$bestIp:$serverPort/media/$safeName")
+            }
+        }
+        return JSONObject().apply { put("exists", false) }
+    }
+
+    fun importMediaFromUri(uri: Uri, rawFileName: String? = null): JSONObject {
+        val activeMediaDir = mediaSubDir()
+        val displayName = rawFileName?.takeIf { it.isNotBlank() } ?: uri.lastPathSegment ?: "media.bin"
+        val fastFp = computeFastUriFingerprint(uri)
+        var deduplicated = false
+        val baseName: String
+        val destFile: File
+        if (fastFp != null) {
+            baseName = buildDedupBaseName(fastFp.first, fastFp.second, displayName)
+            val existing = findMediaFileByBaseName(baseName, allowSafRestore = true)
+            if (existing != null && existing.exists() && existing.length() == fastFp.second) {
+                deduplicated = true
+                destFile = existing
+            } else {
+                val target = File(activeMediaDir, baseName)
+                val part = File(activeMediaDir, ".import-${System.nanoTime()}.part")
+                context.contentResolver.openInputStream(uri)?.use { inp ->
+                    FileOutputStream(part).use { out -> inp.copyTo(out) }
+                } ?: throw IllegalStateException("Не удалось прочитать URI: $uri")
+                if (target.exists()) target.delete()
+                if (!part.renameTo(target)) {
+                    part.copyTo(target, overwrite = true)
+                    part.delete()
+                }
+                mirrorFileToSafIfConfigured(target, subFolder = "media", overwriteExisting = false)
+                destFile = target
+            }
+        } else {
+            val part = File(activeMediaDir, ".import-${System.nanoTime()}.part")
+            context.contentResolver.openInputStream(uri)?.use { inp ->
+                FileOutputStream(part).use { out -> inp.copyTo(out) }
+            } ?: throw IllegalStateException("Не удалось прочитать URI: $uri")
+            val (hash24, size) = computeFastFileFingerprint(part)
+            baseName = buildDedupBaseName(hash24, size, displayName)
+            val existing = findMediaFileByBaseName(baseName, allowSafRestore = true)
+            if (existing != null && existing.exists() && existing.length() == size) {
+                part.delete()
+                deduplicated = true
+                destFile = existing
+            } else {
+                val target = File(activeMediaDir, baseName)
+                if (target.exists()) target.delete()
+                if (!part.renameTo(target)) {
+                    part.copyTo(target, overwrite = true)
+                    part.delete()
+                }
+                mirrorFileToSafIfConfigured(target, subFolder = "media", overwriteExisting = false)
+                destFile = target
+            }
+        }
+
+        registeredFiles[baseName] = destFile
+        ensureMediaServerStarted()
+        val sha = computeFileSha256(destFile)
+        val bestIp = getPrimaryIp()
+        val relPath = "media/$baseName"
+        return JSONObject().apply {
+            put("ok", true)
+            put("deduplicated", deduplicated)
+            put("fileName", relPath)
+            put("baseName", baseName)
+            put("relativePath", relPath)
+            put("fileSize", destFile.length())
+            if (sha.isNotEmpty()) put("fileHash", sha)
+            put("localUrl", "http://127.0.0.1:$serverPort/media/$baseName")
+            put("shareUrl", "http://$bestIp:$serverPort/media/$baseName")
+        }
+    }
+
+    private fun sanitizeProjectId(rawId: String): String {
+        val cleaned = rawId.trim().replace(Regex("[^a-zA-Z0-9_-]"), "").take(64)
+        return cleaned.ifEmpty { "studio-demo" }
+    }
+
+    fun saveProjectJson(projectId: String, projectJson: String): JSONObject {
+        val safeId = sanitizeProjectId(projectId)
+        val projDir = projectsSubDir()
+        val target = File(projDir, "$safeId.json")
+        val tmp = File(projDir, ".$safeId-${System.nanoTime()}.tmp")
+        tmp.writeText(projectJson, Charsets.UTF_8)
+        if (!tmp.renameTo(target)) {
+            tmp.copyTo(target, overwrite = true)
+            tmp.delete()
+        }
+        mirrorFileToSafIfConfigured(target, subFolder = "projects", overwriteExisting = true)
+        return JSONObject().apply {
+            put("ok", true)
+            put("projectId", safeId)
+            put("relativePath", "projects/$safeId.json")
+        }
+    }
+
+    fun listProjectsJson(): JSONArray {
+        restoreAllProjectsFromSafIfConfigured()
+        val projDir = projectsSubDir()
+        val list = mutableListOf<Pair<Long, JSONObject>>()
+        projDir.listFiles()?.forEach { file ->
+            if (!file.isFile || !file.extension.equals("json", ignoreCase = true)) return@forEach
+            if (file.name.startsWith(".")) return@forEach
+            try {
+                val obj = JSONObject(file.readText(Charsets.UTF_8))
+                val updatedAt = obj.optLong("updatedAt", file.lastModified())
+                list.add(updatedAt to obj)
+            } catch (_: Throwable) {
+            }
+        }
+        list.sortByDescending { it.first }
+        return JSONArray().apply {
+            list.forEach { put(it.second) }
+        }
+    }
+
+    fun loadProjectJson(projectId: String): JSONObject? {
+        val safeId = sanitizeProjectId(projectId)
+        var file = File(projectsSubDir(), "$safeId.json")
+        if (!file.exists()) {
+            file = restoreFileFromSaf("$safeId.json", "projects") ?: file
+        }
+        if (!file.exists() || !file.isFile) return null
+        return try {
+            JSONObject(file.readText(Charsets.UTF_8))
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun deleteProjectJson(projectId: String): Boolean {
+        val safeId = sanitizeProjectId(projectId)
+        val file = File(projectsSubDir(), "$safeId.json")
+        val deletedLocal = if (file.exists()) file.delete() else false
+        val uriStr = safTreeUriString
+        if (!uriStr.isNullOrBlank()) {
+            try {
+                val treeUri = Uri.parse(uriStr)
+                getOrCreateSafSubdir(treeUri, "projects", createIfMissing = false)?.let { subUri ->
+                    val pid = DocumentsContract.getDocumentId(subUri)
+                    querySafChildren(treeUri, pid).firstOrNull { it.name == "$safeId.json" }?.let {
+                        DocumentsContract.deleteDocument(context.contentResolver, it.uri)
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+        return deletedLocal
+    }
+
+    private fun collectReferencedMediaNamesFromProjectJson(obj: JSONObject, outNames: MutableSet<String>) {
+        fun addRef(raw: String?) {
+            if (raw.isNullOrBlank()) return
+            val trimmed = raw.trim().replace('\\', '/')
+            if (trimmed.startsWith("synth:") || trimmed.startsWith("data:") || trimmed.startsWith("/src/") || trimmed.startsWith("/assets/")) {
+                return
+            }
+            if (trimmed.startsWith("media/") || trimmed.contains("/media/") || trimmed.contains("/uploads/") || !trimmed.contains("/")) {
+                val base = normalizeBaseMediaName(trimmed)
+                if (base.isNotEmpty()) outNames.add(base)
+            }
+        }
+
+        val clips = obj.optJSONArray("clips")
+        if (clips != null) {
+            for (i in 0 until clips.length()) {
+                val c = clips.optJSONObject(i) ?: continue
+                addRef(c.optString("src", ""))
+                addRef(c.optString("mediaFileName", ""))
+                addRef(c.optString("mediaRemoteUrl", ""))
+                c.optJSONObject("textStyle")?.let { ts ->
+                    addRef(ts.optString("fontSrc", ""))
+                }
+            }
+        }
+
+        val fonts = obj.optJSONArray("customFonts")
+        if (fonts != null) {
+            for (i in 0 until fonts.length()) {
+                val f = fonts.optJSONObject(i) ?: continue
+                addRef(f.optString("src", ""))
+                addRef(f.optString("fileName", ""))
+            }
+        }
+    }
+
+    fun cleanupUnusedMedia(): JSONObject {
+        restoreAllProjectsFromSafIfConfigured()
+        val referenced = HashSet<String>()
+        projectsSubDir().listFiles()?.forEach { f ->
+            if (f.isFile && f.extension.equals("json", ignoreCase = true) && !f.name.startsWith(".")) {
+                try {
+                    collectReferencedMediaNamesFromProjectJson(JSONObject(f.readText(Charsets.UTF_8)), referenced)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        // Also protect currently open host room clips if hosting
+        collectReferencedMediaNamesFromProjectJson(hostRoomState, referenced)
+
+        var deletedCount = 0
+        var freedBytes = 0L
+        var remainingCount = 0
+        var remainingBytes = 0L
+
+        for (file in listAllMediaFiles(mediaDir)) {
+            if (referenced.contains(file.name)) {
+                remainingCount++
+                remainingBytes += file.length()
+            } else {
+                val len = file.length()
+                if (file.delete()) {
+                    registeredFiles.remove(file.name)
+                    deletedCount++
+                    freedBytes += len
+                } else {
+                    remainingCount++
+                    remainingBytes += len
+                }
+            }
+        }
+
+        val uriStr = safTreeUriString
+        if (!uriStr.isNullOrBlank()) {
+            try {
+                val treeUri = Uri.parse(uriStr)
+                getOrCreateSafSubdir(treeUri, "media", createIfMissing = false)?.let { subUri ->
+                    val pid = DocumentsContract.getDocumentId(subUri)
+                    for (child in querySafChildren(treeUri, pid)) {
+                        if (child.mimeType == DocumentsContract.Document.MIME_TYPE_DIR) continue
+                        if (!referenced.contains(child.name)) {
+                            try {
+                                if (DocumentsContract.deleteDocument(context.contentResolver, child.uri)) {
+                                    // Local count already accounts for local media files
+                                    if (freedBytes == 0L && child.size > 0L) {
+                                        freedBytes += child.size
+                                    }
+                                }
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        return JSONObject().apply {
+            put("ok", true)
+            put("deletedCount", deletedCount)
+            put("freedBytes", freedBytes)
+            put("remainingCount", remainingCount)
+            put("remainingBytes", remainingBytes)
+        }
+    }
+
     fun downloadMediaToCache(
         layerId: String,
         remoteUrl: String,
@@ -1454,15 +2075,31 @@ class KtorLanEngine(private val context: Context) {
         maxRetries: Int = 3
     ) {
         scope.launch {
-            val safeName = File(fileName).name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-            val targetFile = File(mediaDir, safeName)
-            val tempFile = File(mediaDir, "$safeName.part")
+            val safeName = normalizeBaseMediaName(fileName)
+            val activeMediaDir = mediaSubDir()
+            val existingCached = findMediaFileByBaseName(safeName, allowSafRestore = true)
+            if (existingCached != null && existingCached.exists() &&
+                expectedSize > 0L && existingCached.length() == expectedSize
+            ) {
+                val hashOk = expectedHash.isNullOrBlank() ||
+                    computeFileSha256(existingCached).equals(expectedHash, ignoreCase = true)
+                if (hashOk) {
+                    registeredFiles[safeName] = existingCached
+                    ensureMediaServerStarted()
+                    val localUrl = "http://127.0.0.1:$serverPort/media/$safeName"
+                    onDownloadProgress?.invoke(layerId, 100)
+                    onDownloadComplete?.invoke(layerId, "media/$safeName", localUrl)
+                    return@launch
+                }
+            }
+
+            val tempFile = File(activeMediaDir, "$safeName.part")
             val candidates = listOfNotNull(
                 remoteUrl.takeIf { it.isNotBlank() },
                 fallbackUrl?.takeIf { it.isNotBlank() && it != remoteUrl }
             )
             val totalAttempts = maxRetries.coerceIn(1, 5)
-            var lastError: String = "Download failed"
+            var lastError = "Download failed"
 
             for (attempt in 1..totalAttempts) {
                 val attemptUrl = candidates.getOrElse((attempt - 1) % candidates.size.coerceAtLeast(1)) { remoteUrl }
@@ -1522,20 +2159,29 @@ class KtorLanEngine(private val context: Context) {
                         throw IllegalStateException("Контрольная сумма сервера SHA-256 не совпала")
                     }
 
-                    val activeDir = mediaDir.apply { mkdirs() }
-                    val destTargetFile = File(activeDir, safeName)
-                    if (destTargetFile.exists()) destTargetFile.delete()
-                    if (!tempFile.renameTo(destTargetFile)) {
-                        tempFile.copyTo(destTargetFile, overwrite = true)
-                        tempFile.delete()
+                    val (fastHash, size) = computeFastFileFingerprint(tempFile)
+                    val dedupName = if (Regex("^[a-f0-9]{24}_\\d+\\.[a-z0-9]+$").matches(safeName)) {
+                        safeName
+                    } else {
+                        buildDedupBaseName(fastHash, size, safeName)
                     }
-                    mirrorFileToSafIfConfigured(destTargetFile)
-                    registeredFiles[safeName] = destTargetFile
+                    val destTargetFile = File(mediaSubDir(), dedupName)
+                    if (destTargetFile.exists() && destTargetFile.length() == size) {
+                        tempFile.delete()
+                    } else {
+                        if (destTargetFile.exists()) destTargetFile.delete()
+                        if (!tempFile.renameTo(destTargetFile)) {
+                            tempFile.copyTo(destTargetFile, overwrite = true)
+                            tempFile.delete()
+                        }
+                        mirrorFileToSafIfConfigured(destTargetFile, subFolder = "media", overwriteExisting = false)
+                    }
+                    registeredFiles[dedupName] = destTargetFile
                     fileHashCache["${destTargetFile.name}:${destTargetFile.length()}:${destTargetFile.lastModified()}"] = actualHash
                     ensureMediaServerStarted()
 
-                    val localUrl = "http://127.0.0.1:$serverPort/media/$safeName"
-                    onDownloadComplete?.invoke(layerId, safeName, localUrl)
+                    val localUrl = "http://127.0.0.1:$serverPort/media/$dedupName"
+                    onDownloadComplete?.invoke(layerId, "media/$dedupName", localUrl)
                     return@launch
                 } catch (err: Throwable) {
                     if (tempFile.exists()) tempFile.delete()
@@ -1559,27 +2205,10 @@ class KtorLanEngine(private val context: Context) {
     ) {
         scope.launch {
             try {
-                var inputFile: File? = null
-                val candidateFromName = File(fileName).name
-                if (candidateFromName.isNotEmpty()) {
-                    val reg = registeredFiles[candidateFromName]
-                    val cached = File(mediaDir, candidateFromName)
-                    if (reg != null && reg.exists()) inputFile = reg
-                    else if (cached.exists()) inputFile = cached
-                }
-                if (inputFile == null && sourceUrl.contains("/media/")) {
-                    val rawPart = sourceUrl.substringAfterLast("/media/").substringBefore("?")
-                    val decoded = java.net.URLDecoder.decode(rawPart, "UTF-8")
-                    val safe = File(decoded).name
-                    val reg = registeredFiles[safe]
-                    val cached = File(mediaDir, safe)
-                    if (reg != null && reg.exists()) inputFile = reg
-                    else if (cached.exists()) inputFile = cached
-                }
-
+                var inputFile: File? = resolveCachedMediaFile(sourceUrl, fileName)
                 if (inputFile == null && (sourceUrl.startsWith("http://") || sourceUrl.startsWith("https://"))) {
-                    val safeSrc = "src-${System.currentTimeMillis()}.mp4"
-                    val dlFile = File(mediaDir, safeSrc)
+                    val safeSrc = ".cmp-src-${System.nanoTime()}.mp4"
+                    val dlFile = File(mediaSubDir(), safeSrc)
                     httpClient.prepareGet(sourceUrl).execute { response ->
                         val channel = response.bodyAsChannel()
                         FileOutputStream(dlFile).use { fos ->
@@ -1601,12 +2230,8 @@ class KtorLanEngine(private val context: Context) {
                 }
                 val originalSizeBytes = inputFile?.length() ?: 0L
 
-                val baseName = File(fileName.ifEmpty { "clip" }).nameWithoutExtension
-                    .replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                    .ifEmpty { "clip" }
-                val outName = "cmp-${System.currentTimeMillis()}-$baseName.mp4"
-                val outFile = File(mediaDir, outName)
-                if (outFile.exists()) outFile.delete()
+                val outTempFile = File(mediaSubDir(), ".cmp-out-${System.nanoTime()}.mp4")
+                if (outTempFile.exists()) outTempFile.delete()
 
                 mainHandler.post {
                     try {
@@ -1645,21 +2270,36 @@ class KtorLanEngine(private val context: Context) {
                                     if (activeTransformers[layerId] === transformerRef) {
                                         activeTransformers.remove(layerId)
                                     }
-                                    registeredFiles[outName] = outFile
-                                    ensureMediaServerStarted()
-                                    val bestIp = getPrimaryIp()
-                                    val localUrl = "http://127.0.0.1:$serverPort/media/$outName"
-                                    val shareUrl = "http://$bestIp:$serverPort/media/$outName"
-                                    val compressedSize = outFile.length()
-                                    onCompressProgress?.invoke(layerId, 100)
-                                    onCompressComplete?.invoke(
-                                        layerId,
-                                        outName,
-                                        localUrl,
-                                        shareUrl,
-                                        originalSizeBytes,
-                                        compressedSize
-                                    )
+                                    scope.launch {
+                                        val (fastHash, size) = computeFastFileFingerprint(outTempFile)
+                                        val dedupName = buildDedupBaseName(fastHash, size, "compressed.mp4")
+                                        val finalFile = File(mediaSubDir(), dedupName)
+                                        if (finalFile.exists() && finalFile.length() == size) {
+                                            outTempFile.delete()
+                                        } else {
+                                            if (finalFile.exists()) finalFile.delete()
+                                            if (!outTempFile.renameTo(finalFile)) {
+                                                outTempFile.copyTo(finalFile, overwrite = true)
+                                                outTempFile.delete()
+                                            }
+                                            mirrorFileToSafIfConfigured(finalFile, subFolder = "media", overwriteExisting = false)
+                                        }
+                                        registeredFiles[dedupName] = finalFile
+                                        ensureMediaServerStarted()
+                                        val bestIp = getPrimaryIp()
+                                        val localUrl = "http://127.0.0.1:$serverPort/media/$dedupName"
+                                        val shareUrl = "http://$bestIp:$serverPort/media/$dedupName"
+                                        val compressedSize = finalFile.length()
+                                        onCompressProgress?.invoke(layerId, 100)
+                                        onCompressComplete?.invoke(
+                                            layerId,
+                                            "media/$dedupName",
+                                            localUrl,
+                                            shareUrl,
+                                            originalSizeBytes,
+                                            compressedSize
+                                        )
+                                    }
                                 }
 
                                 override fun onError(
@@ -1670,7 +2310,7 @@ class KtorLanEngine(private val context: Context) {
                                     if (activeTransformers[layerId] === transformerRef) {
                                         activeTransformers.remove(layerId)
                                     }
-                                    if (outFile.exists()) outFile.delete()
+                                    if (outTempFile.exists()) outTempFile.delete()
                                     onCompressError?.invoke(
                                         layerId,
                                         exportException.message ?: "Media3 Transformer error (${exportException.errorCode})"
@@ -1681,7 +2321,7 @@ class KtorLanEngine(private val context: Context) {
 
                         transformerRef = transformer
                         activeTransformers[layerId] = transformer
-                        transformer.start(editedMediaItem, outFile.absolutePath)
+                        transformer.start(editedMediaItem, outTempFile.absolutePath)
 
                         val progressHolder = ProgressHolder()
                         val poller = object : Runnable {
@@ -1717,8 +2357,8 @@ class KtorLanEngine(private val context: Context) {
     }
 
     /**
-     * Extracts the audio track from a video file into an M4A/AAC file inside mediaDir
-     * using MediaExtractor + MediaMuxer and returns local/share URLs plus durationSec.
+     * Extracts the audio track from a video file into an M4A/AAC file inside mediaDir/media
+     * using MediaExtractor + MediaMuxer and returns deduplicated relative path, localUrl, and durationSec.
      */
     suspend fun extractAudioFromVideo(
         sourceUrl: String,
@@ -1726,25 +2366,10 @@ class KtorLanEngine(private val context: Context) {
         trimStartMs: Long = 0L,
         durationMs: Long = -1L
     ): Triple<String, String, Double> = withContext(Dispatchers.IO) {
-        var inputFile: File? = null
-        val candidate = File(fileName).name
-        if (candidate.isNotEmpty()) {
-            val reg = registeredFiles[candidate]
-            val cached = File(mediaDir, candidate)
-            if (reg != null && reg.exists()) inputFile = reg
-            else if (cached.exists()) inputFile = cached
-        }
-        if (inputFile == null && sourceUrl.contains("/media/")) {
-            val rawPart = sourceUrl.substringAfterLast("/media/").substringBefore("?")
-            val decoded = java.net.URLDecoder.decode(rawPart, "UTF-8")
-            val safe = File(decoded).name
-            val reg = registeredFiles[safe]
-            val cached = File(mediaDir, safe)
-            if (reg != null && reg.exists()) inputFile = reg
-            else if (cached.exists()) inputFile = cached
-        }
+        var inputFile: File? = resolveCachedMediaFile(sourceUrl, fileName)
+        var tempDownloadedSrc: File? = null
         if (inputFile == null && (sourceUrl.startsWith("http://") || sourceUrl.startsWith("https://"))) {
-            val tmpSrc = File(mediaDir, "ext-src-${System.currentTimeMillis()}.mp4")
+            val tmpSrc = File(mediaSubDir(), ".ext-src-${System.nanoTime()}.mp4")
             httpClient.prepareGet(sourceUrl).execute { response ->
                 val channel = response.bodyAsChannel()
                 FileOutputStream(tmpSrc).use { fos ->
@@ -1757,9 +2382,11 @@ class KtorLanEngine(private val context: Context) {
                 }
             }
             inputFile = tmpSrc
+            tempDownloadedSrc = tmpSrc
         }
 
         val extractor = MediaExtractor()
+        val tempOutFile = File(mediaSubDir(), ".ext-out-${System.nanoTime()}.m4a")
         try {
             if (inputFile != null && inputFile.exists()) {
                 extractor.setDataSource(inputFile.absolutePath)
@@ -1782,12 +2409,7 @@ class KtorLanEngine(private val context: Context) {
                 throw IllegalStateException("В этом видео нет звуковой дорожки")
             }
 
-            val base = File(fileName.ifEmpty { "audio" }).nameWithoutExtension
-                .replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                .ifEmpty { "audio" }
-            val outName = "ext-${System.currentTimeMillis()}-$base.m4a"
-            val outFile = File(mediaDir, outName)
-            if (outFile.exists()) outFile.delete()
+            if (tempOutFile.exists()) tempOutFile.delete()
 
             extractor.selectTrack(audioTrackIdx)
             val startUs = (trimStartMs * 1000L).coerceAtLeast(0L)
@@ -1796,7 +2418,7 @@ class KtorLanEngine(private val context: Context) {
             }
             val endUs = if (durationMs > 0L) startUs + durationMs * 1000L else Long.MAX_VALUE
 
-            val muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val muxer = MediaMuxer(tempOutFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             val muxTrackIdx = muxer.addTrack(audioFormat)
             muxer.start()
 
@@ -1828,7 +2450,7 @@ class KtorLanEngine(private val context: Context) {
             val retriever = MediaMetadataRetriever()
             var measuredDurSec = 0.0
             try {
-                retriever.setDataSource(outFile.absolutePath)
+                retriever.setDataSource(tempOutFile.absolutePath)
                 val durStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                 measuredDurSec = (durStr?.toLongOrNull() ?: 0L) / 1000.0
             } catch (_: Throwable) {
@@ -1839,12 +2461,31 @@ class KtorLanEngine(private val context: Context) {
                 }
             }
 
-            registeredFiles[outName] = outFile
+            val (fastHash, size) = computeFastFileFingerprint(tempOutFile)
+            val dedupName = buildDedupBaseName(fastHash, size, "extracted.m4a")
+            val finalFile = File(mediaSubDir(), dedupName)
+            if (finalFile.exists() && finalFile.length() == size) {
+                tempOutFile.delete()
+            } else {
+                if (finalFile.exists()) finalFile.delete()
+                if (!tempOutFile.renameTo(finalFile)) {
+                    tempOutFile.copyTo(finalFile, overwrite = true)
+                    tempOutFile.delete()
+                }
+                mirrorFileToSafIfConfigured(finalFile, subFolder = "media", overwriteExisting = false)
+            }
+
+            registeredFiles[dedupName] = finalFile
             ensureMediaServerStarted()
-            val localUrl = "http://127.0.0.1:$serverPort/media/$outName"
-            val shareUrl = "http://${getPrimaryIp()}:$serverPort/media/$outName"
-            Triple(outName, localUrl, if (measuredDurSec > 0) measuredDurSec else 5.0)
+            val localUrl = "http://127.0.0.1:$serverPort/media/$dedupName"
+            Triple("media/$dedupName", localUrl, if (measuredDurSec > 0) measuredDurSec else 5.0)
         } finally {
+            if (tempDownloadedSrc != null && tempDownloadedSrc.exists()) {
+                tempDownloadedSrc.delete()
+            }
+            if (tempOutFile.exists()) {
+                tempOutFile.delete()
+            }
             try {
                 extractor.release()
             } catch (_: Throwable) {

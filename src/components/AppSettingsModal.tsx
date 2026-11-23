@@ -20,6 +20,7 @@ import {
   saveCustomGiphyApiKey,
 } from '../lib/giphyApi.ts';
 import {
+  cleanupUnusedMediaStorage,
   fetchServerStorageConfig,
   getNativeStorageConfig,
   pickNativeStorageFolder,
@@ -191,6 +192,33 @@ export const AppSettingsModal: React.FC<AppSettingsModalProps> = ({
       setClientSummary(summary);
       onStorageChanged?.();
       showTempStorageNotice('Кэш внутренней папки очищен');
+    } finally {
+      setStorageBusy(false);
+    }
+  };
+
+  const handleCleanupUnusedMedia = async () => {
+    setStorageBusy(true);
+    setStorageError(null);
+    try {
+      const res = await cleanupUnusedMediaStorage();
+      await loadStorageInfo();
+      onStorageChanged?.();
+      if (res.deletedCount > 0) {
+        showTempStorageNotice(
+          `Удалено неиспользуемых файлов: ${res.deletedCount} (освобождено ${formatStorageBytes(res.freedBytes)})`
+        );
+      } else {
+        showTempStorageNotice(
+          'Все медиафайлы используются в проектах (лишних нет)'
+        );
+      }
+    } catch (err) {
+      setStorageError(
+        err instanceof Error
+          ? err.message
+          : 'Не удалось очистить неиспользуемые файлы'
+      );
     } finally {
       setStorageBusy(false);
     }
@@ -560,6 +588,26 @@ export const AppSettingsModal: React.FC<AppSettingsModalProps> = ({
             />
             <span>Переносить уже скачанные фото и видео при смене папки</span>
           </label>
+
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-white/10 bg-zinc-950/60 px-3 py-2">
+            <div className="min-w-0">
+              <p className="text-[11px] font-medium text-zinc-200">
+                Обслуживание папки медиа и проектов
+              </p>
+              <p className="text-[10px] text-zinc-500">
+                Удаляет файлы из media/, на которые нет ссылок в projects/*.json
+              </p>
+            </div>
+            <button
+              type="button"
+              disabled={storageBusy}
+              onClick={() => void handleCleanupUnusedMedia()}
+              className="flex h-8 shrink-0 items-center gap-1.5 rounded-lg border border-rose-500/35 bg-rose-500/15 px-2.5 text-[11px] font-semibold text-rose-200 hover:bg-rose-500/25 disabled:opacity-50"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              <span>Очистить неиспользуемые файлы</span>
+            </button>
+          </div>
 
           {storageError && (
             <p className="rounded-lg border border-rose-500/35 bg-rose-500/10 px-2.5 py-1.5 text-[11px] text-rose-300">

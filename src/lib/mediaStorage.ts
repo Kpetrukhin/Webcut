@@ -1,5 +1,12 @@
 export type ClientStorageMode = 'app-root' | 'custom-fs';
 
+export interface CleanupMediaResult {
+  deletedCount: number;
+  freedBytes: number;
+  remainingCount: number;
+  remainingBytes: number;
+}
+
 export interface ClientStorageSummary {
   mode: ClientStorageMode;
   folderName: string;
@@ -107,9 +114,31 @@ function writeClientMeta(meta: PersistedClientMeta): void {
 }
 
 function sanitizeSafeFileName(fileName: string): string {
-  const base = fileName.split(/[\\/]/).pop() || fileName || 'media.bin';
+  const normalized = fileName.trim().replace(/\\/g, '/').split('?')[0];
+  const stripped = normalized.startsWith('media/')
+    ? normalized.slice('media/'.length)
+    : normalized;
+  const base = stripped.split('/').pop() || stripped || 'media.bin';
   const cleaned = base.replace(/[^a-zA-Z0-9._-]/g, '_');
   return cleaned || `media-${Date.now()}.bin`;
+}
+
+function sanitizeProjectId(rawId: string): string {
+  const cleaned = (rawId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+  return cleaned || 'studio-demo';
+}
+
+async function getSubDirHandle(
+  parent: FsDirHandleLike | null,
+  subName: 'media' | 'projects',
+  create: boolean
+): Promise<FsDirHandleLike | null> {
+  if (!parent) return null;
+  try {
+    return await parent.getDirectoryHandle(subName, {create});
+  } catch {
+    return null;
+  }
 }
 
 function openHandlesDb(): Promise<IDBDatabase> {
@@ -205,21 +234,32 @@ async function countDirFiles(
   }
   let filesCount = 0;
   let totalBytes = 0;
-  try {
-    for await (const entry of dir.values()) {
-      if (entry.kind === 'file') {
-        try {
-          const file = await entry.getFile();
-          filesCount += 1;
-          totalBytes += file.size;
-        } catch {
-          // ignore unreadable entry
+
+  const scanDir = async (target: FsDirHandleLike, skipJson: boolean) => {
+    if (typeof target.values !== 'function') return;
+    try {
+      for await (const entry of target.values()) {
+        if (entry.kind === 'file') {
+          if (skipJson && entry.name.toLowerCase().endsWith('.json')) continue;
+          if (entry.name.endsWith('.part')) continue;
+          try {
+            const file = await entry.getFile();
+            filesCount += 1;
+            totalBytes += file.size;
+          } catch {
+            // ignore unreadable entry
+          }
         }
       }
+    } catch {
+      // ignore enumeration error
     }
-  } catch {
-    // ignore enumeration error
-  }
+  };
+
+  const mediaSub = await getSubDirHandle(dir, 'media', false);
+  if (mediaSub) await scanDir(mediaSub, false);
+  await scanDir(dir, true);
+
   return {filesCount, totalBytes};
 }
 
@@ -264,18 +304,38 @@ async function resolveActiveBrowserDir(
 async function writeBlobToDir(
   dir: FsDirHandleLike,
   fileName: string,
-  blob: Blob
-): Promise<boolean> {
+  blob: Blob,
+  opts?: {overwrite?: boolean}
+): Promise<{ok: boolean; deduplicated: boolean}> {
   try {
     const safeName = sanitizeSafeFileName(fileName);
+    if (!opts?.overwrite) {
+      try {
+        const existingFh = await dir.getFileHandle(safeName, {create: false});
+        const existingFile = await existingFh.getFile();
+        if (existingFile.size === blob.size && existingFile.size > 0) {
+          return {ok: true, deduplicated: true};
+        }
+      } catch {
+        // file does not exist yet
+      }
+    }
     const fileHandle = await dir.getFileHandle(safeName, {create: true});
     const writable = await fileHandle.createWritable();
     await writable.write(blob);
     await writable.close();
-    return true;
+    return {ok: true, deduplicated: false};
   } catch {
-    return false;
+    return {ok: false, deduplicated: false};
   }
+}
+
+export async function checkMediaInLocalFolder(
+  fileName: string,
+  expectedSize?: number
+): Promise<boolean> {
+  const file = await readMediaFromLocalFolder(fileName, expectedSize);
+  return Boolean(file);
 }
 
 export async function saveMediaToLocalFolder(
@@ -285,14 +345,17 @@ export async function saveMediaToLocalFolder(
   if (typeof window === 'undefined') return false;
   const resolved = await resolveActiveBrowserDir(false);
   if (resolved.dir) {
-    const ok = await writeBlobToDir(resolved.dir, fileName, blob);
-    if (ok) return true;
+    const mediaSub = (await getSubDirHandle(resolved.dir, 'media', true)) || resolved.dir;
+    const res = await writeBlobToDir(mediaSub, fileName, blob);
+    if (res.ok) return true;
   }
   // If custom handle lacked permission during background sync, still persist to app-root OPFS
   if (resolved.mode === 'custom-fs') {
     const opfs = await getOpfsMediaDir(true);
     if (opfs) {
-      return await writeBlobToDir(opfs, fileName, blob);
+      const opfsMedia = (await getSubDirHandle(opfs, 'media', true)) || opfs;
+      const res = await writeBlobToDir(opfsMedia, fileName, blob);
+      return res.ok;
     }
   }
   return false;
@@ -304,34 +367,287 @@ export async function readMediaFromLocalFolder(
 ): Promise<File | null> {
   if (typeof window === 'undefined' || !fileName) return null;
   const safeName = sanitizeSafeFileName(fileName);
-  const dirsToCheck: FsDirHandleLike[] = [];
+  const rootDirs: FsDirHandleLike[] = [];
 
   const resolved = await resolveActiveBrowserDir(false);
-  if (resolved.dir) dirsToCheck.push(resolved.dir);
+  if (resolved.dir) rootDirs.push(resolved.dir);
   if (resolved.mode === 'custom-fs') {
     const opfs = await getOpfsMediaDir(false);
-    if (opfs) dirsToCheck.push(opfs);
+    if (opfs) rootDirs.push(opfs);
   }
 
-  for (const dir of dirsToCheck) {
-    try {
-      const fh = await dir.getFileHandle(safeName, {create: false});
-      const file = await fh.getFile();
-      if (file.size <= 0) continue;
-      if (expectedSize && expectedSize > 0 && file.size !== expectedSize) {
-        continue;
+  for (const root of rootDirs) {
+    const subMedia = await getSubDirHandle(root, 'media', false);
+    const candidates = subMedia ? [subMedia, root] : [root];
+    for (const dir of candidates) {
+      try {
+        const fh = await dir.getFileHandle(safeName, {create: false});
+        const file = await fh.getFile();
+        if (file.size <= 0) continue;
+        if (expectedSize && expectedSize > 0 && file.size !== expectedSize) {
+          continue;
+        }
+        return file;
+      } catch {
+        // not present in this dir
       }
-      return file;
-    } catch {
-      // not present in this dir
     }
   }
   return null;
 }
 
-async function copyAllMediaBetweenDirs(
+export async function saveProjectJsonToLocalFolder(
+  projectId: string,
+  projectJson: string
+): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  const safeId = sanitizeProjectId(projectId);
+  const fileName = `${safeId}.json`;
+  const blob = new Blob([projectJson], {type: 'application/json'});
+
+  let saved = false;
+  const resolved = await resolveActiveBrowserDir(false);
+  if (resolved.dir) {
+    const projDir = await getSubDirHandle(resolved.dir, 'projects', true);
+    if (projDir) {
+      const res = await writeBlobToDir(projDir, fileName, blob, {overwrite: true});
+      saved = res.ok;
+    }
+  }
+  // Always keep a copy in OPFS app-root as fallback if custom handle loses permission
+  if (resolved.mode === 'custom-fs' || !saved) {
+    const opfs = await getOpfsMediaDir(true);
+    const opfsProj = await getSubDirHandle(opfs, 'projects', true);
+    if (opfsProj) {
+      const res = await writeBlobToDir(opfsProj, fileName, blob, {overwrite: true});
+      if (res.ok) saved = true;
+    }
+  }
+  return saved;
+}
+
+export async function listProjectsJsonFromLocalFolder<T extends {roomId?: string; updatedAt?: number}>(): Promise<T[]> {
+  if (typeof window === 'undefined') return [];
+  const byId = new Map<string, T>();
+  const resolved = await resolveActiveBrowserDir(false);
+  const rootDirs: FsDirHandleLike[] = [];
+  if (resolved.dir) rootDirs.push(resolved.dir);
+  if (resolved.mode === 'custom-fs') {
+    const opfs = await getOpfsMediaDir(false);
+    if (opfs) rootDirs.push(opfs);
+  }
+
+  for (const root of rootDirs) {
+    const projDir = await getSubDirHandle(root, 'projects', false);
+    if (!projDir || typeof projDir.values !== 'function') continue;
+    try {
+      for await (const entry of projDir.values()) {
+        if (entry.kind !== 'file' || !entry.name.toLowerCase().endsWith('.json')) {
+          continue;
+        }
+        try {
+          const file = await entry.getFile();
+          const text = await file.text();
+          const parsed = JSON.parse(text) as T;
+          if (!parsed || typeof parsed.roomId !== 'string') continue;
+          const prev = byId.get(parsed.roomId);
+          if (!prev || (parsed.updatedAt ?? 0) >= (prev.updatedAt ?? 0)) {
+            byId.set(parsed.roomId, parsed);
+          }
+        } catch {
+          // ignore malformed json
+        }
+      }
+    } catch {
+      // ignore enumeration error
+    }
+  }
+
+  return Array.from(byId.values()).sort(
+    (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)
+  );
+}
+
+export async function loadProjectJsonFromLocalFolder<T>(
+  projectId: string
+): Promise<T | null> {
+  if (typeof window === 'undefined') return null;
+  const safeId = sanitizeProjectId(projectId);
+  const fileName = `${safeId}.json`;
+  const resolved = await resolveActiveBrowserDir(false);
+  const rootDirs: FsDirHandleLike[] = [];
+  if (resolved.dir) rootDirs.push(resolved.dir);
+  if (resolved.mode === 'custom-fs') {
+    const opfs = await getOpfsMediaDir(false);
+    if (opfs) rootDirs.push(opfs);
+  }
+
+  for (const root of rootDirs) {
+    const projDir = await getSubDirHandle(root, 'projects', false);
+    if (!projDir) continue;
+    try {
+      const fh = await projDir.getFileHandle(fileName, {create: false});
+      const file = await fh.getFile();
+      return JSON.parse(await file.text()) as T;
+    } catch {
+      // try next root
+    }
+  }
+  return null;
+}
+
+export async function deleteProjectJsonFromLocalFolder(
+  projectId: string
+): Promise<boolean> {
+  if (typeof window === 'undefined') return false;
+  const safeId = sanitizeProjectId(projectId);
+  const fileName = `${safeId}.json`;
+  let deleted = false;
+
+  const resolved = await resolveActiveBrowserDir(false);
+  const rootDirs: FsDirHandleLike[] = [];
+  if (resolved.dir) rootDirs.push(resolved.dir);
+  const opfs = await getOpfsMediaDir(false);
+  if (opfs && !rootDirs.includes(opfs)) rootDirs.push(opfs);
+
+  for (const root of rootDirs) {
+    const projDir = await getSubDirHandle(root, 'projects', false);
+    if (!projDir || typeof projDir.removeEntry !== 'function') continue;
+    try {
+      await projDir.removeEntry(fileName);
+      deleted = true;
+    } catch {
+      // ignore
+    }
+  }
+  return deleted;
+}
+
+export function extractReferencedMediaNamesFromProjectObj(
+  proj: unknown,
+  outNames: Set<string>
+): void {
+  if (!proj || typeof proj !== 'object') return;
+  const p = proj as {
+    clips?: Array<{
+      src?: string;
+      mediaFileName?: string;
+      mediaRemoteUrl?: string;
+      textStyle?: {fontSrc?: string};
+    }>;
+    customFonts?: Array<{src?: string; fileName?: string}>;
+  };
+  const addRef = (raw?: string) => {
+    if (!raw || typeof raw !== 'string') return;
+    const trimmed = raw.trim().replace(/\\/g, '/');
+    if (
+      !trimmed ||
+      trimmed.startsWith('synth:') ||
+      trimmed.startsWith('data:') ||
+      trimmed.startsWith('/src/') ||
+      trimmed.startsWith('/assets/')
+    ) {
+      return;
+    }
+    if (
+      trimmed.startsWith('media/') ||
+      trimmed.includes('/media/') ||
+      trimmed.includes('/uploads/') ||
+      !trimmed.includes('/')
+    ) {
+      const base = sanitizeSafeFileName(trimmed.split('?')[0]);
+      if (base) outNames.add(base);
+    }
+  };
+
+  if (Array.isArray(p.clips)) {
+    for (const c of p.clips) {
+      addRef(c.src);
+      addRef(c.mediaFileName);
+      addRef(c.mediaRemoteUrl);
+      addRef(c.textStyle?.fontSrc);
+    }
+  }
+  if (Array.isArray(p.customFonts)) {
+    for (const f of p.customFonts) {
+      addRef(f.src);
+      addRef(f.fileName);
+    }
+  }
+}
+
+export async function cleanupUnusedMediaInLocalFolder(): Promise<CleanupMediaResult> {
+  if (typeof window === 'undefined') {
+    return {deletedCount: 0, freedBytes: 0, remainingCount: 0, remainingBytes: 0};
+  }
+  const projects = await listProjectsJsonFromLocalFolder<Record<string, unknown>>();
+  const referenced = new Set<string>();
+  for (const proj of projects) {
+    extractReferencedMediaNamesFromProjectObj(proj, referenced);
+  }
+
+  let deletedCount = 0;
+  let freedBytes = 0;
+  let remainingCount = 0;
+  let remainingBytes = 0;
+
+  const cleanDir = async (dir: FsDirHandleLike | null, skipJson: boolean) => {
+    if (!dir || typeof dir.values !== 'function') return;
+    const toDelete: Array<{name: string; size: number}> = [];
+    for await (const entry of dir.values()) {
+      if (entry.kind !== 'file') continue;
+      if (skipJson && entry.name.toLowerCase().endsWith('.json')) continue;
+      let size = 0;
+      try {
+        size = (await entry.getFile()).size;
+      } catch {
+        size = 0;
+      }
+      if (!referenced.has(entry.name)) {
+        toDelete.push({name: entry.name, size});
+      } else {
+        remainingCount += 1;
+        remainingBytes += size;
+      }
+    }
+    for (const item of toDelete) {
+      if (typeof dir.removeEntry === 'function') {
+        try {
+          await dir.removeEntry(item.name);
+          deletedCount += 1;
+          freedBytes += item.size;
+          continue;
+        } catch {
+          // keep counted as remaining if delete failed
+        }
+      }
+      remainingCount += 1;
+      remainingBytes += item.size;
+    }
+  };
+
+  const resolved = await resolveActiveBrowserDir(false);
+  if (resolved.dir) {
+    const mediaSub = await getSubDirHandle(resolved.dir, 'media', false);
+    await cleanDir(mediaSub, false);
+    await cleanDir(resolved.dir, true);
+  }
+  if (resolved.mode === 'custom-fs') {
+    const opfs = await getOpfsMediaDir(false);
+    if (opfs) {
+      const opfsMedia = await getSubDirHandle(opfs, 'media', false);
+      await cleanDir(opfsMedia, false);
+      await cleanDir(opfs, true);
+    }
+  }
+
+  return {deletedCount, freedBytes, remainingCount, remainingBytes};
+}
+
+async function copyFlatEntries(
   fromDir: FsDirHandleLike | null,
-  toDir: FsDirHandleLike | null
+  toDir: FsDirHandleLike | null,
+  overwrite = false
 ): Promise<number> {
   if (!fromDir || !toDir || typeof fromDir.values !== 'function') return 0;
   let copied = 0;
@@ -341,21 +657,54 @@ async function copyAllMediaBetweenDirs(
       try {
         const file = await entry.getFile();
         if (file.size <= 0) continue;
-        // Skip if target already has file of same size
-        try {
-          const existing = await (await toDir.getFileHandle(entry.name, {create: false})).getFile();
-          if (existing.size === file.size) continue;
-        } catch {
-          // target does not have file yet
-        }
-        const ok = await writeBlobToDir(toDir, entry.name, file);
-        if (ok) copied += 1;
+        const res = await writeBlobToDir(toDir, entry.name, file, {overwrite});
+        if (res.ok && !res.deduplicated) copied += 1;
       } catch {
         // ignore single file errors
       }
     }
   } catch {
     // ignore
+  }
+  return copied;
+}
+
+async function copyAllMediaBetweenDirs(
+  fromDir: FsDirHandleLike | null,
+  toDir: FsDirHandleLike | null
+): Promise<number> {
+  if (!fromDir || !toDir || typeof fromDir.values !== 'function') return 0;
+  let copied = 0;
+  const fromMedia = await getSubDirHandle(fromDir, 'media', false);
+  const toMedia = await getSubDirHandle(toDir, 'media', true);
+  if (fromMedia && toMedia) {
+    copied += await copyFlatEntries(fromMedia, toMedia, false);
+  }
+  const fromProjects = await getSubDirHandle(fromDir, 'projects', false);
+  const toProjects = await getSubDirHandle(toDir, 'projects', true);
+  if (fromProjects && toProjects) {
+    copied += await copyFlatEntries(fromProjects, toProjects, true);
+  }
+  // Legacy flat files in root
+  if (toMedia) {
+    try {
+      for await (const entry of fromDir.values()) {
+        if (entry.kind !== 'file') continue;
+        try {
+          const file = await entry.getFile();
+          if (file.size <= 0) continue;
+          const targetDir = entry.name.toLowerCase().endsWith('.json') && toProjects
+            ? toProjects
+            : toMedia;
+          const res = await writeBlobToDir(targetDir, entry.name, file, {overwrite: false});
+          if (res.ok && !res.deduplicated) copied += 1;
+        } catch {
+          // ignore
+        }
+      }
+    } catch {
+      // ignore
+    }
   }
   return copied;
 }
@@ -462,18 +811,26 @@ export async function resetClientDirectory(): Promise<ClientStorageSummary> {
 
 export async function clearClientAppRootCache(): Promise<ClientStorageSummary> {
   const opfs = await getOpfsMediaDir(false);
-  if (opfs && typeof opfs.values === 'function' && typeof opfs.removeEntry === 'function') {
-    try {
-      const names: string[] = [];
-      for await (const entry of opfs.values()) {
-        names.push(entry.name);
+  if (opfs) {
+    const clearFlat = async (dir: FsDirHandleLike | null) => {
+      if (!dir || typeof dir.values !== 'function' || typeof dir.removeEntry !== 'function') {
+        return;
       }
-      for (const name of names) {
-        await opfs.removeEntry(name).catch(() => {});
+      try {
+        const names: string[] = [];
+        for await (const entry of dir.values()) {
+          if (entry.kind === 'file') names.push(entry.name);
+        }
+        for (const name of names) {
+          await dir.removeEntry(name).catch(() => {});
+        }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
-    }
+    };
+    const opfsMedia = await getSubDirHandle(opfs, 'media', false);
+    await clearFlat(opfsMedia);
+    await clearFlat(opfs);
   }
   return await getClientStorageSummary();
 }

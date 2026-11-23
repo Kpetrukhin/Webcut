@@ -119,3 +119,84 @@ export async function sha256Hex(
   }
   return sha256SyncHex(input);
 }
+
+export const FAST_FINGERPRINT_CHUNK_BYTES = 64 * 1024; // 64 KB head + 64 KB tail
+
+export function sanitizeMediaExtension(
+  originalName?: string,
+  mimeType?: string
+): string {
+  const cleanName = (originalName || '').split(/[?#]/)[0].trim();
+  const dotIdx = cleanName.lastIndexOf('.');
+  if (dotIdx !== -1 && dotIdx < cleanName.length - 1) {
+    const ext = cleanName
+      .slice(dotIdx + 1)
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '')
+      .slice(0, 10);
+    if (ext) return ext;
+  }
+  const mime = (mimeType || '').toLowerCase();
+  if (mime.includes('mp4')) return 'mp4';
+  if (mime.includes('webm')) return 'webm';
+  if (mime.includes('quicktime')) return 'mov';
+  if (mime.includes('jpeg') || mime.includes('jpg')) return 'jpg';
+  if (mime.includes('png')) return 'png';
+  if (mime.includes('webp')) return 'webp';
+  if (mime.includes('gif')) return 'gif';
+  if (mime.includes('mpeg')) return 'mp3';
+  if (mime.includes('wav')) return 'wav';
+  if (mime.includes('aac') || mime.includes('mp4a')) return 'm4a';
+  if (mime.includes('ogg')) return 'ogg';
+  if (mime.includes('ttf')) return 'ttf';
+  if (mime.includes('otf')) return 'otf';
+  if (mime.includes('woff2')) return 'woff2';
+  if (mime.includes('woff')) return 'woff';
+  return 'bin';
+}
+
+export function buildDedupMediaFileName(
+  hash: string,
+  size: number,
+  originalName?: string,
+  mimeType?: string
+): {baseName: string; relativePath: string; ext: string} {
+  const safeHash = hash.toLowerCase().replace(/[^a-f0-9]/g, '').slice(0, 24) || '0'.repeat(24);
+  const safeSize = Math.max(0, Math.trunc(size));
+  const ext = sanitizeMediaExtension(originalName, mimeType);
+  const baseName = `${safeHash}_${safeSize}.${ext}`;
+  return {
+    baseName,
+    relativePath: `media/${baseName}`,
+    ext,
+  };
+}
+
+export async function computeFastMediaFingerprint(blob: Blob): Promise<{
+  hash: string;
+  size: number;
+  fullHex: string;
+}> {
+  const size = blob.size;
+  let sample: Uint8Array;
+  if (size <= FAST_FINGERPRINT_CHUNK_BYTES * 2) {
+    sample = new Uint8Array(await blob.arrayBuffer());
+  } else {
+    const [headBuf, tailBuf] = await Promise.all([
+      blob.slice(0, FAST_FINGERPRINT_CHUNK_BYTES).arrayBuffer(),
+      blob.slice(size - FAST_FINGERPRINT_CHUNK_BYTES, size).arrayBuffer(),
+    ]);
+    const head = new Uint8Array(headBuf);
+    const tail = new Uint8Array(tailBuf);
+    sample = new Uint8Array(head.byteLength + tail.byteLength);
+    sample.set(head, 0);
+    sample.set(tail, head.byteLength);
+  }
+  const fullHex = await sha256Hex(sample);
+  return {
+    hash: fullHex.slice(0, 24),
+    size,
+    fullHex,
+  };
+}
+

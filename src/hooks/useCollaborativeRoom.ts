@@ -1941,6 +1941,27 @@ export function useCollaborativeRoom() {
     setUndoStack([]);
     setRedoStack([]);
     setRoomId(clean);
+    setProject((prev) => ({
+      ...prev,
+      roomId: clean,
+    }));
+    const url = new URL(window.location.href);
+    url.searchParams.set('room', clean);
+    window.history.replaceState({}, '', url.toString());
+  }, []);
+
+  const loadLocalProjectState = useCallback((loadedProject: ProjectState) => {
+    const clean =
+      loadedProject.roomId?.trim().replace(/[^a-zA-Z0-9_-]/g, '') ||
+      'studio-demo';
+    const normalized = normalizeProjectTracks({
+      ...loadedProject,
+      roomId: clean,
+    });
+    setUndoStack([]);
+    setRedoStack([]);
+    setRoomId(clean);
+    setProject(normalized);
     const url = new URL(window.location.href);
     url.searchParams.set('room', clean);
     window.history.replaceState({}, '', url.toString());
@@ -2091,6 +2112,7 @@ export function useCollaborativeRoom() {
     forceSyncProject,
     retryMediaDownload,
     switchRoom,
+    loadLocalProjectState,
     updateUserProfile,
     updateServerConnection,
     startHostRoom,

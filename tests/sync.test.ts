@@ -36,7 +36,16 @@ import {
   mapCanvasBboxToVideoSource,
 } from '../src/lib/trackerEngine.ts';
 import {createDefaultWarp} from '../src/lib/warpEngine.ts';
-import {sha256Hex, sha256SyncHex} from '../src/lib/sha256.ts';
+import {
+  buildDedupMediaFileName,
+  computeFastMediaFingerprint,
+  sha256Hex,
+  sha256SyncHex,
+} from '../src/lib/sha256.ts';
+import {
+  dehydrateProjectForStorage,
+  hydrateProjectFromStorage,
+} from '../src/lib/localProjects.ts';
 import {downloadMediaInBackground} from '../src/lib/lanSyncBridge.ts';
 import {
   extractMediaFileName,
@@ -2179,6 +2188,419 @@ test('WebSocket Auto-Resync E2E: revision=0, ephemeral drag без инкрем�
       }
     } catch {
       // ignore
+    }
+  }
+});
+
+test('Дедупликация медиа: быстрый отпечаток (head64KB + tail64KB + size) и имя media/<hash>_<size>.<ext>', async () => {
+  const smallA = new Blob([new Uint8Array([1, 2, 3, 4, 5])], {
+    type: 'video/mp4',
+  });
+  const smallB = new Blob([new Uint8Array([1, 2, 3, 4, 5])], {
+    type: 'video/mp4',
+  });
+  const fpA = await computeFastMediaFingerprint(smallA);
+  const fpB = await computeFastMediaFingerprint(smallB);
+  assert.equal(fpA.size, 5);
+  assert.equal(fpA.hash.length, 24);
+  assert.equal(fpA.fullHex, fpB.fullHex);
+  assert.equal(
+    buildDedupMediaFileName(fpA.hash, fpA.size, 'My Video.MP4').relativePath,
+    `media/${fpA.hash}_5.mp4`
+  );
+
+  // Large payload (> 128 KB): identical head+tail, different middle byte -> same fast fingerprint
+  const big1 = new Uint8Array(200 * 1024);
+  big1.fill(7);
+  big1[10] = 42;
+  big1[big1.length - 10] = 99;
+
+  const big2 = new Uint8Array(big1);
+  big2[100 * 1024] = 123; // middle byte only
+
+  const big3 = new Uint8Array(big1);
+  big3[big3.length - 5] = 88; // tail byte changed
+
+  const fpBig1 = await computeFastMediaFingerprint(new Blob([big1]));
+  const fpBig2 = await computeFastMediaFingerprint(new Blob([big2]));
+  const fpBig3 = await computeFastMediaFingerprint(new Blob([big3]));
+
+  assert.equal(fpBig1.size, big1.length);
+  assert.equal(fpBig1.fullHex, fpBig2.fullHex);
+  assert.notEqual(fpBig1.fullHex, fpBig3.fullHex);
+});
+
+test('Портативный JSON проекта: дегидрация ссылок в media/<hash>_<size>.<ext> и обратная гидрация', async () => {
+  const tracks = createDefaultTracks();
+  const videoTrackId = tracks.find((t) => t.type === 'video')?.id || 'track-video';
+  const audioTrackId = tracks.find((t) => t.type === 'audio')?.id || 'track-audio';
+  const textTrackId = tracks.find((t) => t.type === 'text')?.id || 'track-text';
+  const project: ProjectState = {
+    roomId: 'portable-1',
+    title: 'Portable Project',
+    aspectRatio: '9:16',
+    backgroundColor: '#09090b',
+    fps: 30,
+    isPublicLan: false,
+    customFonts: [
+      {
+        id: 'f1',
+        name: 'Display.ttf',
+        fontFamily: 'DisplayCustom',
+        src: 'http://192.168.1.44:8080/media/abc123def456abc123def456_2048.ttf',
+        fileName: 'media/abc123def456abc123def456_2048.ttf',
+        fileSize: 2048,
+      },
+    ],
+    trackers: [],
+    tracks,
+    clips: [
+      {
+        id: 'clip-video',
+        track: 'video',
+        trackId: videoTrackId,
+        kind: 'video',
+        name: 'shot.mp4',
+        src: 'blob:http://localhost:3000/fake-blob-id',
+        mediaFileName: 'media/00112233445566778899aabb_102400.mp4',
+        mediaRemoteUrl:
+          'http://192.168.1.44:8080/media/00112233445566778899aabb_102400.mp4',
+        mediaFileSize: 102400,
+        start: 0,
+        duration: 4,
+        trimStart: 0,
+        sourceDuration: 4,
+        speed: 1,
+        volume: 1,
+        opacity: 1,
+        filter: 'none',
+        brightness: 1,
+        contrast: 1,
+        saturate: 1,
+        transitionIn: 'none',
+        motionEffect: 'none',
+      },
+      {
+        id: 'clip-synth',
+        track: 'audio',
+        trackId: audioTrackId,
+        kind: 'synth',
+        name: 'Beat',
+        src: 'synth:cinematic-riser',
+        start: 0,
+        duration: 3,
+        trimStart: 0,
+        sourceDuration: 3,
+        speed: 1,
+        volume: 1,
+        opacity: 1,
+        filter: 'none',
+        brightness: 1,
+        contrast: 1,
+        saturate: 1,
+        transitionIn: 'none',
+        motionEffect: 'none',
+      },
+      {
+        id: 'clip-text',
+        track: 'text',
+        trackId: textTrackId,
+        kind: 'text',
+        name: 'Title',
+        text: 'Hello',
+        textStyle: {
+          fontSize: 48,
+          color: '#ffffff',
+          bgColor: 'transparent',
+          fontWeight: 'bold',
+          fontFamily: 'DisplayCustom',
+          fontSrc:
+            'http://192.168.1.44:8080/media/abc123def456abc123def456_2048.ttf',
+          x: 0.5,
+          y: 0.5,
+          align: 'center',
+        },
+        start: 0,
+        duration: 3,
+        trimStart: 0,
+        sourceDuration: 3,
+        speed: 1,
+        volume: 0,
+        opacity: 1,
+        filter: 'none',
+        brightness: 1,
+        contrast: 1,
+        saturate: 1,
+        transitionIn: 'none',
+        motionEffect: 'none',
+      },
+    ],
+    revision: 2,
+    updatedAt: 1700000000000,
+    chat: [],
+  };
+
+  const dehydrated = dehydrateProjectForStorage(project);
+  const vClip = dehydrated.clips.find((c) => c.id === 'clip-video')!;
+  const sClip = dehydrated.clips.find((c) => c.id === 'clip-synth')!;
+  const tClip = dehydrated.clips.find((c) => c.id === 'clip-text')!;
+
+  assert.equal(vClip.src, 'media/00112233445566778899aabb_102400.mp4');
+  assert.equal(
+    vClip.mediaRemoteUrl,
+    'media/00112233445566778899aabb_102400.mp4'
+  );
+  assert.equal(sClip.src, 'synth:cinematic-riser');
+  assert.equal(
+    tClip.textStyle?.fontSrc,
+    'media/abc123def456abc123def456_2048.ttf'
+  );
+  assert.equal(
+    dehydrated.customFonts?.[0]?.src,
+    'media/abc123def456abc123def456_2048.ttf'
+  );
+
+  const hydrated = await hydrateProjectFromStorage(
+    dehydrated,
+    async (rel) => `http://127.0.0.1:9999/${rel}`
+  );
+  assert.equal(
+    hydrated.clips.find((c) => c.id === 'clip-video')?.src,
+    'http://127.0.0.1:9999/media/00112233445566778899aabb_102400.mp4'
+  );
+  assert.equal(
+    hydrated.clips.find((c) => c.id === 'clip-synth')?.src,
+    'synth:cinematic-riser'
+  );
+  assert.equal(
+    hydrated.customFonts?.[0]?.src,
+    'http://127.0.0.1:9999/media/abc123def456abc123def456_2048.ttf'
+  );
+  assert.equal(
+    hydrated.clips.find((c) => c.id === 'clip-text')?.textStyle?.fontSrc,
+    'http://127.0.0.1:9999/media/abc123def456abc123def456_2048.ttf'
+  );
+});
+
+test('E2E Дедупликация медиа, projects/*.json и cleanupUnusedMedia() на сервере', async () => {
+  process.env.CUTSYNC_NO_AUTOSTART = '1';
+  const os = await import('node:os');
+  const storageConfigFile = path.join(
+    process.cwd(),
+    'data',
+    'storage-config.json'
+  );
+  const hadStorageConfig = fs.existsSync(storageConfigFile);
+  const prevStorageConfig = hadStorageConfig
+    ? fs.readFileSync(storageConfigFile, 'utf-8')
+    : null;
+
+  const customDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'cutsync-dedup-proj-')
+  );
+  const {startServer, stopServer} = await import('../server.ts');
+  const {port} = await startServer({
+    port: 0,
+    disableVite: true,
+    disableBeacon: true,
+  });
+  const baseHttp = `http://127.0.0.1:${port}`;
+
+  try {
+    // 1. Switch storage directory to isolated temp root
+    const cfgRes = await fetch(`${baseHttp}/api/storage/config`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dirPath: customDir, migrateExisting: false}),
+    });
+    assert.equal(cfgRes.status, 200);
+
+    // 2. Upload same video payload twice via different endpoints & filenames -> must deduplicate
+    const videoBytes = Buffer.from('DEDUP-VIDEO-BYTES-ABCDEF-0123456789');
+    const fp = await computeFastMediaFingerprint(new Blob([videoBytes]));
+
+    const up1Res = await fetch(
+      `${baseHttp}/media/upload?fileName=first-take.mp4`,
+      {method: 'POST', body: videoBytes}
+    );
+    assert.equal(up1Res.status, 200);
+    const up1 = (await up1Res.json()) as {
+      ok: boolean;
+      fileName: string;
+      localUrl: string;
+      deduplicated?: boolean;
+    };
+    assert.equal(up1.ok, true);
+    assert.equal(up1.deduplicated, false);
+    assert.ok(up1.fileName.startsWith('media/'));
+    assert.equal(
+      up1.fileName,
+      `media/${fp.hash}_${videoBytes.length}.mp4`
+    );
+
+    const existsRes = await fetch(
+      `${baseHttp}/api/media/exists?hash=${encodeURIComponent(fp.hash)}&size=${videoBytes.length}&ext=mp4`
+    );
+    assert.equal(existsRes.status, 200);
+    const existsJson = (await existsRes.json()) as {
+      exists: boolean;
+      fileName: string;
+      localUrl: string;
+    };
+    assert.equal(existsJson.exists, true);
+    assert.equal(existsJson.fileName, up1.fileName);
+
+    const fd2 = new FormData();
+    fd2.append(
+      'file',
+      new Blob([videoBytes], {type: 'video/mp4'}),
+      'duplicate-take.mp4'
+    );
+    const up2Res = await fetch(`${baseHttp}/api/upload`, {
+      method: 'POST',
+      body: fd2,
+    });
+    assert.equal(up2Res.status, 200);
+    const up2 = (await up2Res.json()) as {
+      ok: boolean;
+      fileName: string;
+      deduplicated?: boolean;
+    };
+    assert.equal(up2.ok, true);
+    assert.equal(up2.fileName, up1.fileName);
+    assert.equal(up2.deduplicated, true);
+
+    const mediaDir = path.join(customDir, 'media');
+    assert.equal(fs.readdirSync(mediaDir).length, 1);
+
+    // 3. Upload custom font (used) and orphan image (unused)
+    const fontBytes = Buffer.from('FAKE-TTF-FONT-BINARY-12345');
+    const fontRes = await fetch(`${baseHttp}/media/upload?fileName=title.ttf`, {
+      method: 'POST',
+      body: fontBytes,
+    });
+    const fontJson = (await fontRes.json()) as {fileName: string};
+
+    const orphanBytes = Buffer.from('ORPHAN-UNUSED-IMAGE-99999');
+    const orphanRes = await fetch(
+      `${baseHttp}/media/upload?fileName=orphan.png`,
+      {method: 'POST', body: orphanBytes}
+    );
+    const orphanJson = (await orphanRes.json()) as {fileName: string};
+    assert.equal(fs.readdirSync(mediaDir).length, 3);
+
+    // 4. Save project JSON referencing video + font with portable relative paths
+    const projId = 'proj-portable-test';
+    const tracks = createDefaultTracks();
+    const videoTrackId = tracks.find((t) => t.type === 'video')?.id || 'track-video';
+    const projectPayload: ProjectState = {
+      roomId: projId,
+      title: 'Portable Timeline',
+      aspectRatio: '16:9',
+      backgroundColor: '#09090b',
+      fps: 30,
+      isPublicLan: false,
+      customFonts: [
+        {
+          id: 'f-1',
+          name: 'title.ttf',
+          fontFamily: 'CustomTitle',
+          src: `http://192.168.0.10:3000/${fontJson.fileName}`,
+          fileName: fontJson.fileName,
+          fileSize: fontBytes.length,
+        },
+      ],
+      trackers: [],
+      tracks,
+      clips: [
+        {
+          id: 'c-1',
+          track: 'video',
+          trackId: videoTrackId,
+          kind: 'video',
+          name: 'first-take.mp4',
+          src: `http://192.168.0.10:3000/${up1.fileName}`,
+          mediaFileName: up1.fileName,
+          mediaFileSize: videoBytes.length,
+          start: 0,
+          duration: 5,
+          trimStart: 0,
+          sourceDuration: 5,
+          speed: 1,
+          volume: 1,
+          opacity: 1,
+          filter: 'none',
+          brightness: 1,
+          contrast: 1,
+          saturate: 1,
+          transitionIn: 'none',
+          motionEffect: 'none',
+        },
+      ],
+      revision: 1,
+      updatedAt: Date.now(),
+      chat: [],
+    };
+
+    const saveProjRes = await fetch(`${baseHttp}/api/projects/${projId}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(projectPayload),
+    });
+    assert.equal(saveProjRes.status, 200);
+
+    const diskProjectPath = path.join(customDir, 'projects', `${projId}.json`);
+    assert.equal(fs.existsSync(diskProjectPath), true);
+    const diskProject = JSON.parse(
+      fs.readFileSync(diskProjectPath, 'utf-8')
+    ) as ProjectState;
+    assert.equal(diskProject.clips[0]?.src, up1.fileName);
+    assert.equal(diskProject.customFonts?.[0]?.src, fontJson.fileName);
+
+    const listProjRes = await fetch(`${baseHttp}/api/projects`);
+    assert.equal(listProjRes.status, 200);
+    const listProjJson = (await listProjRes.json()) as {
+      projects: ProjectState[];
+    };
+    assert.ok(listProjJson.projects.some((p) => p.roomId === projId));
+
+    // 5. Run cleanupUnusedMedia -> removes only orphan.png, keeps clip & font
+    const clean1Res = await fetch(`${baseHttp}/api/storage/cleanup`, {
+      method: 'POST',
+    });
+    assert.equal(clean1Res.status, 200);
+    const clean1 = (await clean1Res.json()) as {
+      deletedCount: number;
+      freedBytes: number;
+      deletedFiles: string[];
+    };
+    assert.equal(clean1.deletedCount, 1);
+    assert.equal(clean1.freedBytes, orphanBytes.length);
+    assert.equal(fs.existsSync(path.join(customDir, orphanJson.fileName)), false);
+    assert.equal(fs.existsSync(path.join(customDir, up1.fileName)), true);
+    assert.equal(fs.existsSync(path.join(customDir, fontJson.fileName)), true);
+
+    // 6. Delete project JSON and clean again -> removes remaining 2 media files
+    const delProjRes = await fetch(`${baseHttp}/api/projects/${projId}`, {
+      method: 'DELETE',
+    });
+    assert.equal(delProjRes.status, 200);
+    assert.equal(fs.existsSync(diskProjectPath), false);
+
+    const clean2Res = await fetch(`${baseHttp}/api/storage/cleanup`, {
+      method: 'POST',
+    });
+    assert.equal(clean2Res.status, 200);
+    const clean2 = (await clean2Res.json()) as {deletedCount: number};
+    assert.equal(clean2.deletedCount, 2);
+    assert.equal(fs.readdirSync(mediaDir).length, 0);
+  } finally {
+    await stopServer();
+    fs.rmSync(customDir, {recursive: true, force: true});
+    if (hadStorageConfig && prevStorageConfig !== null) {
+      fs.writeFileSync(storageConfigFile, prevStorageConfig, 'utf-8');
+    } else if (fs.existsSync(storageConfigFile)) {
+      fs.unlinkSync(storageConfigFile);
     }
   }
 });

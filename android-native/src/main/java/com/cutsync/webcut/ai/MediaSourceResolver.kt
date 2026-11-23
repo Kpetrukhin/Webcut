@@ -128,14 +128,21 @@ internal object MediaSourceResolver {
         val prefs = context.getSharedPreferences("cutsync_storage", Context.MODE_PRIVATE)
         val customDirPath = prefs.getString("custom_media_dir", null)?.trim()
         val candidateDirs = buildList {
-            if (!customDirPath.isNullOrEmpty()) add(File(customDirPath))
-            add(File(context.filesDir, "cutsync_media"))
-            add(File(context.cacheDir, "cutsync_media"))
+            if (!customDirPath.isNullOrEmpty()) {
+                add(File(customDirPath, "media"))
+                add(File(customDirPath))
+            }
+            val filesMedia = File(context.filesDir, "cutsync_media")
+            add(File(filesMedia, "media"))
+            add(filesMedia)
+            val cacheMedia = File(context.cacheDir, "cutsync_media")
+            add(File(cacheMedia, "media"))
+            add(cacheMedia)
         }
 
         val candidateNames = LinkedHashSet<String>()
         if (!fileName.isNullOrBlank()) {
-            val base = File(fileName).name
+            val base = File(fileName.removePrefix("media/")).name
             candidateNames += base
             candidateNames += base.replace(Regex("[^a-zA-Z0-9._-]"), "_")
         }
@@ -146,7 +153,11 @@ internal object MediaSourceResolver {
             } catch (_: Throwable) {
                 rawPart
             }
-            val base = File(decoded).name
+            val base = File(decoded.removePrefix("media/")).name
+            candidateNames += base
+            candidateNames += base.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        } else if (sourceUrl.startsWith("media/")) {
+            val base = File(sourceUrl.removePrefix("media/").substringBefore("?")).name
             candidateNames += base
             candidateNames += base.replace(Regex("[^a-zA-Z0-9._-]"), "_")
         }

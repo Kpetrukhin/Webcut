@@ -54,6 +54,7 @@ import type {
   ColorFilterPreset,
   MotionTrackerBeacon,
   PolygonPoint,
+  ProjectState,
   ShapeType,
   TextCurvePoint,
 } from './shared/types.ts';
@@ -64,14 +65,24 @@ import {
   upsertKeyframeAtTime,
 } from './lib/keyframeEngine.ts';
 import {
+  deleteProjectFromRootStorage,
   fetchServerStorageConfig,
   getNativeStorageConfig,
+  listProjectsFromRootStorage,
+  loadProjectFromRootStorage,
+  resolvePortableMediaUrl,
+  saveProjectToRootStorage,
   uploadFileForP2P,
 } from './lib/lanSyncBridge.ts';
 import type {CompressedMediaResult} from './lib/lanSyncBridge.ts';
+import {preloadProjectFonts} from './lib/fontLoader.ts';
 import {getClientStorageSummary} from './lib/mediaStorage.ts';
 import {
   getLocalProjects,
+  hydrateProjectFromStorage,
+  mergeProjectRecords,
+  projectStateToLocalRecord,
+  recordToProjectState,
   removeLocalProject,
   upsertLocalProject,
 } from './lib/localProjects.ts';
@@ -223,6 +234,7 @@ export default function App() {
     forceSyncProject,
     retryMediaDownload,
     switchRoom,
+    loadLocalProjectState,
     updateUserProfile,
     updateServerConnection,
     startHostRoom,
@@ -407,9 +419,60 @@ export default function App() {
     }
   }, []);
 
+  const syncProjectsFromRootStorage = useCallback(async () => {
+    try {
+      const diskProjects = await listProjectsFromRootStorage();
+      setLocalProjects((prev) =>
+        mergeProjectRecords(
+          diskProjects,
+          prev.length > 0 ? prev : getLocalProjects()
+        )
+      );
+    } catch {
+      setLocalProjects(getLocalProjects());
+    }
+  }, []);
+
   useEffect(() => {
     void refreshStorageSummary();
-  }, [refreshStorageSummary, serverUrl]);
+    void syncProjectsFromRootStorage();
+  }, [refreshStorageSummary, syncProjectsFromRootStorage, serverUrl]);
+
+  const hydratedInitialRoomRef = useRef(false);
+  useEffect(() => {
+    if (hydratedInitialRoomRef.current) return;
+    if (screen !== 'editor' || !hasExplicitRoomInUrl()) {
+      hydratedInitialRoomRef.current = true;
+      return;
+    }
+    if (status === 'connected') {
+      hydratedInitialRoomRef.current = true;
+      return;
+    }
+    if (status !== 'offline' || localRevision > 0) return;
+
+    hydratedInitialRoomRef.current = true;
+    void (async () => {
+      try {
+        const diskProject = await loadProjectFromRootStorage(roomId);
+        if (!diskProject) return;
+        const hydrated = await hydrateProjectFromStorage(
+          diskProject,
+          resolvePortableMediaUrl
+        );
+        void preloadProjectFonts(hydrated.customFonts);
+        loadLocalProjectState(hydrated);
+      } catch {
+        // ignore offline fallback read errors
+      }
+    })();
+  }, [
+    screen,
+    status,
+    roomId,
+    localRevision,
+    loadLocalProjectState,
+  ]);
 
   useEffect(() => {
     const onResize = () => {
@@ -685,40 +748,59 @@ export default function App() {
     });
   }, [selectedClipIdValue, selectedClipTrackValue, selectedClipCurvePoints]);
 
+  const flushActiveProjectToStorage = useCallback(
+    (persistRootJson = true) => {
+      const p = projectRef.current;
+      const activeProject: ProjectState = {
+        ...p,
+        roomId: p.roomId || roomId,
+        updatedAt: Date.now(),
+      };
+      upsertLocalProject(projectStateToLocalRecord(activeProject));
+      if (persistRootJson) {
+        void saveProjectToRootStorage(activeProject);
+      }
+    },
+    [roomId]
+  );
+
   useEffect(() => {
     if (screen !== 'editor') {
-      setLocalProjects(getLocalProjects());
+      void syncProjectsFromRootStorage();
       return;
     }
-    const flushSave = () => {
-      const p = projectRef.current;
-      return upsertLocalProject({
-        roomId: p.roomId || roomId,
-        title: p.title,
-        aspectRatio: p.aspectRatio,
-        backgroundColor: p.backgroundColor || '#09090b',
-        canvasBackground: p.canvasBackground,
-        updatedAt: Date.now(),
-        clipsCount: p.clips.length,
-        tracksCount: p.tracks.length,
-        snapshot: {
-          tracks: p.tracks,
-          clips: p.clips,
-          customFonts: p.customFonts,
-          trackers: p.trackers,
-        },
-      });
+    const handleVisibilityOrUnload = () => {
+      if (
+        document.visibilityState === 'hidden' ||
+        document.visibilityState === undefined
+      ) {
+        flushActiveProjectToStorage(true);
+      }
+    };
+    const handleBeforeUnload = () => {
+      flushActiveProjectToStorage(true);
     };
     const timer = setTimeout(() => {
-      flushSave();
+      flushActiveProjectToStorage(true);
     }, 1200);
-    window.addEventListener('beforeunload', flushSave);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    document.addEventListener('visibilitychange', handleVisibilityOrUnload);
     return () => {
       clearTimeout(timer);
-      window.removeEventListener('beforeunload', flushSave);
-      flushSave();
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+      document.removeEventListener(
+        'visibilitychange',
+        handleVisibilityOrUnload
+      );
+      flushActiveProjectToStorage(false);
     };
-  }, [screen, project, roomId]);
+  }, [
+    screen,
+    project,
+    roomId,
+    flushActiveProjectToStorage,
+    syncProjectsFromRootStorage,
+  ]);
 
   useEffect(() => {
     sendPresence(currentTime, selectedClipId, isPlaying);
@@ -2210,18 +2292,31 @@ export default function App() {
     const endpoint = getApiUrl('/api/rooms');
     const localClips = opts.blank ? [] : createStarterClips();
     const localTracks = createDefaultTracks();
+    const buildLocalProjectState = (targetId: string): ProjectState => ({
+      roomId: targetId,
+      title: opts.title,
+      aspectRatio: opts.aspectRatio,
+      backgroundColor: opts.backgroundColor,
+      canvasBackground: {type: 'solid', color: opts.backgroundColor},
+      fps: 30,
+      hostName: opts.hostName ?? (opts.isPublicLan ? user.name : undefined),
+      isPublicLan: opts.isPublicLan,
+      customFonts: [],
+      trackers: [],
+      tracks: localTracks,
+      clips: localClips,
+      revision: 0,
+      updatedAt: Date.now(),
+      chat: [],
+    });
 
     if (opts.isPublicLan && (isNativeCapacitorApp() || !endpoint)) {
       const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
-      await startHostRoom({
-        roomId: localId,
-        title: opts.title,
-        aspectRatio: opts.aspectRatio,
-        backgroundColor: opts.backgroundColor,
-        tracks: localTracks,
-        clips: localClips,
-      });
-      switchRoom(localId);
+      const created = buildLocalProjectState(localId);
+      await startHostRoom(created);
+      loadLocalProjectState(created);
+      setLocalProjects(upsertLocalProject(projectStateToLocalRecord(created)));
+      void saveProjectToRootStorage(created);
       setCurrentTime(0);
       setSelectedClipId(null);
       setScreen('editor');
@@ -2230,13 +2325,10 @@ export default function App() {
 
     if (!endpoint) {
       const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
-      replaceClips(localClips, {
-        title: opts.title,
-        aspectRatio: opts.aspectRatio,
-        backgroundColor: opts.backgroundColor,
-        tracks: localTracks,
-      });
-      switchRoom(localId);
+      const created = buildLocalProjectState(localId);
+      loadLocalProjectState(created);
+      setLocalProjects(upsertLocalProject(projectStateToLocalRecord(created)));
+      void saveProjectToRootStorage(created);
       setCurrentTime(0);
       setSelectedClipId(null);
       setScreen('editor');
@@ -2251,9 +2343,17 @@ export default function App() {
           hostName: opts.hostName ?? (opts.isPublicLan ? user.name : undefined),
         }),
       });
-      const data = (await res.json()) as {roomId?: string};
+      const data = (await res.json()) as {
+        roomId?: string;
+        project?: ProjectState;
+      };
       if (data.roomId) {
-        switchRoom(data.roomId);
+        const created = data.project ?? buildLocalProjectState(data.roomId);
+        loadLocalProjectState(created);
+        setLocalProjects(
+          upsertLocalProject(projectStateToLocalRecord(created))
+        );
+        void saveProjectToRootStorage(created);
         setCurrentTime(0);
         setSelectedClipId(null);
         setScreen('editor');
@@ -2261,44 +2361,35 @@ export default function App() {
       }
     } catch {
       const localId = `cut-${Math.random().toString(36).slice(2, 8)}`;
+      const created = buildLocalProjectState(localId);
       if (opts.isPublicLan) {
-        await startHostRoom({
-          roomId: localId,
-          title: opts.title,
-          aspectRatio: opts.aspectRatio,
-          backgroundColor: opts.backgroundColor,
-          tracks: localTracks,
-          clips: localClips,
-        });
-      } else {
-        replaceClips(localClips, {
-          title: opts.title,
-          aspectRatio: opts.aspectRatio,
-          backgroundColor: opts.backgroundColor,
-          canvasBackground: {type: 'solid', color: opts.backgroundColor},
-          tracks: localTracks,
-        });
+        await startHostRoom(created);
       }
-      switchRoom(localId);
+      loadLocalProjectState(created);
+      setLocalProjects(upsertLocalProject(projectStateToLocalRecord(created)));
+      void saveProjectToRootStorage(created);
       setCurrentTime(0);
       setSelectedClipId(null);
       setScreen('editor');
     }
   };
 
-  const handleOpenLocalProject = (record: LocalProjectRecord) => {
-    if (record.snapshot) {
-      replaceClips(record.snapshot.clips, {
-        title: record.title,
-        aspectRatio: record.aspectRatio,
-        backgroundColor: record.backgroundColor,
-        canvasBackground: record.canvasBackground,
-        customFonts: record.snapshot.customFonts,
-        trackers: record.snapshot.trackers,
-        tracks: record.snapshot.tracks,
-      });
+  const handleOpenLocalProject = async (record: LocalProjectRecord) => {
+    let rawProject: ProjectState | null = null;
+    try {
+      rawProject = await loadProjectFromRootStorage(record.roomId);
+    } catch {
+      rawProject = null;
     }
-    switchRoom(record.roomId);
+    if (!rawProject) {
+      rawProject = recordToProjectState(record);
+    }
+    const hydrated = await hydrateProjectFromStorage(
+      rawProject,
+      resolvePortableMediaUrl
+    );
+    void preloadProjectFonts(hydrated.customFonts);
+    loadLocalProjectState(hydrated);
     setCurrentTime(0);
     setSelectedClipId(null);
     setScreen('editor');
@@ -2532,9 +2623,12 @@ export default function App() {
             setSelectedClipId(null);
             setScreen('editor');
           }}
-          onOpenLocalProject={handleOpenLocalProject}
+          onOpenLocalProject={(rec) => {
+            void handleOpenLocalProject(rec);
+          }}
           onDeleteLocalProject={(id) => {
             setLocalProjects(removeLocalProject(id));
+            void deleteProjectFromRootStorage(id);
           }}
           onUpdateProfile={updateUserProfile}
           onConnectServer={updateServerConnection}
@@ -2553,6 +2647,7 @@ export default function App() {
           }}
           onRefreshRooms={() => {
             void refreshRooms();
+            void syncProjectsFromRootStorage();
           }}
           onOpenSettings={() => setShowAppSettings(true)}
           storageSummaryLabel={storageSummaryState.label}
@@ -2562,7 +2657,10 @@ export default function App() {
           <AppSettingsModal
             onClose={() => setShowAppSettings(false)}
             onKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
-            onStorageChanged={() => void refreshStorageSummary()}
+            onStorageChanged={() => {
+              void refreshStorageSummary();
+              void syncProjectsFromRootStorage();
+            }}
           />
         )}
         <OfflineIndicator />
@@ -2583,6 +2681,7 @@ export default function App() {
             type="button"
             onClick={() => {
               setIsPlaying(false);
+              flushActiveProjectToStorage(true);
               setScreen('home');
             }}
             aria-label="Главное меню"
@@ -6004,7 +6103,10 @@ export default function App() {
         <AppSettingsModal
           onClose={() => setShowAppSettings(false)}
           onKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
-          onStorageChanged={() => void refreshStorageSummary()}
+          onStorageChanged={() => {
+            void refreshStorageSummary();
+            void syncProjectsFromRootStorage();
+          }}
         />
       )}
 

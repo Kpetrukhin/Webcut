@@ -289,7 +289,8 @@ class LanSyncPlugin : Plugin() {
                     trimStartMs = trimStartMs,
                     durationMs = durationMs
                 )
-                val shareUrl = "http://${engine.getPrimaryIp()}:${engine.getBoundPort()}/media/$outName"
+                val baseOnly = java.io.File(outName).name
+                val shareUrl = "http://${engine.getPrimaryIp()}:${engine.getBoundPort()}/media/$baseOnly"
                 val (fileSize, fileHash) = engine.getCachedFileMetadata(outName)
                 call.resolve(
                     JSObject().apply {
@@ -303,6 +304,124 @@ class LanSyncPlugin : Plugin() {
                 )
             } catch (err: Throwable) {
                 call.reject(err.message ?: "Failed to extract audio")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun checkMediaExists(call: PluginCall) {
+        val fileName = call.getString("fileName") ?: ""
+        val expectedSize = call.getDouble("expectedSize", -1.0)?.toLong() ?: -1L
+        if (fileName.isBlank()) {
+            call.resolve(JSObject().apply { put("exists", false) })
+            return
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val resJson = engine.checkMediaExists(fileName, expectedSize)
+                call.resolve(JSObject(resJson.toString()))
+            } catch (err: Throwable) {
+                call.resolve(JSObject().apply { put("exists", false) })
+            }
+        }
+    }
+
+    @PluginMethod
+    fun importMediaUri(call: PluginCall) {
+        val uriStr = call.getString("uri") ?: run {
+            call.reject("Missing uri")
+            return
+        }
+        val fileName = call.getString("fileName")
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val resJson = engine.importMediaFromUri(android.net.Uri.parse(uriStr), fileName)
+                call.resolve(JSObject(resJson.toString()))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось импортировать медиафайл")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun saveProjectJson(call: PluginCall) {
+        val projectId = call.getString("projectId") ?: run {
+            call.reject("Missing projectId")
+            return
+        }
+        val projectJson = call.getString("projectJson") ?: run {
+            call.reject("Missing projectJson")
+            return
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val resJson = engine.saveProjectJson(projectId, projectJson)
+                call.resolve(JSObject(resJson.toString()))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось сохранить проект")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun listProjectsJson(call: PluginCall) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val arr = engine.listProjectsJson()
+                val jsArr = JSArray()
+                for (i in 0 until arr.length()) {
+                    arr.optJSONObject(i)?.let { jsArr.put(JSObject(it.toString())) }
+                }
+                call.resolve(JSObject().apply { put("projects", jsArr) })
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось прочитать проекты")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun loadProjectJson(call: PluginCall) {
+        val projectId = call.getString("projectId") ?: run {
+            call.reject("Missing projectId")
+            return
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val obj = engine.loadProjectJson(projectId)
+                call.resolve(JSObject().apply {
+                    put("found", obj != null)
+                    if (obj != null) put("project", JSObject(obj.toString()))
+                })
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось загрузить проект")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun deleteProjectJson(call: PluginCall) {
+        val projectId = call.getString("projectId") ?: run {
+            call.reject("Missing projectId")
+            return
+        }
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val deleted = engine.deleteProjectJson(projectId)
+                call.resolve(JSObject().apply { put("deleted", deleted) })
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось удалить проект")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun cleanupUnusedMedia(call: PluginCall) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val resJson = engine.cleanupUnusedMedia()
+                call.resolve(JSObject(resJson.toString()))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось очистить неиспользуемые файлы")
             }
         }
     }

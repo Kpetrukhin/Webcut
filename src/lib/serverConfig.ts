@@ -98,6 +98,12 @@ export function resolveMediaSrc(src: string | undefined): string | undefined {
   ) {
     return src;
   }
+  if (src.startsWith('media/')) {
+    const baseName = extractMediaFileName(src);
+    const serverPath = `/media/${encodeURIComponent(baseName)}`;
+    const base = getSavedServerUrl();
+    return base ? `${base}${serverPath}` : serverPath;
+  }
   if (src.startsWith('/uploads/') || src.startsWith('/media/')) {
     const base = getSavedServerUrl();
     if (base) return `${base}${src}`;
@@ -114,7 +120,7 @@ export function extractMediaFileName(
   }
   if (!src) return '';
   const withoutQuery = src.split('?')[0];
-  const lastSeg = withoutQuery.split('/').pop() || '';
+  const lastSeg = withoutQuery.split(/[\\/]/).pop() || '';
   try {
     return decodeURIComponent(lastSeg);
   } catch {

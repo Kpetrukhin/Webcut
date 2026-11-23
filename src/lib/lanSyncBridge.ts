@@ -6,17 +6,30 @@ import type {
   ProjectState,
 } from '../shared/types.ts';
 import {
+  extractMediaFileName,
   getApiUrl,
   getSavedServerUrl,
   isNativeCapacitorApp,
   resolveMediaCandidateUrls,
+  resolveMediaSrc,
 } from './serverConfig.ts';
-import {sha256Hex} from './sha256.ts';
 import {
+  buildDedupMediaFileName,
+  computeFastMediaFingerprint,
+  sha256Hex,
+} from './sha256.ts';
+import {
+  checkMediaInLocalFolder,
+  cleanupUnusedMediaInLocalFolder,
+  deleteProjectJsonFromLocalFolder,
+  listProjectsJsonFromLocalFolder,
+  loadProjectJsonFromLocalFolder,
   readMediaFromLocalFolder,
   saveMediaToLocalFolder,
+  saveProjectJsonToLocalFolder,
 } from './mediaStorage.ts';
-import type {ServerStorageConfig} from './mediaStorage.ts';
+import type {CleanupMediaResult, ServerStorageConfig} from './mediaStorage.ts';
+import {dehydrateProjectForStorage} from './localProjects.ts';
 
 export interface NativeStorageConfig {
   currentDir: string;
@@ -111,6 +124,45 @@ interface LanSyncPluginInterface {
   resetStorageFolder?: (options?: {
     migrateExisting?: boolean;
   }) => Promise<NativeStorageConfig & {migratedCount?: number}>;
+  checkMediaExists?: (options: {
+    fileName: string;
+    expectedSize?: number;
+  }) => Promise<{
+    exists: boolean;
+    fileName?: string;
+    baseName?: string;
+    relativePath?: string;
+    fileSize?: number;
+    fileHash?: string;
+    localUrl?: string;
+    shareUrl?: string;
+  }>;
+  importMediaUri?: (options: {
+    uri: string;
+    fileName?: string;
+  }) => Promise<{
+    ok: boolean;
+    deduplicated?: boolean;
+    fileName: string;
+    baseName?: string;
+    relativePath?: string;
+    fileSize?: number;
+    fileHash?: string;
+    localUrl: string;
+    shareUrl: string;
+  }>;
+  saveProjectJson?: (options: {
+    projectId: string;
+    projectJson: string;
+  }) => Promise<{ok: boolean; projectId: string; relativePath: string}>;
+  listProjectsJson?: () => Promise<{projects: ProjectState[]}>;
+  loadProjectJson?: (options: {
+    projectId: string;
+  }) => Promise<{found: boolean; project?: ProjectState}>;
+  deleteProjectJson?: (options: {
+    projectId: string;
+  }) => Promise<{deleted: boolean}>;
+  cleanupUnusedMedia?: () => Promise<CleanupMediaResult & {ok?: boolean}>;
   addListener(
     eventName: 'udpRoomsUpdate',
     listenerFunc: (data: {rooms: DiscoveredUdpRoom[]}) => void
@@ -370,6 +422,7 @@ export interface PreparedP2PMedia {
   shareUrl: string;
   fileSize?: number;
   fileHash?: string;
+  deduplicated?: boolean;
 }
 
 const MAX_CLIENT_HASH_BYTES = 250 * 1024 * 1024;
@@ -384,9 +437,11 @@ function uploadFormWithProgress(
     name?: string;
     kind?: 'video' | 'image' | 'audio' | 'font';
     fileName?: string;
+    baseName?: string;
     src?: string;
     sizeBytes?: number;
     fileHash?: string;
+    deduplicated?: boolean;
   };
 }> {
   return new Promise((resolve, reject) => {
@@ -403,9 +458,11 @@ function uploadFormWithProgress(
           name?: string;
           kind?: 'video' | 'image' | 'audio' | 'font';
           fileName?: string;
+          baseName?: string;
           src?: string;
           sizeBytes?: number;
           fileHash?: string;
+          deduplicated?: boolean;
         };
         onProgress?.(100);
         resolve({
@@ -427,24 +484,67 @@ export async function uploadFileForP2P(
   fallbackKind: 'video' | 'image' | 'audio' | 'font',
   onProgress?: (pct: number) => void
 ): Promise<PreparedP2PMedia> {
-  const safeBase = file.name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'media.bin';
-  const stampedName = `${Date.now()}-${safeBase}`;
-  let localHash: string | undefined;
-  if (file.size <= MAX_CLIENT_HASH_BYTES) {
-    try {
-      localHash = await sha256Hex(await file.arrayBuffer());
-    } catch {
-      localHash = undefined;
-    }
-  }
   const localSize = file.size;
+  const fastFp = await computeFastMediaFingerprint(file);
+  const dedup = buildDedupMediaFileName(
+    fastFp.hash,
+    fastFp.size,
+    file.name,
+    file.type
+  );
 
-  // 1. Native Android Ktor HTTP streaming (/media/upload -> /media/{fileName})
+  let cachedFullHash: string | undefined;
+  const computeFullHashIfNeeded = async () => {
+    if (cachedFullHash) return cachedFullHash;
+    if (file.size <= MAX_CLIENT_HASH_BYTES) {
+      try {
+        cachedFullHash = await sha256Hex(await file.arrayBuffer());
+      } catch {
+        cachedFullHash = undefined;
+      }
+    }
+    return cachedFullHash;
+  };
+
+  // 1. Native Android Ktor HTTP streaming & fast deduplication (media/<hash>_<size>.<ext>)
   if (hasNativeLanPlugin()) {
     try {
       const srv = await LanSync.ensureMediaServer();
+      const shareIp = pickBestShareIpForRemoteHost(
+        srv.interfaces || [],
+        srv.primaryIp || '127.0.0.1'
+      );
+
+      if (typeof LanSync.checkMediaExists === 'function') {
+        const check = await LanSync.checkMediaExists({
+          fileName: dedup.baseName,
+          expectedSize: localSize,
+        });
+        if (check?.exists) {
+          const baseName = extractMediaFileName(
+            check.fileName,
+            check.baseName || dedup.baseName
+          );
+          const relPath = check.fileName || `media/${baseName}`;
+          const localSrc =
+            check.localUrl || `http://127.0.0.1:${srv.port}/media/${encodeURIComponent(baseName)}`;
+          const shareUrl = `http://${shareIp}:${srv.port}/media/${encodeURIComponent(baseName)}`;
+          onProgress?.(100);
+          return {
+            name: file.name,
+            fileName: relPath,
+            kind: fallbackKind,
+            localSrc,
+            shareUrl,
+            fileSize: check.fileSize ?? localSize,
+            fileHash: check.fileHash,
+            deduplicated: true,
+          };
+        }
+      }
+
       const uploadRes = await fetch(
-        `${srv.localUploadUrl}?fileName=${encodeURIComponent(stampedName)}`,
+        `${srv.localUploadUrl}?fileName=${encodeURIComponent(dedup.baseName)}`,
         {
           method: 'POST',
           body: file,
@@ -453,25 +553,29 @@ export async function uploadFileForP2P(
       if (uploadRes.ok) {
         const data = (await uploadRes.json()) as {
           fileName: string;
+          baseName?: string;
           localUrl: string;
           shareUrl: string;
           fileSize?: number;
           fileHash?: string;
+          deduplicated?: boolean;
         };
-        const shareIp = pickBestShareIpForRemoteHost(
-          srv.interfaces || [],
-          srv.primaryIp || '127.0.0.1'
+        const baseName = extractMediaFileName(
+          data.fileName,
+          data.baseName || dedup.baseName
         );
-        const shareUrl = `http://${shareIp}:${srv.port}/media/${encodeURIComponent(data.fileName)}`;
+        const relPath = data.fileName || `media/${baseName}`;
+        const shareUrl = `http://${shareIp}:${srv.port}/media/${encodeURIComponent(baseName)}`;
         onProgress?.(100);
         return {
           name: file.name,
-          fileName: data.fileName,
+          fileName: relPath,
           kind: fallbackKind,
           localSrc: data.localUrl,
           shareUrl,
           fileSize: data.fileSize ?? localSize,
-          fileHash: data.fileHash ?? localHash,
+          fileHash: data.fileHash ?? (await computeFullHashIfNeeded()),
+          deduplicated: Boolean(data.deduplicated),
         };
       }
     } catch {
@@ -479,10 +583,61 @@ export async function uploadFileForP2P(
     }
   }
 
-  // 2. Web / Node Express HTTP /api/upload
+  // 2. Web / Node Express HTTP: check dedup existence before uploading
   const uploadEndpoint = getApiUrl('/api/upload');
   if (uploadEndpoint) {
     try {
+      const origin =
+        isNativeCapacitorApp() && getSavedServerUrl()
+          ? getSavedServerUrl()
+          : window.location.origin;
+
+      const existsEndpoint = getApiUrl(
+        `/api/media/exists?fileName=${encodeURIComponent(dedup.baseName)}&expectedSize=${localSize}`
+      );
+      if (existsEndpoint) {
+        try {
+          const checkRes = await fetch(existsEndpoint);
+          if (checkRes.ok) {
+            const checkData = (await checkRes.json()) as {
+              exists?: boolean;
+              fileName?: string;
+              baseName?: string;
+              localUrl?: string;
+              fileSize?: number;
+              fileHash?: string;
+            };
+            if (checkData.exists && checkData.localUrl) {
+              const baseName = extractMediaFileName(
+                checkData.fileName,
+                checkData.baseName || dedup.baseName
+              );
+              const relPath = checkData.fileName || `media/${baseName}`;
+              const alreadyLocal = await checkMediaInLocalFolder(baseName, localSize);
+              if (!alreadyLocal) {
+                void saveMediaToLocalFolder(baseName, file).catch(() => {});
+              }
+              const shareUrl = checkData.localUrl.startsWith('http')
+                ? checkData.localUrl
+                : `${origin}${checkData.localUrl}`;
+              onProgress?.(100);
+              return {
+                name: file.name,
+                fileName: relPath,
+                kind: fallbackKind,
+                localSrc: checkData.localUrl,
+                shareUrl,
+                fileSize: checkData.fileSize ?? localSize,
+                fileHash: checkData.fileHash,
+                deduplicated: true,
+              };
+            }
+          }
+        } catch {
+          // continue to full upload
+        }
+      }
+
       const form = new FormData();
       form.append('file', file);
       const {ok, data} =
@@ -494,30 +649,33 @@ export async function uploadFileForP2P(
                 name?: string;
                 kind?: 'video' | 'image' | 'audio' | 'font';
                 fileName?: string;
+                baseName?: string;
                 src?: string;
                 sizeBytes?: number;
                 fileHash?: string;
+                deduplicated?: boolean;
               };
               return {ok: r.ok, data: j};
             })();
       if (ok && data.src) {
-        const fileName = data.fileName || data.src.split('/').pop() || stampedName;
-        void saveMediaToLocalFolder(fileName, file).catch(() => {});
-        const origin =
-          isNativeCapacitorApp() && getSavedServerUrl()
-            ? getSavedServerUrl()
-            : window.location.origin;
+        const baseName = extractMediaFileName(
+          data.src,
+          data.baseName || data.fileName || dedup.baseName
+        );
+        const relPath = data.fileName || `media/${baseName}`;
+        void saveMediaToLocalFolder(baseName, file).catch(() => {});
         const shareUrl = data.src.startsWith('http')
           ? data.src
           : `${origin}${data.src}`;
         return {
           name: data.name || file.name,
-          fileName,
+          fileName: relPath,
           kind: data.kind || fallbackKind,
           localSrc: data.src,
           shareUrl,
           fileSize: data.sizeBytes ?? localSize,
-          fileHash: data.fileHash ?? localHash,
+          fileHash: data.fileHash ?? (await computeFullHashIfNeeded()),
+          deduplicated: Boolean(data.deduplicated),
         };
       }
     } catch {
@@ -525,17 +683,23 @@ export async function uploadFileForP2P(
     }
   }
 
-  void saveMediaToLocalFolder(stampedName, file).catch(() => {});
-  const blobUrl = URL.createObjectURL(file);
+  // 3. Offline browser storage fallback with deduplication
+  const existingLocal = await readMediaFromLocalFolder(dedup.baseName, localSize);
+  if (!existingLocal) {
+    void saveMediaToLocalFolder(dedup.baseName, file).catch(() => {});
+  }
+  const blobUrl = URL.createObjectURL(existingLocal || file);
+  const localHash = await computeFullHashIfNeeded();
   onProgress?.(100);
   return {
     name: file.name,
-    fileName: stampedName,
+    fileName: dedup.relativePath,
     kind: fallbackKind,
     localSrc: blobUrl,
     shareUrl: blobUrl,
     fileSize: localSize,
     fileHash: localHash,
+    deduplicated: Boolean(existingLocal),
   };
 }
 
@@ -852,6 +1016,241 @@ export async function resetNativeStorageFolder(
     return null;
   }
   return await LanSync.resetStorageFolder({migrateExisting});
+}
+
+export async function resolvePortableMediaUrl(
+  relPath: string,
+  expectedSize?: number
+): Promise<string | undefined> {
+  const baseName = extractMediaFileName(relPath);
+  if (!baseName) return undefined;
+
+  if (hasNativeLanPlugin()) {
+    try {
+      const srv = await LanSync.ensureMediaServer();
+      if (typeof LanSync.checkMediaExists === 'function') {
+        const res = await LanSync.checkMediaExists({
+          fileName: baseName,
+          expectedSize,
+        });
+        if (res.exists && res.localUrl) {
+          return res.localUrl;
+        }
+      }
+      if (srv?.port) {
+        return `http://127.0.0.1:${srv.port}/media/${encodeURIComponent(baseName)}`;
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  try {
+    const cached = await readMediaFromLocalFolder(baseName, expectedSize);
+    if (cached) {
+      return URL.createObjectURL(cached);
+    }
+  } catch {
+    // fall through
+  }
+
+  return resolveMediaSrc(`media/${baseName}`);
+}
+
+export async function saveProjectToRootStorage(
+  project: ProjectState
+): Promise<void> {
+  if (!project || !project.roomId) return;
+  const portable = dehydrateProjectForStorage(project);
+  const projectJson = JSON.stringify(portable, null, 2);
+
+  const tasks: Array<Promise<unknown>> = [];
+
+  if (hasNativeLanPlugin() && typeof LanSync.saveProjectJson === 'function') {
+    tasks.push(
+      LanSync.saveProjectJson({
+        projectId: portable.roomId,
+        projectJson,
+      }).catch(() => {})
+    );
+  } else {
+    tasks.push(
+      saveProjectJsonToLocalFolder(portable.roomId, projectJson).catch(() => {})
+    );
+  }
+
+  const endpoint = getApiUrl(
+    `/api/projects/${encodeURIComponent(portable.roomId)}`
+  );
+  if (endpoint) {
+    tasks.push(
+      fetch(endpoint, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: projectJson,
+      }).catch(() => {})
+    );
+  }
+
+  await Promise.all(tasks);
+}
+
+export async function listProjectsFromRootStorage(): Promise<ProjectState[]> {
+  const byId = new Map<string, ProjectState>();
+  const ingest = (items?: ProjectState[]) => {
+    if (!Array.isArray(items)) return;
+    for (const item of items) {
+      if (!item || typeof item.roomId !== 'string') continue;
+      const prev = byId.get(item.roomId);
+      if (!prev || (item.updatedAt ?? 0) >= (prev.updatedAt ?? 0)) {
+        byId.set(item.roomId, item);
+      }
+    }
+  };
+
+  const promises: Array<Promise<void>> = [];
+
+  if (hasNativeLanPlugin() && typeof LanSync.listProjectsJson === 'function') {
+    promises.push(
+      LanSync.listProjectsJson()
+        .then((res) => ingest(res?.projects))
+        .catch(() => {})
+    );
+  } else {
+    promises.push(
+      listProjectsJsonFromLocalFolder<ProjectState>()
+        .then((items) => ingest(items))
+        .catch(() => {})
+    );
+  }
+
+  const endpoint = getApiUrl('/api/projects');
+  if (endpoint) {
+    promises.push(
+      fetch(endpoint)
+        .then(async (r) => {
+          if (!r.ok) return;
+          const data = (await r.json()) as {projects?: ProjectState[]};
+          ingest(data.projects);
+        })
+        .catch(() => {})
+    );
+  }
+
+  await Promise.all(promises);
+  return Array.from(byId.values()).sort(
+    (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)
+  );
+}
+
+export async function loadProjectFromRootStorage(
+  projectId: string
+): Promise<ProjectState | null> {
+  if (!projectId) return null;
+  let best: ProjectState | null = null;
+  const pick = (candidate?: ProjectState | null) => {
+    if (!candidate || typeof candidate.roomId !== 'string') return;
+    if (!best || (candidate.updatedAt ?? 0) >= (best.updatedAt ?? 0)) {
+      best = candidate;
+    }
+  };
+
+  const promises: Array<Promise<void>> = [];
+
+  if (hasNativeLanPlugin() && typeof LanSync.loadProjectJson === 'function') {
+    promises.push(
+      LanSync.loadProjectJson({projectId})
+        .then((res) => {
+          if (res?.found && res.project) pick(res.project);
+        })
+        .catch(() => {})
+    );
+  } else {
+    promises.push(
+      loadProjectJsonFromLocalFolder<ProjectState>(projectId)
+        .then((p) => pick(p))
+        .catch(() => {})
+    );
+  }
+
+  const endpoint = getApiUrl(`/api/projects/${encodeURIComponent(projectId)}`);
+  if (endpoint) {
+    promises.push(
+      fetch(endpoint)
+        .then(async (r) => {
+          if (!r.ok) return;
+          const data = (await r.json()) as {
+            found?: boolean;
+            project?: ProjectState;
+          };
+          if (data.found && data.project) pick(data.project);
+        })
+        .catch(() => {})
+    );
+  }
+
+  await Promise.all(promises);
+  return best;
+}
+
+export async function deleteProjectFromRootStorage(
+  projectId: string
+): Promise<void> {
+  if (!projectId) return;
+  const tasks: Array<Promise<unknown>> = [];
+
+  if (hasNativeLanPlugin() && typeof LanSync.deleteProjectJson === 'function') {
+    tasks.push(LanSync.deleteProjectJson({projectId}).catch(() => {}));
+  } else {
+    tasks.push(deleteProjectJsonFromLocalFolder(projectId).catch(() => {}));
+  }
+
+  const endpoint = getApiUrl(`/api/projects/${encodeURIComponent(projectId)}`);
+  if (endpoint) {
+    tasks.push(fetch(endpoint, {method: 'DELETE'}).catch(() => {}));
+  }
+
+  await Promise.all(tasks);
+}
+
+export async function cleanupUnusedMediaStorage(): Promise<CleanupMediaResult> {
+  if (hasNativeLanPlugin() && typeof LanSync.cleanupUnusedMedia === 'function') {
+    const res = await LanSync.cleanupUnusedMedia();
+    return {
+      deletedCount: res.deletedCount ?? 0,
+      freedBytes: res.freedBytes ?? 0,
+      remainingCount: res.remainingCount ?? 0,
+      remainingBytes: res.remainingBytes ?? 0,
+    };
+  }
+
+  const [localRes, srvRes] = await Promise.all([
+    cleanupUnusedMediaInLocalFolder().catch<CleanupMediaResult>(() => ({
+      deletedCount: 0,
+      freedBytes: 0,
+      remainingCount: 0,
+      remainingBytes: 0,
+    })),
+    (async (): Promise<CleanupMediaResult | null> => {
+      const endpoint = getApiUrl('/api/storage/cleanup');
+      if (!endpoint) return null;
+      try {
+        const res = await fetch(endpoint, {method: 'POST'});
+        if (!res.ok) return null;
+        return (await res.json()) as CleanupMediaResult;
+      } catch {
+        return null;
+      }
+    })(),
+  ]);
+
+  if (!srvRes) return localRes;
+  return {
+    deletedCount: localRes.deletedCount + (srvRes.deletedCount ?? 0),
+    freedBytes: localRes.freedBytes + (srvRes.freedBytes ?? 0),
+    remainingCount: Math.max(localRes.remainingCount, srvRes.remainingCount ?? 0),
+    remainingBytes: Math.max(localRes.remainingBytes, srvRes.remainingBytes ?? 0),
+  };
 }
 
 export interface CompressedMediaResult {
