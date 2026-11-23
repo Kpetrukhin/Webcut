@@ -1824,3 +1824,63 @@ test('Трекинг объектов (VitTrack) и полигон «По точ
   assert.ok(Math.abs(resolved[2].x - 0.8) < 0.01);
 });
 
+test('Волшебная палочка (MobileSAM): трассировка контура без сдвига координат и создание обычного слоя-наложения (rgba(0,191,255,0.3))', async () => {
+  const {
+    SAM_MAGIC_WAND_FILL_HEX,
+    SAM_MAGIC_WAND_FILL_OPACITY,
+    createSamOverlayShapeClip,
+    extractContourPolygonPointsFromAlphaGrid,
+  } = await import('../src/lib/samContourEngine.ts');
+
+  // Non-square off-diagonal region (x != y) to verify row-major Moore-Neighbor stopping condition
+  const w = 80;
+  const h = 60;
+  const alpha = new Uint8Array(w * h);
+  for (let y = 12; y <= 44; y++) {
+    for (let x = 28; x <= 68; x++) {
+      alpha[y * w + x] = 255;
+    }
+  }
+
+  const pts = extractContourPolygonPointsFromAlphaGrid(alpha, w, h, {
+    threshold: 128,
+    maxPoints: 44,
+    minPoints: 4,
+  });
+
+  assert.ok(pts.length >= 4 && pts.length <= 44);
+  const xs = pts.map((p) => p.x);
+  const ys = pts.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+
+  // Expected normalized bounds: x in [28.5/80 .. 68.5/80] = [0.356 .. 0.856], y in [12.5/60 .. 44.5/60] = [0.208 .. 0.742]
+  assert.ok(Math.abs(minX - 28.5 / w) < 0.03, `minX=${minX}`);
+  assert.ok(Math.abs(maxX - 68.5 / w) < 0.03, `maxX=${maxX}`);
+  assert.ok(Math.abs(minY - 12.5 / h) < 0.03, `minY=${minY}`);
+  assert.ok(Math.abs(maxY - 44.5 / h) < 0.03, `maxY=${maxY}`);
+
+  const clipDraft = createSamOverlayShapeClip({
+    points: pts,
+    start: 2.25,
+  });
+
+  assert.equal(clipDraft.track, 'overlay');
+  assert.equal(clipDraft.kind, 'shape');
+  assert.equal(clipDraft.start, 2.25);
+  assert.equal(clipDraft.adjustmentMask, false);
+  assert.equal(clipDraft.mask, undefined);
+  assert.equal(clipDraft.filter, 'none');
+  assert.equal(clipDraft.blur, undefined);
+  assert.equal(clipDraft.shapeStyle?.shapeType, 'points');
+  assert.equal(clipDraft.shapeStyle?.fillColor, SAM_MAGIC_WAND_FILL_HEX);
+  assert.equal(clipDraft.shapeStyle?.fillColor, '#00bfff');
+  assert.equal(clipDraft.shapeStyle?.fillOpacity, SAM_MAGIC_WAND_FILL_OPACITY);
+  assert.equal(clipDraft.shapeStyle?.fillOpacity, 0.3);
+  assert.equal(clipDraft.shapeStyle?.strokeWidth, 0);
+  assert.equal(clipDraft.shapeStyle?.points?.length, pts.length);
+});
+
+

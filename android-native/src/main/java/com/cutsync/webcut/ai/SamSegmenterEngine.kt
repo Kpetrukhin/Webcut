@@ -530,6 +530,19 @@ class SamSegmenterEngine(private val appContext: Context) {
             return top + (bot - top) * dy
         }
 
+        var minVal = Float.POSITIVE_INFINITY
+        var maxVal = Float.NEGATIVE_INFINITY
+        val planeEnd = min(masksData.size, planeOffset + planeSize)
+        for (idx in planeOffset until planeEnd) {
+            val v = masksData[idx]
+            if (v.isFinite()) {
+                if (v < minVal) minVal = v
+                if (v > maxVal) maxVal = v
+            }
+        }
+        val isProbabilityMask = minVal >= -1e-4f && maxVal <= 1.0001f && minVal < maxVal
+        val maskThreshold = if (isProbabilityMask) 0.5f else 0f
+
         for (y in 0 until outH) {
             val my = if (isAlreadyOrigSize) {
                 y.toFloat()
@@ -550,7 +563,7 @@ class SamSegmenterEngine(private val appContext: Context) {
                     sampleLogitBilinear(mx, my)
                 }
 
-                if (logit > 0f) {
+                if (logit > maskThreshold) {
                     outPixels[rowOff + x] = Color.WHITE
                     fgCount++
                     if (x < minX) minX = x

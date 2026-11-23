@@ -283,27 +283,35 @@ export function extractContourPolygonPointsFromAlphaGrid(
   let cy = startY;
   // Came from West (background pixel at startX - 1, startY), so first clockwise check is NW/N
   let enterDir = 6; // W
+  let firstNextIdx = -1;
   const maxSteps = Math.min(total * 4, bestLabelPixels.length * 8 + 16);
 
   perimeter.push({x: (cx + 0.5) / w, y: (cy + 0.5) / h});
 
   for (let step = 0; step < maxSteps; step++) {
     let found = false;
+    const prevIdx = cy * w + cx;
     const startSearch = (enterDir + 1) & 7;
     for (let k = 0; k < 8; k++) {
       const dir = (startSearch + k) & 7;
       const nx = cx + dX[dir];
       const ny = cy + dY[dir];
       if (nx >= 0 && nx < w && ny >= 0 && ny < h && mask[ny * w + nx] === 1) {
+        const nextIdx = ny * w + nx;
+        if (firstNextIdx === -1) {
+          firstNextIdx = nextIdx;
+        } else if (prevIdx === startIdx && nextIdx === firstNextIdx) {
+          return finishContour(perimeter, maxPoints, minPoints, bboxFallback);
+        }
+
+        const oldX = cx;
+        const oldY = cy;
         cx = nx;
         cy = ny;
-        // Backtrack direction from new pixel to previous empty neighbor
         enterDir = (dir + 4) & 7;
-        // Walk back one step before dir was hit to ensure clockwise outer hug
         const prevEmpty = (dir + 7) & 7;
-        const px = (cx - dX[dir]) + dX[prevEmpty];
-        const py = (cy - dY[dir]) + dY[prevEmpty];
-        // Compute exact direction from new pixel (cx,cy) to the last empty neighbor
+        const px = oldX + dX[prevEmpty];
+        const py = oldY + dY[prevEmpty];
         for (let b = 0; b < 8; b++) {
           if (cx + dX[b] === px && cy + dY[b] === py) {
             enterDir = b;
@@ -316,12 +324,21 @@ export function extractContourPolygonPointsFromAlphaGrid(
     }
 
     if (!found) break;
-    if (cx * w + cy === startIdx && perimeter.length > 2) {
+    if (cy * w + cx === startIdx && perimeter.length > 2 && firstNextIdx === -1) {
       break;
     }
     perimeter.push({x: (cx + 0.5) / w, y: (cy + 0.5) / h});
   }
 
+  return finishContour(perimeter, maxPoints, minPoints, bboxFallback);
+}
+
+function finishContour(
+  perimeter: Array<{x: number; y: number}>,
+  maxPoints: number,
+  minPoints: number,
+  bboxFallback: () => PolygonPoint[]
+): PolygonPoint[] {
   if (perimeter.length < 3) {
     return bboxFallback();
   }

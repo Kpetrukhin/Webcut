@@ -1,5 +1,6 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
+  Check,
   ChevronLeft,
   ChevronsUpDown,
   CopyPlus,
@@ -13,6 +14,7 @@ import {
   Home,
   ImagePlus,
   Layers,
+  Loader2,
   MessageSquare,
   Minimize2,
   Move,
@@ -37,6 +39,7 @@ import {
   Type,
   Undo2,
   Wifi,
+  X,
 } from 'lucide-react';
 import {
   createDefaultTracks,
@@ -87,7 +90,11 @@ import type {
   ExportQuality,
   ExportResolution,
 } from './lib/exportEngine.ts';
-import {getCanvasDimensions, MediaPool} from './lib/renderEngine.ts';
+import {
+  getCanvasDimensions,
+  MediaPool,
+  renderCompositeFrame,
+} from './lib/renderEngine.ts';
 import {
   getApiUrl,
   isNativeCapacitorApp,
@@ -123,7 +130,11 @@ import {AudioPanel} from './components/AudioPanel.tsx';
 import {AppSettingsModal} from './components/AppSettingsModal.tsx';
 import {AIModelManagerModal} from './components/AIModelManagerModal.tsx';
 import {requestAIFeature, webcutAI} from './lib/webcutAi.ts';
-import type {TrackBbox} from './lib/webcutAi.ts';
+import type {SamPointInput, TrackBbox} from './lib/webcutAi.ts';
+import {
+  createSamOverlayShapeClip,
+  extractContourFromMaskDataUrl,
+} from './lib/samContourEngine.ts';
 import {ChromaKeyPanel} from './components/ChromaKeyPanel.tsx';
 import {ColorAdjustPanel} from './components/ColorAdjustPanel.tsx';
 import {CropEditorModal} from './components/CropEditorModal.tsx';
@@ -285,6 +296,18 @@ export default function App() {
     progress: number;
     livePoint: {x: number; y: number} | null;
   } | null>(null);
+  const [magicWandSession, setMagicWandSession] = useState<{
+    points: SamPointInput[];
+    mode: 1 | 0;
+    tintedMaskDataUrl: string | null;
+    contourPoints: PolygonPoint[];
+    isEncoding: boolean;
+    isBusy: boolean;
+    encodeTimeMs?: number;
+    decodeTimeMs?: number;
+    iou?: number;
+  } | null>(null);
+  const magicWandSeqRef = useRef(0);
   const [showCropModal, setShowCropModal] = useState(false);
   const [customColorPresets, setCustomColorPresets] = useState<
     ColorFilterPreset[]
@@ -1799,6 +1822,8 @@ export default function App() {
       setMobileSheet(null);
       setShowOpacitySlider(false);
       setShowChromaKeyPanel(false);
+      magicWandSeqRef.current += 1;
+      setMagicWandSession(null);
       const preferKeyframes =
         Boolean(requestedClip) &&
         !(
@@ -1950,6 +1975,227 @@ export default function App() {
     }
     setObjectTrackSession(null);
   }, [objectTrackSession]);
+
+  const handleStartMagicWand = useCallback(async () => {
+    const p = projectRef.current;
+    if (p.clips.length === 0) {
+      showTransientNotice('Добавьте фото или видео на таймлайн для выделения');
+      return;
+    }
+
+    try {
+      const prep = await webcutAI.prepareModel('sam2_tiny_seg');
+      if (!prep.ok || !prep.ready) {
+        requestAIFeature('sam2_tiny_seg', '✨ Волшебная палочка (MobileSAM)');
+        return;
+      }
+    } catch {
+      requestAIFeature('sam2_tiny_seg', '✨ Волшебная палочка (MobileSAM)');
+      return;
+    }
+
+    setIsPlaying(false);
+    setMobileSheet(null);
+    setMobileEditTool(null);
+    setShowTrackpad(false);
+    setShowOpacitySlider(false);
+    setShowChromaKeyPanel(false);
+    setObjectTrackSession(null);
+
+    const seq = ++magicWandSeqRef.current;
+    setMagicWandSession({
+      points: [],
+      mode: 1,
+      tintedMaskDataUrl: null,
+      contourPoints: [],
+      isEncoding: true,
+      isBusy: true,
+    });
+
+    try {
+      const {width: cw, height: ch} = getCanvasDimensions(p.aspectRatio);
+      const offscreen = document.createElement('canvas');
+      offscreen.width = cw;
+      offscreen.height = ch;
+      const ctx = offscreen.getContext('2d');
+      if (!ctx) {
+        throw new Error('Не удалось инициализировать 2D-контекст для кадра');
+      }
+
+      const pool = mediaPoolRef.current ?? (mediaPoolRef.current = new MediaPool());
+      renderCompositeFrame(
+        ctx,
+        cw,
+        ch,
+        p.clips,
+        currentTime,
+        pool,
+        null,
+        [],
+        p.tracks,
+        p.backgroundColor,
+        undefined,
+        user.id,
+        null,
+        p.canvasBackground,
+        p.trackers
+      );
+
+      const frameDataUrl = offscreen.toDataURL('image/jpeg', 0.92);
+      const enc = await webcutAI.encodeSamFrame(frameDataUrl);
+      if (magicWandSeqRef.current !== seq) return;
+
+      setMagicWandSession((cur) =>
+        cur
+          ? {
+              ...cur,
+              isEncoding: false,
+              isBusy: false,
+              encodeTimeMs: enc.encodeTimeMs,
+            }
+          : null
+      );
+    } catch (err) {
+      if (magicWandSeqRef.current !== seq) return;
+      setMagicWandSession(null);
+      showTransientNotice(
+        err instanceof Error
+          ? err.message
+          : 'Не удалось закодировать кадр (MobileSAM)'
+      );
+    }
+  }, [currentTime, showTransientNotice, user.id]);
+
+  const runMagicWandDecode = useCallback(
+    async (nextPoints: SamPointInput[]) => {
+      if (nextPoints.length === 0) {
+        magicWandSeqRef.current += 1;
+        setMagicWandSession((cur) =>
+          cur
+            ? {
+                ...cur,
+                points: [],
+                tintedMaskDataUrl: null,
+                contourPoints: [],
+                isBusy: false,
+                decodeTimeMs: undefined,
+                iou: undefined,
+              }
+            : null
+        );
+        return;
+      }
+
+      const seq = ++magicWandSeqRef.current;
+      setMagicWandSession((cur) =>
+        cur ? {...cur, points: nextPoints, isBusy: true} : null
+      );
+
+      try {
+        const dec = await webcutAI.decodeSamPoints(nextPoints, true);
+        if (magicWandSeqRef.current !== seq) return;
+        const extracted = await extractContourFromMaskDataUrl(dec.maskDataUrl);
+        if (magicWandSeqRef.current !== seq) return;
+
+        setMagicWandSession((cur) =>
+          cur
+            ? {
+                ...cur,
+                points: nextPoints,
+                tintedMaskDataUrl:
+                  extracted.tintedPreviewDataUrl ?? dec.maskDataUrl,
+                contourPoints: extracted.points,
+                isBusy: false,
+                decodeTimeMs: dec.decodeTimeMs,
+                iou: dec.iou,
+              }
+            : null
+        );
+
+        if (extracted.points.length < 3) {
+          showTransientNotice('Объект не распознан — попробуйте другую точку');
+        }
+      } catch (err) {
+        if (magicWandSeqRef.current !== seq) return;
+        setMagicWandSession((cur) => (cur ? {...cur, isBusy: false} : null));
+        showTransientNotice(
+          err instanceof Error ? err.message : 'Ошибка выделения объекта (SAM)'
+        );
+      }
+    },
+    [showTransientNotice]
+  );
+
+  const handleAddMagicWandPoint = useCallback(
+    (nx: number, ny: number) => {
+      if (!magicWandSession || magicWandSession.isBusy) return;
+      const nextPoints: SamPointInput[] = [
+        ...magicWandSession.points,
+        {
+          x: Math.round(nx * 10000) / 10000,
+          y: Math.round(ny * 10000) / 10000,
+          label: magicWandSession.mode,
+        },
+      ];
+      void runMagicWandDecode(nextPoints);
+    },
+    [magicWandSession, runMagicWandDecode]
+  );
+
+  const handleRemoveMagicWandPoint = useCallback(
+    (index: number) => {
+      if (!magicWandSession || magicWandSession.isBusy) return;
+      if (index < 0 || index >= magicWandSession.points.length) return;
+      const nextPoints = magicWandSession.points.filter((_, i) => i !== index);
+      void runMagicWandDecode(nextPoints);
+    },
+    [magicWandSession, runMagicWandDecode]
+  );
+
+  const handleApplyMagicWand = useCallback(() => {
+    if (!magicWandSession || magicWandSession.contourPoints.length < 3) return;
+    const selectedTrackIdx =
+      selectedClip && selectedClip.track !== 'audio'
+        ? project.tracks.findIndex((t) => t.id === selectedClip.trackId)
+        : -1;
+
+    const clipDraft = createSamOverlayShapeClip({
+      points: magicWandSession.contourPoints,
+      start: currentTime,
+    });
+    const {clip} = addClip(clipDraft, {
+      forceNewTrack: false,
+      minTrackIndex: selectedTrackIdx,
+    });
+
+    magicWandSeqRef.current += 1;
+    setMagicWandSession(null);
+    setSelectedClipId(clip.id);
+    setDesktopTab('edit');
+    setEditSubMode('shape');
+    showTransientNotice(
+      'Слой-выделение добавлен на таймлайн — можно редактировать или включить корр. маску'
+    );
+  }, [
+    magicWandSession,
+    selectedClip,
+    project.tracks,
+    currentTime,
+    addClip,
+    showTransientNotice,
+  ]);
+
+  const handleCancelMagicWand = useCallback(() => {
+    magicWandSeqRef.current += 1;
+    setMagicWandSession(null);
+  }, []);
+
+  useEffect(() => {
+    if ((isPlaying || screen !== 'editor') && magicWandSession) {
+      magicWandSeqRef.current += 1;
+      setMagicWandSession(null);
+    }
+  }, [isPlaying, screen, magicWandSession]);
 
   const handleCreateRoom = async (opts: {
     title: string;
@@ -2949,6 +3195,9 @@ export default function App() {
                                   onCreateTracker={() =>
                                     void handleStartObjectTracking(selectedClip)
                                   }
+                                  onStartMagicWand={() =>
+                                    void handleStartMagicWand()
+                                  }
                                   onOpenAdjust={() => setEditSubMode('adjust')}
                                 />
                               )}
@@ -3034,6 +3283,9 @@ export default function App() {
                                 clip={selectedClip}
                                 currentTime={currentTime}
                                 onUpdateClip={updateClip}
+                                onStartMagicWand={() =>
+                                  void handleStartMagicWand()
+                                }
                               />
                             )}
 
@@ -3148,6 +3400,7 @@ export default function App() {
                     onCreateTracker={() =>
                       void handleStartObjectTracking(selectedClip ?? undefined)
                     }
+                    onStartMagicWand={() => void handleStartMagicWand()}
                     onOpenAdjust={() => {
                       setDesktopTab('edit');
                       setEditSubMode('adjust');
@@ -3160,6 +3413,7 @@ export default function App() {
                     onSeek={handleSeek}
                     onAddMediaClip={handleAddMediaClip}
                     onUpdateClip={(id, patch) => updateClip(id, patch)}
+                    onStartMagicWand={() => void handleStartMagicWand()}
                   />
                 )}
               </div>
@@ -3566,6 +3820,126 @@ export default function App() {
               </div>
             </div>
           )}
+          {magicWandSession && (
+            <div
+              data-testid="magic_wand_toolbar"
+              className="absolute top-3 left-1/2 z-30 flex w-[calc(100%-24px)] max-w-xl -translate-x-1/2 flex-wrap items-center justify-between gap-2 rounded-2xl border border-sky-400/50 bg-zinc-950/92 px-3 py-2 shadow-2xl backdrop-blur-md"
+            >
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+                {magicWandSession.isEncoding ? (
+                  <span className="flex items-center gap-1.5 text-[11px] font-semibold text-sky-200">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-sky-400" />
+                    <span>Кодирование кадра (MobileSAM)...</span>
+                  </span>
+                ) : (
+                  <>
+                    <div className="flex rounded-lg border border-white/10 bg-zinc-900 p-0.5 text-[11px] font-semibold">
+                      <button
+                        type="button"
+                        data-testid="magic_wand_mode_add"
+                        onClick={() =>
+                          setMagicWandSession((cur) =>
+                            cur ? {...cur, mode: 1} : null
+                          )
+                        }
+                        className={`rounded-md px-2.5 py-1 transition ${
+                          magicWandSession.mode === 1
+                            ? 'bg-sky-500 text-zinc-950'
+                            : 'text-zinc-300 hover:text-white'
+                        }`}
+                      >
+                        + Добавить
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="magic_wand_mode_exclude"
+                        onClick={() =>
+                          setMagicWandSession((cur) =>
+                            cur ? {...cur, mode: 0} : null
+                          )
+                        }
+                        className={`rounded-md px-2.5 py-1 transition ${
+                          magicWandSession.mode === 0
+                            ? 'bg-rose-500 text-white'
+                            : 'text-zinc-300 hover:text-white'
+                        }`}
+                      >
+                        − Исключить
+                      </button>
+                    </div>
+
+                    {magicWandSession.points.length > 0 && (
+                      <>
+                        <button
+                          type="button"
+                          disabled={magicWandSession.isBusy}
+                          onClick={() =>
+                            handleRemoveMagicWandPoint(
+                              magicWandSession.points.length - 1
+                            )
+                          }
+                          title="Удалить последнюю точку"
+                          className="flex h-7 items-center gap-1 rounded-lg border border-white/10 bg-zinc-900 px-2 text-[11px] text-zinc-200 hover:border-white/25 disabled:opacity-40"
+                        >
+                          <Undo2 className="h-3 w-3" />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={magicWandSession.isBusy}
+                          onClick={() => void runMagicWandDecode([])}
+                          title="Сбросить все точки"
+                          className="flex h-7 items-center gap-1 rounded-lg border border-white/10 bg-zinc-900 px-2 text-[11px] text-zinc-300 hover:text-rose-300 disabled:opacity-40"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </>
+                    )}
+
+                    <span className="flex items-center gap-1 text-[10px] text-sky-200/80">
+                      {magicWandSession.isBusy ? (
+                        <>
+                          <Loader2 className="h-3 w-3 animate-spin text-sky-300" />
+                          <span>Выделение...</span>
+                        </>
+                      ) : magicWandSession.contourPoints.length >= 3 ? (
+                        <span>
+                          Контур: {magicWandSession.contourPoints.length} т.
+                        </span>
+                      ) : (
+                        <span>Тапните по объекту на кадре</span>
+                      )}
+                    </span>
+                  </>
+                )}
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  type="button"
+                  data-testid="magic_wand_apply_button"
+                  disabled={
+                    magicWandSession.isEncoding ||
+                    magicWandSession.isBusy ||
+                    magicWandSession.contourPoints.length < 3
+                  }
+                  onClick={handleApplyMagicWand}
+                  className="flex h-7 items-center gap-1 rounded-lg bg-sky-500 px-3 text-[11px] font-bold text-zinc-950 hover:bg-sky-400 disabled:opacity-40 active:scale-95"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  <span>Применить</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="magic_wand_cancel_button"
+                  onClick={handleCancelMagicWand}
+                  className="flex h-7 items-center gap-1 rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 active:scale-95"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  <span>Отмена</span>
+                </button>
+              </div>
+            </div>
+          )}
           <div ref={previewBoxRef} className="flex-1 min-h-0">
             <PreviewCanvas
               tracks={project.tracks}
@@ -3625,6 +3999,18 @@ export default function App() {
               onChangeObjectTrackBbox={(bbox) =>
                 setObjectTrackSession((cur) => (cur ? {...cur, bbox} : null))
               }
+              magicWandSession={
+                magicWandSession
+                  ? {
+                      points: magicWandSession.points,
+                      tintedMaskDataUrl: magicWandSession.tintedMaskDataUrl,
+                      contourPoints: magicWandSession.contourPoints,
+                      isBusy: magicWandSession.isBusy,
+                    }
+                  : null
+              }
+              onAddMagicWandPoint={handleAddMagicWandPoint}
+              onRemoveMagicWandPoint={handleRemoveMagicWandPoint}
               onLockLayer={sendLayerLock}
               onSelectClip={setSelectedClipId}
               onDoubleClickTextClip={handleDoubleClickTextClip}
@@ -4165,6 +4551,7 @@ export default function App() {
                   onCreateTracker={() =>
                     void handleStartObjectTracking(selectedClip)
                   }
+                  onStartMagicWand={() => void handleStartMagicWand()}
                   onOpenAdjust={() => setMobileEditTool('adjust')}
                 />
               </div>
@@ -4194,6 +4581,7 @@ export default function App() {
                   clip={selectedClip}
                   currentTime={currentTime}
                   onUpdateClip={updateClip}
+                  onStartMagicWand={() => void handleStartMagicWand()}
                 />
               </div>
             </div>
@@ -5066,6 +5454,7 @@ export default function App() {
             onCreateTracker={() =>
               void handleStartObjectTracking(selectedClip ?? undefined)
             }
+            onStartMagicWand={() => void handleStartMagicWand()}
             onOpenAdjust={() => {
               setMobileSheet(null);
               setMobileEditTool('adjust');
@@ -5085,6 +5474,7 @@ export default function App() {
             onSeek={handleSeek}
             onAddMediaClip={handleAddMediaClip}
             onUpdateClip={(id, patch) => updateClip(id, patch)}
+            onStartMagicWand={() => void handleStartMagicWand()}
             onClose={() => setMobileSheet(null)}
           />
         </BottomSheet>

@@ -794,7 +794,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     !isPlaying &&
     showSelectionOutline &&
     !chromaKeyPickerActive &&
-    !colorPickerActive
+    !colorPickerActive &&
+    !magicWandSession
       ? getTextCurveOverlayData(activeCurveClip, width, height, currentTime)
       : null;
 
@@ -818,7 +819,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       !showSelectionOutline ||
       chromaKeyPickerActive ||
       colorPickerActive ||
-      maskEditActive
+      maskEditActive ||
+      Boolean(magicWandSession)
     ) {
       return null;
     }
