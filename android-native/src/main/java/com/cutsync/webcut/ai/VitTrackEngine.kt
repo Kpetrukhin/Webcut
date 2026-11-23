@@ -181,7 +181,7 @@ class VitTrackEngine(private val appContext: Context) {
             val stepMs = (1000L / sampleFps.coerceIn(8, 60)).coerceAtLeast(16L)
 
             val (templateInputName, searchInputName) = resolveInputNames(session)
-            val (scoreOutputName, bboxOutputName) = resolveOutputNames(session)
+            val outputBinding = resolveOutputs(session)
 
             val templateBuf = FloatArray(3 * TEMPLATE_SIZE * TEMPLATE_SIZE)
             val searchBuf = FloatArray(3 * SEARCH_SIZE * SEARCH_SIZE)
@@ -269,14 +269,14 @@ class VitTrackEngine(private val appContext: Context) {
                     )
                     ortResult = session.run(inputs)
 
-                    val scoreTensor = (ortResult.get(scoreOutputName).orElse(null) as? OnnxTensor)
-                        ?: throw IllegalStateException("VitTrack: не найден выход '$scoreOutputName'")
-                    val bboxTensor = (ortResult.get(bboxOutputName).orElse(null) as? OnnxTensor)
-                        ?: throw IllegalStateException("VitTrack: не найден выход '$bboxOutputName'")
+                    val scoreTensor = (ortResult.get(outputBinding.scoreName).orElse(null) as? OnnxTensor)
+                        ?: throw IllegalStateException("VitTrack: не найден выход '${outputBinding.scoreName}'")
 
-                    val scoreShape = (scoreTensor.info as? TensorInfo)?.shape ?: longArrayOf(1, 1, DEFAULT_SCORE_GRID.toLong(), DEFAULT_SCORE_GRID.toLong())
-                    val gridH = (if (scoreShape.size >= 2) scoreShape[scoreShape.size - 2].toInt() else DEFAULT_SCORE_GRID).coerceAtLeast(1)
-                    val gridW = (if (scoreShape.isNotEmpty()) scoreShape[scoreShape.size - 1].toInt() else DEFAULT_SCORE_GRID).coerceAtLeast(1)
+                    val scoreShape = (scoreTensor.info as? TensorInfo)?.shape ?: longArrayOf()
+                    val scoreFb = scoreTensor.floatBuffer
+                    val scoreRemaining = scoreFb.remaining()
+                    val scoreBasePos = scoreFb.position()
+                    val (gridH, gridW) = resolveScoreGridDims(scoreShape, scoreRemaining)
                     val gridCount = gridH * gridW
 
                     if (hannCacheSize != gridCount) {
@@ -284,13 +284,12 @@ class VitTrackEngine(private val appContext: Context) {
                         hannCacheSize = gridCount
                     }
 
-                    val scoreFb = scoreTensor.floatBuffer
                     var bestIdx = 0
                     var bestPenalized = Float.NEGATIVE_INFINITY
                     var rawBestScore = 0f
-                    val availableScores = min(scoreFb.remaining(), gridCount)
+                    val availableScores = min(scoreRemaining, gridCount)
                     for (i in 0 until availableScores) {
-                        val raw = scoreFb.get(i)
+                        val raw = scoreFb.get(scoreBasePos + i)
                         val prob = if (raw < 0f || raw > 1f) sigmoid(raw) else raw
                         val penalized = prob * ((1f - PENALTY_WINDOW_WEIGHT) + PENALTY_WINDOW_WEIGHT * hannWindow[i])
                         if (penalized > bestPenalized) {
@@ -303,11 +302,9 @@ class VitTrackEngine(private val appContext: Context) {
                     val bestRow = bestIdx / gridW
                     val bestCol = bestIdx % gridW
 
-                    val bboxShape = (bboxTensor.info as? TensorInfo)?.shape ?: longArrayOf(1, 4, gridH.toLong(), gridW.toLong())
-                    val bboxFb = bboxTensor.floatBuffer
-                    val (predCxNorm, predCyNorm, predWNorm, predHNorm) = decodeBbox(
-                        fb = bboxFb,
-                        shape = bboxShape,
+                    val (predCxNorm, predCyNorm, predWNorm, predHNorm) = decodeOutputs(
+                        ortResult = ortResult,
+                        binding = outputBinding,
                         bestCol = bestCol,
                         bestRow = bestRow,
                         gridW = gridW,
@@ -662,31 +659,106 @@ class VitTrackEngine(private val appContext: Context) {
         return (templateName ?: names[0]) to (searchName ?: names[1])
     }
 
-    private fun resolveOutputNames(session: OrtSession): Pair<String, String> {
+    private data class OutputBinding(
+        val scoreName: String,
+        val sizeName: String?,
+        val offsetName: String?,
+        val bboxName: String?
+    )
+
+    private fun resolveOutputs(session: OrtSession): OutputBinding {
         val names = session.outputNames.toList()
         if (names.size < 2) {
-            throw IllegalStateException("VitTrack должен иметь 2 выхода (score, bbox), найдено: $names")
-        }
-        var scoreName: String? = names.firstOrNull {
-            it.contains("score", ignoreCase = true) || it.contains("conf", ignoreCase = true)
-        }
-        var bboxName: String? = names.firstOrNull {
-            it.contains("box", ignoreCase = true) || it.contains("size", ignoreCase = true)
+            throw IllegalStateException("VitTrack должен иметь минимум 2 выхода, найдено: $names")
         }
 
-        if (scoreName == null || bboxName == null) {
-            for ((name, info) in session.outputInfo) {
-                val ti = info.info as? TensorInfo ?: continue
-                val shape = ti.shape
-                val ch = if (shape.size >= 2) shape[1] else 0L
-                if (ch == 1L && scoreName == null) {
-                    scoreName = name
-                } else if (ch == 4L && bboxName == null) {
-                    bboxName = name
-                }
+        fun shapeOf(name: String): LongArray {
+            val ti = session.outputInfo[name]?.info as? TensorInfo ?: return longArrayOf()
+            return ti.shape
+        }
+
+        fun channelCountOf(shape: LongArray): Int = when {
+            shape.size == 4 && shape[1] in 1L..4L -> shape[1].toInt()
+            shape.size == 4 && shape[3] in 1L..4L -> shape[3].toInt()
+            shape.size == 2 -> shape[1].toInt()
+            shape.size == 1 -> shape[0].toInt()
+            else -> 0
+        }
+
+        val scoreName = names.firstOrNull {
+            it.contains("score", ignoreCase = true) ||
+                it.contains("conf", ignoreCase = true) ||
+                it.equals("output1", ignoreCase = true)
+        } ?: names.firstOrNull {
+            channelCountOf(shapeOf(it)) == 1
+        } ?: names[0]
+
+        val remaining = names.filter { it != scoreName }
+        val twoChannelNames = remaining.filter { channelCountOf(shapeOf(it)) == 2 }
+
+        // OpenCV Zoo VitTrack (2023sep): 3 outputs -> conf [1,1,16,16], size [1,2,16,16], offset [1,2,16,16]
+        if (remaining.size >= 2 && twoChannelNames.size >= 2) {
+            val sizeName = twoChannelNames.firstOrNull {
+                it.contains("size", ignoreCase = true) ||
+                    it.contains("wh", ignoreCase = true) ||
+                    it.equals("output2", ignoreCase = true)
+            } ?: twoChannelNames[0]
+
+            val offsetName = twoChannelNames.firstOrNull {
+                it != sizeName && (
+                    it.contains("offset", ignoreCase = true) ||
+                        it.contains("reg", ignoreCase = true) ||
+                        it.equals("output3", ignoreCase = true)
+                    )
+            } ?: twoChannelNames.firstOrNull { it != sizeName }
+
+            if (offsetName != null) {
+                return OutputBinding(
+                    scoreName = scoreName,
+                    sizeName = sizeName,
+                    offsetName = offsetName,
+                    bboxName = null
+                )
             }
         }
-        return (scoreName ?: names[0]) to (bboxName ?: names[1])
+
+        // Fallback 2-output model -> score [1,1,H,W] + bbox [1,4,H,W] / [1,H,W,4] / [1,4]
+        val bboxName = remaining.firstOrNull {
+            it.contains("box", ignoreCase = true) || it.contains("bbox", ignoreCase = true)
+        } ?: remaining.firstOrNull {
+            channelCountOf(shapeOf(it)) == 4
+        } ?: remaining.first()
+
+        return OutputBinding(
+            scoreName = scoreName,
+            sizeName = null,
+            offsetName = null,
+            bboxName = bboxName
+        )
+    }
+
+    private fun resolveScoreGridDims(shape: LongArray, remaining: Int): Pair<Int, Int> {
+        val rawDims = when {
+            shape.size == 4 && shape[1] == 1L -> shape[2].toInt() to shape[3].toInt()
+            shape.size == 4 && shape[3] == 1L -> shape[1].toInt() to shape[2].toInt()
+            shape.size == 4 -> shape[2].toInt() to shape[3].toInt()
+            shape.size == 3 -> shape[1].toInt() to shape[2].toInt()
+            shape.size == 2 -> shape[0].toInt() to shape[1].toInt()
+            else -> -1 to -1
+        }
+        val rawH = rawDims.first
+        val rawW = rawDims.second
+        if (rawH > 0 && rawW > 0 && (remaining <= 0 || rawH * rawW <= remaining)) {
+            return rawH to rawW
+        }
+        if (remaining > 0) {
+            val side = sqrt(remaining.toDouble()).roundToInt().coerceAtLeast(1)
+            if (side * side == remaining) return side to side
+            if (rawH > 0 && remaining % rawH == 0) return rawH to (remaining / rawH)
+            if (rawW > 0 && remaining % rawW == 0) return (remaining / rawW) to rawW
+            return if (side * side <= remaining) side to side else 1 to remaining
+        }
+        return DEFAULT_SCORE_GRID to DEFAULT_SCORE_GRID
     }
 
     private fun computeContextCropSide(w: Float, h: Float, factor: Float): Float {
@@ -695,40 +767,140 @@ class VitTrackEngine(private val appContext: Context) {
         return max(8f, sqrt(wc * hc) * factor)
     }
 
-    private fun decodeBbox(
-        fb: FloatBuffer,
-        shape: LongArray,
+    private fun decodeOutputs(
+        ortResult: OrtSession.Result,
+        binding: OutputBinding,
         bestCol: Int,
         bestRow: Int,
         gridW: Int,
         gridH: Int
     ): FloatArray {
+        if (binding.sizeName != null && binding.offsetName != null) {
+            val sizeTensor = (ortResult.get(binding.sizeName).orElse(null) as? OnnxTensor)
+                ?: throw IllegalStateException("VitTrack: не найден выход '${binding.sizeName}'")
+            val offsetTensor = (ortResult.get(binding.offsetName).orElse(null) as? OnnxTensor)
+                ?: throw IllegalStateException("VitTrack: не найден выход '${binding.offsetName}'")
+
+            val sizeVals = readTensorCellChannels(sizeTensor, bestRow, bestCol, gridH, gridW, defaultChannels = 2)
+            val offsetVals = readTensorCellChannels(offsetTensor, bestRow, bestCol, gridH, gridW, defaultChannels = 2)
+
+            val w = sizeVals.getOrElse(0) { 0.25f }
+            val h = sizeVals.getOrElse(1) { 0.25f }
+            val dx = offsetVals.getOrElse(0) { 0.5f }
+            val dy = offsetVals.getOrElse(1) { 0.5f }
+            return normalizeBboxCoords(
+                v0 = dx,
+                v1 = dy,
+                v2 = w,
+                v3 = h,
+                bestCol = bestCol,
+                bestRow = bestRow,
+                gridW = gridW,
+                gridH = gridH,
+                isGridHead = true
+            )
+        }
+
+        val bboxName = binding.bboxName
+            ?: throw IllegalStateException("VitTrack: не найден выход bbox")
+        val bboxTensor = (ortResult.get(bboxName).orElse(null) as? OnnxTensor)
+            ?: throw IllegalStateException("VitTrack: не найден выход '$bboxName'")
+        val shape = (bboxTensor.info as? TensorInfo)?.shape ?: longArrayOf()
+        val isGridHead = !(shape.size <= 2 || (shape.size == 4 && shape[2] == 1L && shape[3] == 1L))
+        val vals = readTensorCellChannels(bboxTensor, bestRow, bestCol, gridH, gridW, defaultChannels = 4)
+        return normalizeBboxCoords(
+            v0 = vals.getOrElse(0) { 0.5f },
+            v1 = vals.getOrElse(1) { 0.5f },
+            v2 = vals.getOrElse(2) { 0.25f },
+            v3 = vals.getOrElse(3) { 0.25f },
+            bestCol = bestCol,
+            bestRow = bestRow,
+            gridW = gridW,
+            gridH = gridH,
+            isGridHead = isGridHead
+        )
+    }
+
+    private fun readTensorCellChannels(
+        tensor: OnnxTensor,
+        bestRow: Int,
+        bestCol: Int,
+        fallbackGridH: Int,
+        fallbackGridW: Int,
+        defaultChannels: Int
+    ): FloatArray {
+        val shape = (tensor.info as? TensorInfo)?.shape ?: longArrayOf()
+        val fb = tensor.floatBuffer
+        val remaining = fb.remaining()
+        val basePos = fb.position()
+
+        fun safeGet(relIdx: Int, fallback: Float = 0f): Float {
+            return if (relIdx in 0 until remaining) fb.get(basePos + relIdx) else fallback
+        }
+
+        // Flat [C] or [1, C] or [1, C, 1, 1]
         if (shape.size <= 2 || (shape.size == 4 && shape[2] == 1L && shape[3] == 1L)) {
-            val c0 = fb.get(0)
-            val c1 = fb.get(1)
-            val c2 = fb.get(2)
-            val c3 = fb.get(3)
-            return normalizeBboxCoords(c0, c1, c2, c3, bestCol, bestRow, gridW, gridH, isGridHead = false)
+            val chCount = min(remaining, max(1, defaultChannels))
+            return FloatArray(chCount) { ch -> safeGet(ch) }
         }
 
-        // [1, 4, H, W] NCHW layout
-        if (shape.size == 4 && shape[1] == 4L) {
-            val planeSize = gridH * gridW
-            val cell = bestRow * gridW + bestCol
-            val v0 = fb.get(cell)
-            val v1 = fb.get(planeSize + cell)
-            val v2 = fb.get(2 * planeSize + cell)
-            val v3 = fb.get(3 * planeSize + cell)
-            return normalizeBboxCoords(v0, v1, v2, v3, bestCol, bestRow, gridW, gridH, isGridHead = true)
+        if (shape.size == 4) {
+            val raw1 = shape[1].toInt()
+            val raw2 = shape[2].toInt()
+            val raw3 = shape[3].toInt()
+            val isNchw = raw1 in 1..8 && (raw2 != 1 || raw3 != 1)
+            if (isNchw) {
+                val cCount = raw1
+                val perPlane = if (cCount > 0) remaining / cCount else remaining
+                val tH = if (raw2 > 0) raw2 else fallbackGridH.coerceAtLeast(1)
+                val tW = if (raw3 > 0) raw3 else if (tH > 0 && perPlane >= tH) perPlane / tH else fallbackGridW.coerceAtLeast(1)
+                val r = bestRow.coerceIn(0, tH - 1)
+                val c = bestCol.coerceIn(0, tW - 1)
+                val planeSize = tH * tW
+                return FloatArray(cCount) { ch ->
+                    safeGet(ch * planeSize + r * tW + c)
+                }
+            } else {
+                // NHWC [1, H, W, C]
+                val cCount = if (raw3 > 0) raw3 else max(1, defaultChannels)
+                val totalCells = if (cCount > 0) remaining / cCount else remaining
+                val tH = if (raw1 > 0) raw1 else fallbackGridH.coerceAtLeast(1)
+                val tW = if (raw2 > 0) raw2 else if (tH > 0 && totalCells >= tH) totalCells / tH else fallbackGridW.coerceAtLeast(1)
+                val r = bestRow.coerceIn(0, tH - 1)
+                val c = bestCol.coerceIn(0, tW - 1)
+                val base = (r * tW + c) * cCount
+                return FloatArray(cCount) { ch ->
+                    safeGet(base + ch)
+                }
+            }
         }
 
-        // [1, H, W, 4] NHWC layout fallback
-        val base = (bestRow * gridW + bestCol) * 4
-        val v0 = fb.get(base)
-        val v1 = fb.get(base + 1)
-        val v2 = fb.get(base + 2)
-        val v3 = fb.get(base + 3)
-        return normalizeBboxCoords(v0, v1, v2, v3, bestCol, bestRow, gridW, gridH, isGridHead = true)
+        if (shape.size == 3) {
+            val raw0 = shape[0].toInt()
+            val raw1 = shape[1].toInt()
+            val raw2 = shape[2].toInt()
+            return if (raw0 in 1..8) {
+                // [C, H, W]
+                val tH = if (raw1 > 0) raw1 else fallbackGridH.coerceAtLeast(1)
+                val tW = if (raw2 > 0) raw2 else fallbackGridW.coerceAtLeast(1)
+                val r = bestRow.coerceIn(0, tH - 1)
+                val c = bestCol.coerceIn(0, tW - 1)
+                val planeSize = tH * tW
+                FloatArray(raw0) { ch -> safeGet(ch * planeSize + r * tW + c) }
+            } else {
+                // [H, W, C]
+                val cCount = if (raw2 > 0) raw2 else max(1, defaultChannels)
+                val tH = if (raw0 > 0) raw0 else fallbackGridH.coerceAtLeast(1)
+                val tW = if (raw1 > 0) raw1 else fallbackGridW.coerceAtLeast(1)
+                val r = bestRow.coerceIn(0, tH - 1)
+                val c = bestCol.coerceIn(0, tW - 1)
+                val base = (r * tW + c) * cCount
+                FloatArray(cCount) { ch -> safeGet(base + ch) }
+            }
+        }
+
+        val fallbackCount = min(remaining, max(1, defaultChannels))
+        return FloatArray(fallbackCount) { ch -> safeGet(ch) }
     }
 
     private fun normalizeBboxCoords(
