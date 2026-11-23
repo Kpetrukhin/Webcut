@@ -1,7 +1,8 @@
 import React from 'react';
-import {Ban, RotateCcw} from 'lucide-react';
+import {Ban, RotateCcw, Sparkles} from 'lucide-react';
 import type {Clip, ClipMask, MaskMode, MaskShape} from '../shared/types.ts';
 import {createDefaultMask, MASK_SHAPE_OPTIONS} from '../lib/maskEngine.ts';
+import {requestAIFeature} from '../lib/webcutAi.ts';
 import {ScrubNumberField} from './ScrubNumberField.tsx';
 
 interface MaskPanelProps {
@@ -182,6 +183,22 @@ export const MaskPanel: React.FC<MaskPanelProps> = ({
           );
         })}
       </div>
+
+      <button
+        type="button"
+        onClick={() =>
+          requestAIFeature('sam2_tiny_seg', 'AI Авто-маска (Сегментация)')
+        }
+        className="flex h-10 w-full items-center justify-between gap-2 rounded-xl border border-violet-400/40 bg-violet-500/15 px-3 text-xs font-semibold text-violet-100 transition hover:bg-violet-500/25 active:scale-[0.99]"
+      >
+        <span className="flex items-center gap-1.5">
+          <Sparkles className="h-3.5 w-3.5 text-violet-300" />
+          <span>✨ AI Авто-маска объекта</span>
+        </span>
+        <span className="rounded-md bg-violet-500/30 px-1.5 py-0.5 font-mono text-[9px] text-violet-200">
+          ONNX
+        </span>
+      </button>
 
       {mask ? (
         <div className="space-y-3 rounded-xl border border-white/10 bg-zinc-900/60 p-3">

@@ -9,6 +9,7 @@ import {
   RotateCcw,
   Settings,
   ShieldAlert,
+  Sparkles,
   Trash2,
   X,
 } from 'lucide-react';
@@ -41,6 +42,7 @@ import type {
   ServerStorageConfig,
 } from '../lib/mediaStorage.ts';
 import {isNativeCapacitorApp} from '../lib/serverConfig.ts';
+import {openAIModelManager} from '../lib/webcutAi.ts';
 
 interface AppSettingsModalProps {
   onClose: () => void;
@@ -636,6 +638,36 @@ export const AppSettingsModal: React.FC<AppSettingsModalProps> = ({
             <span>Получить бесплатный ключ на developers.giphy.com</span>
             <ExternalLink className="h-3 w-3" />
           </a>
+        </div>
+
+        {/* Local AI Engine (ONNX Mobile) */}
+        <div className="space-y-2.5 rounded-2xl border border-violet-500/25 bg-violet-500/5 p-3.5">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5">
+              <Sparkles className="h-4 w-4 text-violet-300" />
+              <span className="text-xs font-semibold text-white">
+                Локальный AI-движок (ONNX Mobile)
+              </span>
+            </div>
+            <span className="rounded-full border border-violet-400/35 bg-violet-500/15 px-2 py-0.5 text-[10px] font-semibold text-violet-200">
+              NPU → GPU → CPU
+            </span>
+          </div>
+          <p className="text-[11px] leading-relaxed text-zinc-400">
+            Веса нейросетей не вшиты в APK и загружаются лениво во внутреннюю
+            папку приложения (filesDir/ai_models) или из .zip-пака.
+          </p>
+          <button
+            type="button"
+            onClick={() => {
+              onClose();
+              openAIModelManager();
+            }}
+            className="flex h-9 w-full items-center justify-center gap-1.5 rounded-xl bg-violet-500 px-3 text-xs font-bold text-white hover:bg-violet-400 active:scale-[0.99]"
+          >
+            <Sparkles className="h-3.5 w-3.5" />
+            <span>Модели AI и импорт .zip-пака</span>
+          </button>
         </div>
 
         <div className="flex items-center justify-end gap-2 pt-1">

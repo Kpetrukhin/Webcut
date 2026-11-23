@@ -126,11 +126,28 @@ if (fs.existsSync(appGradlePath)) {
     );
   }
 
+  if (!appGradle.includes('com.microsoft.onnxruntime:onnxruntime-android')) {
+    const ortDeps = `
+    implementation 'com.microsoft.onnxruntime:onnxruntime-android:1.20.0'
+`;
+    appGradle = appGradle.replace(
+      "implementation project(':capacitor-android')",
+      `implementation project(':capacitor-android')${ortDeps}`
+    );
+  }
+
+  if (!appGradle.includes("abiFilters 'arm64-v8a'") && appGradle.includes('defaultConfig {')) {
+    appGradle = appGradle.replace(
+      'defaultConfig {',
+      `defaultConfig {\n        ndk {\n            abiFilters 'arm64-v8a'\n        }`
+    );
+  }
+
   fs.writeFileSync(appGradlePath, appGradle, 'utf-8');
-  console.log('Patched android/app/build.gradle with Ktor 2.3.12 CIO, Media3 1.5.1, Coil 2.7.0 (GIF/AnimatedWebP) + Kotlin 21.');
+  console.log('Patched android/app/build.gradle with Ktor 2.3.12 CIO, Media3 1.5.1, Coil 2.7.0, ONNX Runtime Mobile 1.20.0 (arm64-v8a) + Kotlin 21.');
 }
 
-// 4. Copy native Kotlin Ktor P2P plugin files & wire MainActivity.java
+// 4. Copy native Kotlin Ktor P2P & AI Engine files recursively & wire MainActivity.java
 const targetJavaDir = path.join(
   androidDir,
   'app/src/main/java/com/cutsync/webcut'
@@ -141,16 +158,22 @@ const nativeSrcDir = path.join(
   root,
   'android-native/src/main/java/com/cutsync/webcut'
 );
-if (fs.existsSync(nativeSrcDir)) {
-  for (const file of fs.readdirSync(nativeSrcDir)) {
-    if (file.endsWith('.kt') || file.endsWith('.java')) {
-      fs.copyFileSync(
-        path.join(nativeSrcDir, file),
-        path.join(targetJavaDir, file)
-      );
+function copyNativeSourcesRecursively(srcDir, dstDir) {
+  if (!fs.existsSync(srcDir)) return;
+  fs.mkdirSync(dstDir, {recursive: true});
+  for (const entry of fs.readdirSync(srcDir, {withFileTypes: true})) {
+    const srcPath = path.join(srcDir, entry.name);
+    const dstPath = path.join(dstDir, entry.name);
+    if (entry.isDirectory()) {
+      copyNativeSourcesRecursively(srcPath, dstPath);
+    } else if (entry.isFile() && (entry.name.endsWith('.kt') || entry.name.endsWith('.java'))) {
+      fs.copyFileSync(srcPath, dstPath);
     }
   }
-  console.log('Copied native Kotlin Ktor P2P files to Android project.');
+}
+if (fs.existsSync(nativeSrcDir)) {
+  copyNativeSourcesRecursively(nativeSrcDir, targetJavaDir);
+  console.log('Copied native Kotlin Ktor P2P & WebcutAI engine files to Android project.');
 }
 
 const mainActivityPath = path.join(targetJavaDir, 'MainActivity.java');
@@ -163,12 +186,13 @@ public class MainActivity extends BridgeActivity {
     @Override
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(LanSyncPlugin.class);
+        registerPlugin(WebcutAIPlugin.class);
         super.onCreate(savedInstanceState);
     }
 }
 `;
 fs.writeFileSync(mainActivityPath, mainActivityCode, 'utf-8');
-console.log('Updated MainActivity.java to register LanSyncPlugin.');
+console.log('Updated MainActivity.java to register LanSyncPlugin and WebcutAIPlugin.');
 
 // 5. Copy PWA icon into Android mipmap launcher resources
 const icon512 = path.join(root, 'public/pwa-512x512.png');

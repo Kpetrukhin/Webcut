@@ -105,6 +105,8 @@ import {
 } from './hooks/useCollaborativeRoom.ts';
 import {AudioPanel} from './components/AudioPanel.tsx';
 import {AppSettingsModal} from './components/AppSettingsModal.tsx';
+import {AIModelManagerModal} from './components/AIModelManagerModal.tsx';
+import './lib/webcutAi.ts';
 import {ChromaKeyPanel} from './components/ChromaKeyPanel.tsx';
 import {ColorAdjustPanel} from './components/ColorAdjustPanel.tsx';
 import {CropEditorModal} from './components/CropEditorModal.tsx';
@@ -5059,6 +5061,8 @@ export default function App() {
           onStorageChanged={() => void refreshStorageSummary()}
         />
       )}
+
+      <AIModelManagerModal />
 
       <input
         ref={overlayFileInputRef}

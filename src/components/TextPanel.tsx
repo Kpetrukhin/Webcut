@@ -26,6 +26,7 @@ import {
   sanitizeFontFamilyName,
 } from '../lib/fontLoader.ts';
 import {uploadFileForP2P} from '../lib/lanSyncBridge.ts';
+import {requestAIFeature} from '../lib/webcutAi.ts';
 import {
   buildPresetCurvePoints,
   colorToHex,
@@ -328,6 +329,22 @@ export const TextPanel: React.FC<TextPanelProps> = ({
           )}
         </div>
 
+        <button
+          type="button"
+          onClick={() =>
+            requestAIFeature('whisper_tiny_asr', 'AI Авто-субтитры (Речь → Текст)')
+          }
+          className="flex h-10 w-full items-center justify-between gap-2 rounded-xl border border-violet-400/40 bg-violet-500/15 px-3 text-xs font-semibold text-violet-100 transition hover:bg-violet-500/25 active:scale-[0.99]"
+        >
+          <span className="flex items-center gap-1.5">
+            <Sparkles className="h-3.5 w-3.5 text-violet-300" />
+            <span>✨ AI Авто-субтитры</span>
+          </span>
+          <span className="rounded bg-violet-500/30 px-1.5 py-0.5 font-mono text-[9px] text-violet-200">
+            ONNX
+          </span>
+        </button>
+
         <label className="flex cursor-pointer items-center justify-between rounded-xl border border-white/10 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300">
           <span>Создавать новую дорожку текста</span>
           <input
@@ -450,6 +467,21 @@ export const TextPanel: React.FC<TextPanelProps> = ({
             </div>
           </div>
         </div>
+        <button
+          type="button"
+          onClick={() =>
+            requestAIFeature('whisper_tiny_asr', 'AI Авто-субтитры (Речь → Текст)')
+          }
+          className="flex h-8 w-full items-center justify-between gap-2 rounded-lg border border-violet-400/35 bg-violet-500/15 px-2.5 text-[11px] font-semibold text-violet-100 transition hover:bg-violet-500/25 active:scale-[0.99]"
+        >
+          <span className="flex items-center gap-1.5">
+            <Sparkles className="h-3 w-3 text-violet-300" />
+            <span>✨ AI Авто-субтитры</span>
+          </span>
+          <span className="rounded bg-violet-500/30 px-1.5 py-0.5 font-mono text-[9px] text-violet-200">
+            ONNX
+          </span>
+        </button>
       </div>
 
       {/* Scrollable Sub-Tab Content */}
