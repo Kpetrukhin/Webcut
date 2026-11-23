@@ -47,7 +47,7 @@ export default defineConfig(() => {
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,jpg}'],
-          navigateFallbackDenylist: [/^\/api\//, /^\/uploads\//, /^\/ws/],
+          navigateFallbackDenylist: [/^\/api\//, /^\/uploads\//, /^\/media\//, /^\/ws/, /^\/sync/, /^\/__vite_ws/],
           runtimeCaching: [
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
@@ -108,6 +108,7 @@ export default defineConfig(() => {
       },
     },
     server: {
+      allowedHosts: true as const,
       hmr: process.env.DISABLE_HMR !== 'true',
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },

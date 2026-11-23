@@ -1,12 +1,16 @@
 package com.cutsync.webcut
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
+import androidx.activity.result.ActivityResult
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.PermissionState
 import com.getcapacitor.Plugin
 import com.getcapacitor.PluginCall
 import com.getcapacitor.PluginMethod
+import com.getcapacitor.annotation.ActivityCallback
 import com.getcapacitor.annotation.CapacitorPlugin
 import com.getcapacitor.annotation.Permission
 import com.getcapacitor.annotation.PermissionCallback
@@ -14,6 +18,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.json.JSONArray
+import org.json.JSONObject
 
 @CapacitorPlugin(
     name = "LanSync",
@@ -325,6 +330,103 @@ class LanSyncPlugin : Plugin() {
                 )
             } catch (err: Throwable) {
                 call.reject(err.message ?: "Failed to render text bitmap")
+            }
+        }
+    }
+
+    private fun jsonToStorageResult(obj: JSONObject, migratedCount: Int = 0): JSObject {
+        val res = JSObject()
+        res.put("currentDir", obj.optString("currentDir", ""))
+        res.put("defaultDir", obj.optString("defaultDir", ""))
+        res.put("isDefault", obj.optBoolean("isDefault", true))
+        res.put("mode", obj.optString("mode", "internal"))
+        res.put("displayName", obj.optString("displayName", ""))
+        res.put("filesCount", obj.optInt("filesCount", 0))
+        res.put("totalBytes", obj.optLong("totalBytes", 0L))
+        res.put("migratedCount", migratedCount)
+        val presetsArr = JSArray()
+        obj.optJSONArray("presets")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                arr.optJSONObject(i)?.let { p ->
+                    presetsArr.put(JSObject().apply {
+                        put("label", p.optString("label"))
+                        put("path", p.optString("path"))
+                        put("isDefault", p.optBoolean("isDefault", false))
+                    })
+                }
+            }
+        }
+        res.put("presets", presetsArr)
+        return res
+    }
+
+    @PluginMethod
+    fun getStorageConfig(call: PluginCall) {
+        call.resolve(jsonToStorageResult(engine.getStorageConfigJson()))
+    }
+
+    @PluginMethod
+    fun setStorageFolder(call: PluginCall) {
+        val dirPath = call.getString("dirPath") ?: run {
+            call.reject("Missing dirPath")
+            return
+        }
+        val migrate = call.getBoolean("migrateExisting", true) ?: true
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val (cfg, migrated) = engine.setStorageFolderPath(dirPath, migrate)
+                call.resolve(jsonToStorageResult(cfg, migrated))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось выбрать папку")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun resetStorageFolder(call: PluginCall) {
+        val migrate = call.getBoolean("migrateExisting", true) ?: true
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val (cfg, migrated) = engine.resetStorageFolder(migrate)
+                call.resolve(jsonToStorageResult(cfg, migrated))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось сбросить папку")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun pickStorageFolder(call: PluginCall) {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+            )
+        }
+        startActivityForResult(call, intent, "onStorageFolderPicked")
+    }
+
+    @ActivityCallback
+    private fun onStorageFolderPicked(call: PluginCall?, result: ActivityResult) {
+        if (call == null) return
+        val uri = result.data?.data
+        if (result.resultCode != Activity.RESULT_OK || uri == null) {
+            val res = jsonToStorageResult(engine.getStorageConfigJson(), 0)
+            res.put("canceled", true)
+            call.resolve(res)
+            return
+        }
+        val migrate = call.getBoolean("migrateExisting", true) ?: true
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val (cfg, migrated) = engine.setSafStorageTree(uri, migrate)
+                val res = jsonToStorageResult(cfg, migrated)
+                res.put("canceled", false)
+                call.resolve(res)
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось открыть выбранную папку")
             }
         }
     }

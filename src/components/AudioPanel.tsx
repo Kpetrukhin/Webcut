@@ -96,7 +96,7 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
         remoteUrl: prepared.shareUrl,
         fileSize: prepared.fileSize,
         fileHash: prepared.fileHash,
-        duration: Math.max(0.5, Math.min(300, dur)),
+        duration: Math.max(0.5, Math.min(1800, dur)),
         forceNewTrack: false,
       });
       onNotify?.('Аудио добавлено на дорожку');

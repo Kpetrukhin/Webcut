@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   ChevronLeft,
+  ChevronsUpDown,
   CopyPlus,
   Crop,
   Diamond,
@@ -57,8 +58,13 @@ import {
   evaluateClipTransform,
   upsertKeyframeAtTime,
 } from './lib/keyframeEngine.ts';
-import {uploadFileForP2P} from './lib/lanSyncBridge.ts';
+import {
+  fetchServerStorageConfig,
+  getNativeStorageConfig,
+  uploadFileForP2P,
+} from './lib/lanSyncBridge.ts';
 import type {CompressedMediaResult} from './lib/lanSyncBridge.ts';
+import {getClientStorageSummary} from './lib/mediaStorage.ts';
 import {
   getLocalProjects,
   removeLocalProject,
@@ -66,10 +72,20 @@ import {
 } from './lib/localProjects.ts';
 import type {LocalProjectRecord} from './lib/localProjects.ts';
 import {
+  EXPORT_FORMAT_OPTIONS,
+  EXPORT_FPS_OPTIONS,
+  EXPORT_RESOLUTION_OPTIONS,
   exportProjectToVideo,
-  getCanvasDimensions,
-  MediaPool,
-} from './lib/renderEngine.ts';
+  getExportDimensions,
+  MAX_ANIMATED_IMAGE_FRAMES,
+} from './lib/exportEngine.ts';
+import type {
+  ExportFormat,
+  ExportFps,
+  ExportQuality,
+  ExportResolution,
+} from './lib/exportEngine.ts';
+import {MediaPool} from './lib/renderEngine.ts';
 import {getApiUrl, isNativeCapacitorApp} from './lib/serverConfig.ts';
 import {
   colorToHex,
@@ -103,6 +119,7 @@ import {ShapesPanel} from './components/ShapesPanel.tsx';
 import {StickersSheet} from './components/StickersSheet.tsx';
 import {Timeline} from './components/Timeline.tsx';
 import {TransformPanel} from './components/TransformPanel.tsx';
+import type {ClipTransformPatch} from './components/TransformPanel.tsx';
 import {TransformTrackpad} from './components/TransformTrackpad.tsx';
 import {VoiceRecorderOverlay} from './components/VoiceRecorderOverlay.tsx';
 import {RoomsLobbyModal} from './components/RoomsLobbyModal.tsx';
@@ -111,7 +128,6 @@ import {
   CompressMediaModal,
   EffectsPanel,
   KeyframeControls,
-  MediaPanel,
   OverlayPanel,
   TeamPanel,
   TOOL_TABS,
@@ -192,8 +208,8 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [selectedClipId, setSelectedClipId] = useState<string | null>(null);
   const [pxPerSec, setPxPerSec] = useState(64);
-  const [desktopTab, setDesktopTab] = useState<ActiveToolTab>('media');
-  const [desktopOverlayView, setDesktopOverlayView] = useState<'media' | 'shapes'>('shapes');
+  const [desktopTab, setDesktopTab] = useState<ActiveToolTab>('overlay');
+  const [desktopOverlayView, setDesktopOverlayView] = useState<'media' | 'shapes'>('media');
   const [mobileSheet, setMobileSheet] = useState<
     ActiveToolTab | 'shapes' | null
   >(null);
@@ -249,16 +265,232 @@ export default function App() {
     x: boolean;
     y: boolean;
   }>({x: false, y: false});
+  const studioRootRef = useRef<HTMLDivElement | null>(null);
+  const previewBoxRef = useRef<HTMLDivElement | null>(null);
+  const bottomPanelRef = useRef<HTMLDivElement | null>(null);
+  const [viewportHeight, setViewportHeight] = useState<number>(() =>
+    typeof window !== 'undefined' ? window.innerHeight : 800
+  );
+  const [customTimelineHeight, setCustomTimelineHeight] = useState<
+    number | null
+  >(() => {
+    try {
+      const raw = localStorage.getItem('cutsync_timeline_height');
+      if (raw !== null) {
+        const parsed = Number(raw);
+        if (Number.isFinite(parsed) && parsed >= 120) {
+          return Math.round(parsed);
+        }
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return null;
+  });
+  const [isResizingTimeline, setIsResizingTimeline] = useState(false);
+  const timelineResizeDragRef = useRef<{
+    pointerId: number;
+    startY: number;
+    startHeight: number;
+    maxHeight: number;
+    moved: boolean;
+  } | null>(null);
   const [showLobbyModal, setShowLobbyModal] = useState(false);
   const [showStickersSheet, setShowStickersSheet] = useState(false);
   const [showAppSettings, setShowAppSettings] = useState(false);
   const [giphyKeyVersion, setGiphyKeyVersion] = useState(0);
+  const [storageSummaryState, setStorageSummaryState] = useState<{
+    label: string;
+    isCustom: boolean;
+  }>({
+    label: 'По стандарту (корневая папка приложения)',
+    isCustom: false,
+  });
+
+  const refreshStorageSummary = useCallback(async () => {
+    try {
+      if (isNativeCapacitorApp()) {
+        const nativeCfg = await getNativeStorageConfig();
+        if (nativeCfg) {
+          setStorageSummaryState({
+            label: nativeCfg.isDefault
+              ? 'По стандарту (корень приложения)'
+              : `${nativeCfg.displayName} (${nativeCfg.currentDir})`,
+            isCustom: !nativeCfg.isDefault,
+          });
+          return;
+        }
+      }
+      const [client, srv] = await Promise.all([
+        getClientStorageSummary().catch(() => null),
+        fetchServerStorageConfig().catch(() => null),
+      ]);
+      const clientCustom = Boolean(client && !client.isDefault);
+      const srvCustom = Boolean(srv && !srv.isDefault);
+      if (clientCustom && client) {
+        setStorageSummaryState({
+          label: `Устройство: ${client.folderName}${srvCustom && srv ? ` · Хост: ${srv.currentDir}` : ''}`,
+          isCustom: true,
+        });
+      } else if (srvCustom && srv) {
+        setStorageSummaryState({
+          label: srv.currentDir,
+          isCustom: true,
+        });
+      } else {
+        setStorageSummaryState({
+          label: srv?.currentDir
+            ? `По стандарту (${srv.currentDir})`
+            : 'По стандарту (корневая папка приложения)',
+          isCustom: false,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshStorageSummary();
+  }, [refreshStorageSummary, serverUrl]);
+
+  useEffect(() => {
+    const onResize = () => {
+      setViewportHeight(
+        studioRootRef.current?.clientHeight || window.innerHeight
+      );
+    };
+    onResize();
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
+  const maxSafeTimelineHeight = Math.max(180, viewportHeight - 210);
+  const clampedCustomTimelineHeight =
+    customTimelineHeight !== null
+      ? Math.max(120, Math.min(maxSafeTimelineHeight, customTimelineHeight))
+      : null;
+
+  const handleTimelineResizePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const bottomEl = bottomPanelRef.current;
+      if (!bottomEl) return;
+      const startHeight = bottomEl.getBoundingClientRect().height;
+      const previewHeight =
+        previewBoxRef.current?.getBoundingClientRect().height ?? 240;
+      const minTimelineHeight = 120;
+      const minPreviewHeight = 96;
+      const maxHeight = Math.max(
+        minTimelineHeight + 40,
+        Math.round(startHeight + previewHeight - minPreviewHeight)
+      );
+      try {
+        e.currentTarget.setPointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      timelineResizeDragRef.current = {
+        pointerId: e.pointerId,
+        startY: e.clientY,
+        startHeight,
+        maxHeight,
+        moved: false,
+      };
+      setIsResizingTimeline(true);
+    },
+    []
+  );
+
+  const handleTimelineResizePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      const drag = timelineResizeDragRef.current;
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      const dy = drag.startY - e.clientY;
+      if (Math.abs(dy) > 2) drag.moved = true;
+      const nextHeight = Math.round(
+        Math.max(120, Math.min(drag.maxHeight, drag.startHeight + dy))
+      );
+      setCustomTimelineHeight(nextHeight);
+    },
+    []
+  );
+
+  const handleTimelineResizePointerUp = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      const drag = timelineResizeDragRef.current;
+      if (!drag || drag.pointerId !== e.pointerId) return;
+      timelineResizeDragRef.current = null;
+      setIsResizingTimeline(false);
+      try {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+      if (drag.moved) {
+        const finalH = Math.round(
+          Math.max(
+            120,
+            Math.min(drag.maxHeight, drag.startHeight + (drag.startY - e.clientY))
+          )
+        );
+        try {
+          localStorage.setItem('cutsync_timeline_height', String(finalH));
+        } catch {
+          // ignore
+        }
+      }
+    },
+    []
+  );
+
+  const handleTimelineResizeReset = useCallback(() => {
+    setCustomTimelineHeight(null);
+    try {
+      localStorage.removeItem('cutsync_timeline_height');
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const handleTimelineResizeKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      e.preventDefault();
+      const currentH =
+        bottomPanelRef.current?.getBoundingClientRect().height ?? 240;
+      const delta = e.key === 'ArrowUp' ? 24 : -24;
+      const nextH = Math.round(
+        Math.max(120, Math.min(maxSafeTimelineHeight, currentH + delta))
+      );
+      setCustomTimelineHeight(nextH);
+      try {
+        localStorage.setItem('cutsync_timeline_height', String(nextH));
+      } catch {
+        // ignore
+      }
+    },
+    [maxSafeTimelineHeight]
+  );
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState(project.title);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('mp4');
+  const [exportResolution, setExportResolution] =
+    useState<ExportResolution>('1080p');
+  const [exportFps, setExportFps] = useState<ExportFps>(30);
+  const [exportQuality, setExportQuality] = useState<ExportQuality>('high');
   const [exportProgress, setExportProgress] = useState<number | null>(null);
+  const [exportStage, setExportStage] = useState<string>('');
+  const exportAbortRef = useRef<AbortController | null>(null);
   const [exportedUrl, setExportedUrl] = useState<{
     url: string;
     filename: string;
+    ext: ExportFormat;
+    width: number;
+    height: number;
+    fps: number;
   } | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -540,7 +772,7 @@ export default function App() {
     if (target) {
       setSelectedClipId(target.id);
     } else if (project.clips.length === 0) {
-      setMobileSheet('media');
+      setMobileSheet('overlay');
     } else {
       showTransientNotice('Под белой линией времени нет клипа');
     }
@@ -701,10 +933,17 @@ export default function App() {
 
       try {
         for (const file of Array.from(files)) {
-          const fallbackKind = file.type.startsWith('video/')
-            ? 'video'
-            : 'image';
-          const prepared = await uploadFileForP2P(file, fallbackKind);
+          const isVideo =
+            file.type.startsWith('video/') ||
+            /\.(mp4|mov|webm|mkv|avi|m4v|3gp)$/i.test(file.name);
+          const fallbackKind = isVideo ? 'video' : 'image';
+          const prepared = await uploadFileForP2P(
+            file,
+            fallbackKind,
+            (pct) => {
+              if (pct < 100) showTransientNotice(`Загрузка файла: ${pct}%`);
+            }
+          );
           const mediaKind = prepared.kind === 'video' ? 'video' : 'image';
           let dur = 4.5;
           if (mediaKind === 'video') {
@@ -714,7 +953,7 @@ export default function App() {
               v.onloadedmetadata = () => {
                 resolve(
                   Number.isFinite(v.duration) && v.duration > 0
-                    ? Math.min(60, Math.round(v.duration * 10) / 10)
+                    ? Math.min(1800, Math.round(v.duration * 10) / 10)
                     : 5
                 );
               };
@@ -834,7 +1073,7 @@ export default function App() {
       if (!target) return;
       if (target.keyframes && target.keyframes.length > 0) {
         const {keyframes} = upsertKeyframeAtTime(target, currentTime, {warp});
-        updateClip(clipId, {warp, keyframes}, {skipUndo: !commit});
+        updateClip(clipId, {keyframes}, {skipUndo: !commit});
         return;
       }
       updateClip(clipId, {warp}, {skipUndo: !commit});
@@ -891,8 +1130,13 @@ export default function App() {
 
       setReplacingMedia(true);
       try {
-        const fallbackKind = file.type.startsWith('video/') ? 'video' : 'image';
-        const prepared = await uploadFileForP2P(file, fallbackKind);
+        const isVideo =
+          file.type.startsWith('video/') ||
+          /\.(mp4|mov|webm|mkv|avi|m4v|3gp)$/i.test(file.name);
+        const fallbackKind = isVideo ? 'video' : 'image';
+        const prepared = await uploadFileForP2P(file, fallbackKind, (pct) => {
+          if (pct < 100) showTransientNotice(`Загрузка файла: ${pct}%`);
+        });
         const mediaKind = prepared.kind === 'video' ? 'video' : 'image';
 
         let probedDuration = target.duration;
@@ -903,7 +1147,7 @@ export default function App() {
             v.onloadedmetadata = () => {
               resolve(
                 Number.isFinite(v.duration) && v.duration > 0
-                  ? Math.min(60, Math.round(v.duration * 10) / 10)
+                  ? Math.min(1800, Math.round(v.duration * 10) / 10)
                   : target.duration
               );
             };
@@ -1222,6 +1466,51 @@ export default function App() {
     [currentTime, updateClip]
   );
 
+  const handleUpdateClipTransformFields = useCallback(
+    (
+      clipId: string,
+      patch: ClipTransformPatch,
+      opts?: {skipUndo?: boolean; skipSync?: boolean}
+    ) => {
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
+      if (!target) return;
+
+      if (target.keyframes && target.keyframes.length > 0) {
+        const {keyframes} = upsertKeyframeAtTime(target, currentTime, patch);
+        updateClip(clipId, {keyframes}, opts);
+        return;
+      }
+
+      const clipPatch: Partial<Clip> = {};
+      if (patch.scaleX !== undefined) clipPatch.scaleX = patch.scaleX;
+      if (patch.scaleY !== undefined) clipPatch.scaleY = patch.scaleY;
+      if (patch.flipHorizontal !== undefined) {
+        clipPatch.flipHorizontal = patch.flipHorizontal;
+      }
+      if (patch.flipVertical !== undefined) {
+        clipPatch.flipVertical = patch.flipVertical;
+      }
+      if (patch.scale !== undefined) clipPatch.mediaScale = patch.scale;
+      if (patch.rotation !== undefined) clipPatch.rotation = patch.rotation;
+      if (patch.warp !== undefined) clipPatch.warp = patch.warp;
+      if (patch.x !== undefined || patch.y !== undefined) {
+        if (target.track === 'text') {
+          const baseStyle = normalizeTextStyle(target.textStyle);
+          clipPatch.textStyle = {
+            ...baseStyle,
+            ...(patch.x !== undefined ? {x: patch.x} : {}),
+            ...(patch.y !== undefined ? {y: patch.y} : {}),
+          };
+        } else {
+          if (patch.x !== undefined) clipPatch.mediaX = patch.x;
+          if (patch.y !== undefined) clipPatch.mediaY = patch.y;
+        }
+      }
+      updateClip(clipId, clipPatch, opts);
+    },
+    [currentTime, updateClip]
+  );
+
   const handleAddKeyframeAtPlayhead = useCallback(() => {
     if (!selectedClip || selectedClip.track === 'audio') return;
     const {keyframes} = upsertKeyframeAtTime(selectedClip, currentTime);
@@ -1238,7 +1527,7 @@ export default function App() {
         });
         updateClip(
           selectedClip.id,
-          {opacity: clamped, keyframes},
+          {keyframes},
           {skipUndo: !commit}
         );
         return;
@@ -1410,13 +1699,21 @@ export default function App() {
 
   const handleExportVideo = async () => {
     if (project.clips.length === 0) return;
+    setShowExportModal(false);
     setIsPlaying(false);
     setExportError(null);
+    setExportStage('Подготовка экспорта...');
+    if (exportedUrl?.url) {
+      URL.revokeObjectURL(exportedUrl.url);
+    }
     setExportedUrl(null);
     setExportProgress(1);
 
+    const controller = new AbortController();
+    exportAbortRef.current = controller;
+
     try {
-      const {blob, ext} = await exportProjectToVideo({
+      const result = await exportProjectToVideo({
         clips: project.clips,
         tracks: project.tracks,
         aspectRatio: project.aspectRatio,
@@ -1424,16 +1721,30 @@ export default function App() {
         canvasBackground: project.canvasBackground,
         customFonts: project.customFonts,
         duration,
+        currentTime,
+        format: exportFormat,
+        resolution: exportResolution,
+        fps: exportFps,
+        quality: exportQuality,
         pool: mediaPoolRef.current!,
         audioEngine: audioEngineRef.current!,
         onProgress: (pct) => setExportProgress(pct),
+        onStage: (stage) => setExportStage(stage),
+        signal: controller.signal,
       });
 
-      const url = URL.createObjectURL(blob);
+      const url = URL.createObjectURL(result.blob);
       const safeTitle =
         project.title.replace(/[^a-zA-Zа-яА-Я0-9_-]/g, '_') || 'CutSync';
-      const filename = `${safeTitle}.${ext}`;
-      setExportedUrl({url, filename});
+      const filename = `${safeTitle}_${result.width}x${result.height}.${result.ext}`;
+      setExportedUrl({
+        url,
+        filename,
+        ext: result.ext,
+        width: result.width,
+        height: result.height,
+        fps: result.fps,
+      });
 
       const a = document.createElement('a');
       a.href = url;
@@ -1442,11 +1753,21 @@ export default function App() {
       a.click();
       a.remove();
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setExportProgress(null);
+        setExportError(null);
+        showTransientNotice('Экспорт отменён');
+        return;
+      }
       setExportError(
         err instanceof Error
           ? err.message
-          : 'Браузер не поддерживает запись Canvas видео'
+          : 'Браузер не поддерживает выбранный формат экспорта'
       );
+    } finally {
+      if (exportAbortRef.current === controller) {
+        exportAbortRef.current = null;
+      }
     }
   };
 
@@ -1469,9 +1790,21 @@ export default function App() {
       )
   );
 
-  const selectedOpacityValue = selectedClip
-    ? evaluateClipTransform(selectedClip, currentTime).opacity
+  const selectedEvaluatedTransform = selectedClip
+    ? evaluateClipTransform(selectedClip, currentTime)
+    : null;
+  const selectedOpacityValue = selectedEvaluatedTransform
+    ? selectedEvaluatedTransform.opacity
     : 1;
+  const hasActiveTransformChanges = Boolean(
+    selectedClip &&
+      selectedEvaluatedTransform &&
+      (selectedEvaluatedTransform.flipHorizontal ||
+        selectedEvaluatedTransform.flipVertical ||
+        Math.abs(selectedEvaluatedTransform.scaleX - 1) > 0.01 ||
+        Math.abs(selectedEvaluatedTransform.scaleY - 1) > 0.01 ||
+        !isIdentityWarp(selectedEvaluatedTransform.warp ?? selectedClip.warp))
+  );
 
   const isMaskEditActive = Boolean(
     selectedClip &&
@@ -1614,11 +1947,14 @@ export default function App() {
             void refreshRooms();
           }}
           onOpenSettings={() => setShowAppSettings(true)}
+          storageSummaryLabel={storageSummaryState.label}
+          storageIsCustom={storageSummaryState.isCustom}
         />
         {showAppSettings && (
           <AppSettingsModal
             onClose={() => setShowAppSettings(false)}
             onKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
+            onStorageChanged={() => void refreshStorageSummary()}
           />
         )}
         <OfflineIndicator />
@@ -1627,7 +1963,10 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-[100dvh] w-full flex-col overflow-hidden bg-[#09090b] text-zinc-100">
+    <div
+      ref={studioRootRef}
+      className="flex h-[100dvh] w-full flex-col overflow-hidden bg-[#09090b] text-zinc-100"
+    >
       {/* Top Studio Header */}
       <header className="flex h-12 shrink-0 items-center justify-between gap-1.5 border-b border-white/10 bg-[#111114] px-2.5 sm:h-13 sm:gap-2 sm:px-4">
         {/* Left: Home Menu + Project Title */}
@@ -1747,7 +2086,7 @@ export default function App() {
 
           <button
             type="button"
-            onClick={handleExportVideo}
+            onClick={() => setShowExportModal(true)}
             disabled={project.clips.length === 0 || exportProgress !== null}
             className="flex h-8 items-center gap-1 rounded-lg bg-cyan-500 px-2.5 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 disabled:opacity-45 active:scale-95 whitespace-nowrap sm:h-9 sm:px-3"
           >
@@ -1770,10 +2109,6 @@ export default function App() {
                   key={tab.id}
                   type="button"
                   onClick={() => {
-                    if (tab.id === 'overlay') {
-                      setShowOverlayChooser(true);
-                      return;
-                    }
                     if (tab.id === 'effects') {
                       handleAddAdjustmentLayer();
                       return;
@@ -1989,13 +2324,7 @@ export default function App() {
                                   type="button"
                                   onClick={() => setEditSubMode('transform')}
                                   className={`flex h-16 flex-col items-center justify-center gap-1 rounded-xl border px-1.5 text-[11px] font-medium transition ${
-                                    selectedClip.flipHorizontal ||
-                                    selectedClip.flipVertical ||
-                                    Math.abs((selectedClip.scaleX ?? 1) - 1) >
-                                      0.01 ||
-                                    Math.abs((selectedClip.scaleY ?? 1) - 1) >
-                                      0.01 ||
-                                    !isIdentityWarp(selectedClip.warp)
+                                    hasActiveTransformChanges
                                       ? 'border-cyan-400/60 bg-cyan-500/15 text-cyan-200'
                                       : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-cyan-400'
                                   }`}
@@ -2237,7 +2566,9 @@ export default function App() {
                               <TransformPanel
                                 clip={selectedClip}
                                 currentTime={currentTime}
+                                onSeek={handleSeek}
                                 onUpdateClip={updateClip}
+                                onUpdateTransform={handleUpdateClipTransformFields}
                                 onUpdateWarp={handleUpdateClipWarp}
                                 onOpenTrackpad={() =>
                                   setShowTrackpad((v) => !v)
@@ -2409,24 +2740,9 @@ export default function App() {
                 )}
               </div>
             )}
-            {desktopTab === 'media' && (
-              <MediaPanel onAddMediaClip={handleAddMediaClip} />
-            )}
             {desktopTab === 'overlay' && (
               <div className="space-y-3">
                 <div className="grid grid-cols-2 gap-1 rounded-xl border border-white/10 bg-zinc-900 p-1">
-                  <button
-                    type="button"
-                    onClick={() => setDesktopOverlayView('shapes')}
-                    className={`flex h-8 items-center justify-center gap-1.5 rounded-lg text-xs font-medium transition ${
-                      desktopOverlayView === 'shapes'
-                        ? 'bg-cyan-500 text-zinc-950'
-                        : 'text-zinc-300 hover:text-white'
-                    }`}
-                  >
-                    <Shapes className="h-3.5 w-3.5" />
-                    Фигуры
-                  </button>
                   <button
                     type="button"
                     onClick={() => setDesktopOverlayView('media')}
@@ -2438,6 +2754,18 @@ export default function App() {
                   >
                     <ImagePlus className="h-3.5 w-3.5" />
                     Фото / Видео
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDesktopOverlayView('shapes')}
+                    className={`flex h-8 items-center justify-center gap-1.5 rounded-lg text-xs font-medium transition ${
+                      desktopOverlayView === 'shapes'
+                        ? 'bg-cyan-500 text-zinc-950'
+                        : 'text-zinc-300 hover:text-white'
+                    }`}
+                  >
+                    <Shapes className="h-3.5 w-3.5" />
+                    Фигуры
                   </button>
                 </div>
                 {desktopOverlayView === 'shapes' ? (
@@ -2735,7 +3063,7 @@ export default function App() {
                 </button>
               </div>
             )}
-          <div className="flex-1 min-h-0">
+          <div ref={previewBoxRef} className="flex-1 min-h-0">
             <PreviewCanvas
               tracks={project.tracks}
               clips={project.clips}
@@ -2745,6 +3073,7 @@ export default function App() {
               customFonts={project.customFonts}
               currentTime={currentTime}
               isPlaying={isPlaying}
+              disableSizeTransition={isResizingTimeline}
               selectedClipId={selectedClipId}
               currentUserId={user.id}
               collaborators={collaborators}
@@ -2786,98 +3115,133 @@ export default function App() {
           </div>
 
           {/* Transport Bar */}
-          <div className="flex h-11 min-w-0 shrink-0 items-center justify-between gap-2 border-t border-white/5 bg-[#101013] px-2.5 sm:px-4">
-            <div className="flex shrink-0 items-center gap-1">
-              <button
-                type="button"
-                onClick={undo}
-                disabled={!canUndo}
-                aria-label="Отменить"
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
-              >
-                <Undo2 className="h-4 w-4" />
-              </button>
-              <button
-                type="button"
-                onClick={redo}
-                disabled={!canRedo}
-                aria-label="Повторить"
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
-              >
-                <Redo2 className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="flex min-w-0 shrink-0 items-center gap-1.5 sm:gap-2.5">
-              <span className="font-mono text-xs tabular-nums text-white whitespace-nowrap">
-                {formatTimecode(currentTime)}
-              </span>
-              <button
-                type="button"
-                onClick={() => setIsPlaying((p) => !p)}
-                aria-label={isPlaying ? 'Пауза' : 'Воспроизвести'}
-                className="flex h-9 w-11 shrink-0 items-center justify-center rounded-full bg-white text-zinc-950 shadow hover:bg-zinc-200 active:scale-95"
-              >
-                {isPlaying ? (
-                  <Pause className="h-4 w-4 fill-current" />
-                ) : (
-                  <Play className="ml-0.5 h-4 w-4 fill-current" />
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={handleAddKeyframeAtPlayhead}
-                disabled={!selectedClip || selectedClip.track === 'audio'}
-                title="Поставить ключевой кадр в текущем времени"
-                aria-label="Ключевой кадр"
-                className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition active:scale-95 disabled:opacity-30 ${
-                  hasKeyframeAtPlayhead
-                    ? 'border-amber-400/70 bg-amber-500/20 text-amber-300'
-                    : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-amber-400/60 hover:text-amber-200'
-                }`}
-              >
-                <svg
-                  viewBox="0 0 24 24"
-                  className="h-4 w-4"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+          <div className="relative flex min-w-0 shrink-0 flex-col border-t border-white/10 bg-[#101013]">
+            {/* Top resize strip across Transport Bar */}
+            <div
+              onPointerDown={handleTimelineResizePointerDown}
+              onPointerMove={handleTimelineResizePointerMove}
+              onPointerUp={handleTimelineResizePointerUp}
+              onPointerCancel={handleTimelineResizePointerUp}
+              onDoubleClick={handleTimelineResizeReset}
+              className={`absolute inset-x-0 -top-1.5 z-10 h-3 cursor-ns-resize touch-none transition-colors ${
+                isResizingTimeline ? 'bg-cyan-400/20' : 'hover:bg-white/5'
+              }`}
+            />
+            <div className="flex h-[54px] min-w-0 items-center justify-between gap-2 px-2.5 pt-2.5 pb-1 sm:px-4">
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={undo}
+                  disabled={!canUndo}
+                  aria-label="Отменить"
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
                 >
-                  <path d="M12 3l7.5 9L12 21 4.5 12 12 3z" />
-                  <path d="M12 9v6" />
-                  <path d="M9 12h6" />
-                </svg>
-              </button>
-              <span className="font-mono text-xs tabular-nums text-zinc-500 whitespace-nowrap">
-                {formatTimecode(duration)}
-              </span>
-            </div>
+                  <Undo2 className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={redo}
+                  disabled={!canRedo}
+                  aria-label="Повторить"
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+                >
+                  <Redo2 className="h-4 w-4" />
+                </button>
+              </div>
 
-            <div className="flex shrink-0 items-center gap-1">
-              <button
-                type="button"
-                onClick={handleSplitSelectedOrCurrent}
-                disabled={!canSplitNow}
-                title="Разделить клип по линии времени (S)"
-                className="flex h-9 shrink-0 items-center gap-1 rounded-lg px-2 text-xs font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-30"
-              >
-                <Scissors className="h-4 w-4 shrink-0 text-cyan-400" />
-                <span className="hidden xl:inline whitespace-nowrap">Разделить</span>
-              </button>
-              <button
-                type="button"
-                onClick={() =>
-                  replaceClips(createStarterClips(), {
-                    tracks: createDefaultTracks(),
-                  })
-                }
-                title="Сбросить к демо-проекту"
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-white/10 hover:text-white"
-              >
-                <RotateCcw className="h-4 w-4" />
-              </button>
+              <div className="flex min-w-0 shrink-0 items-center gap-1.5 sm:gap-2.5">
+                <span className="font-mono text-xs tabular-nums text-white whitespace-nowrap">
+                  {formatTimecode(currentTime)}
+                </span>
+                <div className="relative flex shrink-0 items-center justify-center">
+                  <button
+                    type="button"
+                    role="separator"
+                    aria-orientation="horizontal"
+                    aria-label="Двигать нижнее окно вверх и вниз"
+                    title="Потяните вверх/вниз для изменения размера таймлайна и превью (двойной клик — сброс)"
+                    onPointerDown={handleTimelineResizePointerDown}
+                    onPointerMove={handleTimelineResizePointerMove}
+                    onPointerUp={handleTimelineResizePointerUp}
+                    onPointerCancel={handleTimelineResizePointerUp}
+                    onDoubleClick={handleTimelineResizeReset}
+                    onKeyDown={handleTimelineResizeKeyDown}
+                    className={`before:absolute before:-top-2 before:inset-x-[-6px] before:bottom-0 before:content-[''] absolute -top-[19px] left-1/2 z-20 flex h-[17px] w-11 -translate-x-1/2 cursor-ns-resize touch-none items-center justify-center rounded-full border transition ${
+                      isResizingTimeline
+                        ? 'border-cyan-400 bg-cyan-500/25 text-cyan-200 shadow-[0_0_12px_rgba(34,211,238,0.4)]'
+                        : 'border-white/15 bg-[#1a1a20] text-zinc-400 shadow-sm hover:border-cyan-400/60 hover:bg-[#23232b] hover:text-zinc-100'
+                    }`}
+                  >
+                    <ChevronsUpDown className="h-3 w-3" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setIsPlaying((p) => !p)}
+                    aria-label={isPlaying ? 'Пауза' : 'Воспроизвести'}
+                    className="flex h-9 w-11 shrink-0 items-center justify-center rounded-full bg-white text-zinc-950 shadow hover:bg-zinc-200 active:scale-95"
+                  >
+                    {isPlaying ? (
+                      <Pause className="h-4 w-4 fill-current" />
+                    ) : (
+                      <Play className="ml-0.5 h-4 w-4 fill-current" />
+                    )}
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleAddKeyframeAtPlayhead}
+                  disabled={!selectedClip || selectedClip.track === 'audio'}
+                  title="Поставить ключевой кадр в текущем времени"
+                  aria-label="Ключевой кадр"
+                  className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition active:scale-95 disabled:opacity-30 ${
+                    hasKeyframeAtPlayhead
+                      ? 'border-amber-400/70 bg-amber-500/20 text-amber-300'
+                      : 'border-white/10 bg-zinc-900 text-zinc-200 hover:border-amber-400/60 hover:text-amber-200'
+                  }`}
+                >
+                  <svg
+                    viewBox="0 0 24 24"
+                    className="h-4 w-4"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  >
+                    <path d="M12 3l7.5 9L12 21 4.5 12 12 3z" />
+                    <path d="M12 9v6" />
+                    <path d="M9 12h6" />
+                  </svg>
+                </button>
+                <span className="font-mono text-xs tabular-nums text-zinc-500 whitespace-nowrap">
+                  {formatTimecode(duration)}
+                </span>
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1">
+                <button
+                  type="button"
+                  onClick={handleSplitSelectedOrCurrent}
+                  disabled={!canSplitNow}
+                  title="Разделить клип по линии времени (S)"
+                  className="flex h-9 shrink-0 items-center gap-1 rounded-lg px-2 text-xs font-medium text-zinc-200 hover:bg-white/10 disabled:opacity-30"
+                >
+                  <Scissors className="h-4 w-4 shrink-0 text-cyan-400" />
+                  <span className="hidden xl:inline whitespace-nowrap">Разделить</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    replaceClips(createStarterClips(), {
+                      tracks: createDefaultTracks(),
+                    })
+                  }
+                  title="Сбросить к демо-проекту"
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-zinc-400 hover:bg-white/10 hover:text-white"
+                >
+                  <RotateCcw className="h-4 w-4" />
+                </button>
+              </div>
             </div>
           </div>
         </main>
@@ -3072,10 +3436,7 @@ export default function App() {
                 </div>
               )}
 
-              {(selectedClip.track === 'overlay' ||
-                selectedClip.track === 'text' ||
-                selectedClip.track === 'adjustment' ||
-                selectedClip.kind === 'adjustment') && (
+              {selectedClip.track !== 'audio' && (
                 <KeyframeControls
                   clip={selectedClip}
                   currentTime={currentTime}
@@ -3162,16 +3523,24 @@ export default function App() {
 
       {/* Multi-Track Dynamic Timeline OR Alight Motion Trackpad / Mobile Tool Overlays */}
       <div
+        ref={bottomPanelRef}
+        style={
+          clampedCustomTimelineHeight !== null
+            ? {height: `${clampedCustomTimelineHeight}px`}
+            : undefined
+        }
         className={`relative shrink-0 ${
-          (selectedClip?.track === 'text' &&
-            mobileEditTool === 'text' &&
-            !isTextColorPickerActive) ||
-          mobileEditTool === 'shape' ||
-          mobileEditTool === 'adjust' ||
-          mobileEditTool === 'filters' ||
-          mobileEditTool === 'keyframes'
-            ? 'h-[305px] sm:h-[330px] lg:h-[260px]'
-            : 'h-[220px] sm:h-[245px] lg:h-[260px]'
+          clampedCustomTimelineHeight !== null
+            ? ''
+            : (selectedClip?.track === 'text' &&
+                  mobileEditTool === 'text' &&
+                  !isTextColorPickerActive) ||
+                mobileEditTool === 'shape' ||
+                mobileEditTool === 'adjust' ||
+                mobileEditTool === 'filters' ||
+                mobileEditTool === 'keyframes'
+              ? 'h-[305px] sm:h-[330px] lg:h-[260px]'
+              : 'h-[220px] sm:h-[245px] lg:h-[260px]'
         }`}
       >
         {showTrackpad && selectedClip && selectedClip.track !== 'audio' ? (
@@ -3182,6 +3551,7 @@ export default function App() {
             snapEnabled={snapEnabled}
             onLockLayer={sendLayerLock}
             onTransformClip={handleTransformClipOnCanvas}
+            onUpdateClip={(id, patch) => updateClip(id, patch)}
             onSnapGuidesChange={setTrackpadSnapGuides}
             onClose={() => {
               setShowTrackpad(false);
@@ -3233,7 +3603,9 @@ export default function App() {
                 <TransformPanel
                   clip={selectedClip}
                   currentTime={currentTime}
+                  onSeek={handleSeek}
                   onUpdateClip={updateClip}
+                  onUpdateTransform={handleUpdateClipTransformFields}
                   onUpdateWarp={handleUpdateClipWarp}
                   onOpenTrackpad={() => {
                     setMobileEditTool(null);
@@ -3699,10 +4071,7 @@ export default function App() {
                 className={`flex h-11 min-w-[78px] shrink-0 flex-col items-center justify-center rounded-lg px-2 text-[10px] font-medium transition ${
                   mobileEditTool === 'transform'
                     ? 'bg-cyan-500/20 text-cyan-300'
-                    : selectedClip.flipHorizontal ||
-                        selectedClip.flipVertical ||
-                        Math.abs((selectedClip.scaleX ?? 1) - 1) > 0.01 ||
-                        Math.abs((selectedClip.scaleY ?? 1) - 1) > 0.01
+                    : hasActiveTransformChanges
                       ? 'text-cyan-300 hover:bg-white/5'
                       : 'text-zinc-200 hover:bg-white/5'
                 }`}
@@ -4134,22 +4503,22 @@ export default function App() {
                 <span className="text-xs font-semibold text-white">Фигуры</span>
               </button>
             </div>
+            <button
+              type="button"
+              onClick={() => {
+                setShowOverlayChooser(false);
+                setMobileSheet('overlay');
+              }}
+              className="flex h-10 w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-zinc-900 text-xs font-medium text-zinc-200 hover:border-indigo-400/50 active:scale-[0.99]"
+            >
+              <Layers className="h-3.5 w-3.5 text-indigo-400" />
+              Выбор дорожки, сцены и настройки слоя
+            </button>
           </div>
         </div>
       )}
 
       {/* Mobile Bottom Sheets */}
-      {mobileSheet === 'media' && (
-        <BottomSheet
-          title="Добавить видео или фото"
-          onClose={() => setMobileSheet(null)}
-        >
-          <MediaPanel
-            onAddMediaClip={handleAddMediaClip}
-            onClose={() => setMobileSheet(null)}
-          />
-        </BottomSheet>
-      )}
       {mobileSheet === 'shapes' && (
         <BottomSheet
           title="Фигуры и свойства"
@@ -4353,7 +4722,191 @@ export default function App() {
         />
       )}
 
-      {/* Video Export Modal */}
+      {/* Export Settings Modal */}
+      {showExportModal && (
+        <div
+          onClick={() => setShowExportModal(false)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md space-y-4 rounded-2xl border border-white/15 bg-[#141418] p-5 shadow-2xl"
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Download className="h-4 w-4 text-cyan-400" />
+                <h3 className="text-base font-semibold text-white">
+                  Параметры экспорта
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowExportModal(false)}
+                className="rounded-lg bg-zinc-800 px-2.5 py-1 text-xs text-zinc-300 hover:text-white"
+              >
+                Закрыть
+              </button>
+            </div>
+
+            {/* Format */}
+            <div className="space-y-1.5">
+              <p className="text-xs font-medium text-zinc-400">Формат файла</p>
+              <div className="grid grid-cols-5 gap-1.5">
+                {EXPORT_FORMAT_OPTIONS.map((fmt) => {
+                  const active = exportFormat === fmt.id;
+                  return (
+                    <button
+                      key={fmt.id}
+                      type="button"
+                      onClick={() => setExportFormat(fmt.id)}
+                      className={`flex flex-col items-center justify-center rounded-xl border px-1.5 py-2 text-center transition ${
+                        active
+                          ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                          : 'border-white/10 bg-zinc-900 text-zinc-300 hover:border-white/25'
+                      }`}
+                    >
+                      <span className="text-xs font-bold">{fmt.label}</span>
+                      <span className="text-[10px] text-zinc-400">
+                        {fmt.ext}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[11px] text-zinc-400">
+                {
+                  EXPORT_FORMAT_OPTIONS.find((f) => f.id === exportFormat)
+                    ?.hint
+                }
+              </p>
+            </div>
+
+            {/* Resolution */}
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-zinc-400">Разрешение</span>
+                <span className="font-mono text-[11px] text-cyan-300">
+                  {getExportDimensions(project.aspectRatio, exportResolution).width}
+                  ×
+                  {getExportDimensions(project.aspectRatio, exportResolution).height}
+                </span>
+              </div>
+              <div className="grid grid-cols-5 gap-1.5">
+                {EXPORT_RESOLUTION_OPTIONS.map((resOpt) => {
+                  const active = exportResolution === resOpt.id;
+                  return (
+                    <button
+                      key={resOpt.id}
+                      type="button"
+                      onClick={() => setExportResolution(resOpt.id)}
+                      className={`flex flex-col items-center justify-center rounded-xl border px-1 py-2 text-center transition ${
+                        active
+                          ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                          : 'border-white/10 bg-zinc-900 text-zinc-300 hover:border-white/25'
+                      }`}
+                    >
+                      <span className="text-xs font-bold">
+                        {resOpt.id === '1440p'
+                          ? '2K'
+                          : resOpt.id === '2160p'
+                            ? '4K'
+                            : resOpt.id}
+                      </span>
+                      <span className="text-[9px] text-zinc-400">
+                        {resOpt.hint}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* FPS (hidden/muted for PNG snapshot) */}
+            {exportFormat !== 'png' && (
+              <div className="space-y-1.5">
+                <p className="text-xs font-medium text-zinc-400">
+                  Частота кадров (FPS)
+                </p>
+                <div className="grid grid-cols-6 gap-1.5">
+                  {EXPORT_FPS_OPTIONS.map((fpsOpt) => {
+                    const active = exportFps === fpsOpt;
+                    return (
+                      <button
+                        key={fpsOpt}
+                        type="button"
+                        onClick={() => setExportFps(fpsOpt)}
+                        className={`h-9 rounded-xl border text-xs font-semibold transition ${
+                          active
+                            ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                            : 'border-white/10 bg-zinc-900 text-zinc-300 hover:border-white/25'
+                        }`}
+                      >
+                        {fpsOpt}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Quality preset */}
+            {(exportFormat === 'mp4' ||
+              exportFormat === 'webm' ||
+              exportFormat === 'webp') && (
+              <div className="space-y-1.5">
+                <p className="text-xs font-medium text-zinc-400">Качество</p>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      {id: 'standard', label: 'Эконом'},
+                      {id: 'high', label: 'Высокое'},
+                      {id: 'ultra', label: 'Максимум'},
+                    ] as const
+                  ).map((q) => (
+                    <button
+                      key={q.id}
+                      type="button"
+                      onClick={() => setExportQuality(q.id)}
+                      className={`h-9 rounded-xl border text-xs font-medium transition ${
+                        exportQuality === q.id
+                          ? 'border-cyan-400 bg-cyan-500/20 text-cyan-200'
+                          : 'border-white/10 bg-zinc-900 text-zinc-300 hover:border-white/25'
+                      }`}
+                    >
+                      {q.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {(exportFormat === 'webp' || exportFormat === 'gif') &&
+              Math.round(duration * exportFps) > MAX_ANIMATED_IMAGE_FRAMES && (
+                <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                  Для {exportFormat.toUpperCase()} лимит{' '}
+                  {MAX_ANIMATED_IMAGE_FRAMES} кадров (сейчас ~
+                  {Math.round(duration * exportFps)} при {exportFps} fps).
+                  Уменьшите FPS или выберите MP4/WebM.
+                </div>
+              )}
+
+            <button
+              type="button"
+              onClick={() => void handleExportVideo()}
+              disabled={
+                (exportFormat === 'webp' || exportFormat === 'gif') &&
+                Math.round(duration * exportFps) > MAX_ANIMATED_IMAGE_FRAMES
+              }
+              className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-cyan-500 text-sm font-semibold text-zinc-950 hover:bg-cyan-400 disabled:opacity-45 active:scale-[0.99]"
+            >
+              <Download className="h-4 w-4" />
+              Начать экспорт (.{exportFormat})
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Video Export Progress / Result Modal */}
       {(exportProgress !== null || exportError) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-xs">
           <div className="w-full max-w-sm space-y-4 rounded-2xl border border-white/15 bg-[#141418] p-5 shadow-2xl">
@@ -4362,10 +4915,12 @@ export default function App() {
                 {exportError
                   ? 'Ошибка экспорта'
                   : exportProgress === 100
-                    ? 'Видео готово'
-                    : 'Рендер видео...'}
+                    ? exportFormat === 'png'
+                      ? 'Кадр готов'
+                      : 'Экспорт завершён'
+                    : 'Экспорт...'}
               </h3>
-              {(exportProgress === 100 || exportError) && (
+              {exportProgress === 100 || exportError ? (
                 <button
                   type="button"
                   onClick={() => {
@@ -4375,6 +4930,14 @@ export default function App() {
                   className="text-xs text-zinc-400 hover:text-white"
                 >
                   Закрыть
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => exportAbortRef.current?.abort()}
+                  className="rounded-lg border border-rose-500/40 bg-rose-500/15 px-2.5 py-1 text-xs font-medium text-rose-300 hover:bg-rose-500/25"
+                >
+                  Отменить
                 </button>
               )}
             </div>
@@ -4390,12 +4953,19 @@ export default function App() {
                   />
                 </div>
                 <div className="flex items-center justify-between text-xs text-zinc-400">
-                  <span>
-                    Формат {project.aspectRatio} (
-                    {getCanvasDimensions(project.aspectRatio).width}×
-                    {getCanvasDimensions(project.aspectRatio).height}) · 30 fps
+                  <span className="truncate pr-2">
+                    {exportProgress === 100 && exportedUrl
+                      ? `${exportedUrl.width}×${exportedUrl.height}${
+                          exportedUrl.ext === 'png'
+                            ? ''
+                            : ` · ${exportedUrl.fps} fps`
+                        }`
+                      : exportStage ||
+                        `${getExportDimensions(project.aspectRatio, exportResolution).width}×${getExportDimensions(project.aspectRatio, exportResolution).height}${
+                          exportFormat === 'png' ? '' : ` · ${exportFps} fps`
+                        }`}
                   </span>
-                  <span className="font-mono tabular-nums text-white">
+                  <span className="shrink-0 font-mono tabular-nums text-white">
                     {exportProgress}%
                   </span>
                 </div>
@@ -4404,12 +4974,22 @@ export default function App() {
 
             {exportedUrl && (
               <div className="space-y-3">
-                <video
-                  src={exportedUrl.url}
-                  controls
-                  playsInline
-                  className="max-h-56 w-full rounded-xl border border-white/10 bg-black"
-                />
+                {exportedUrl.ext === 'webp' ||
+                exportedUrl.ext === 'gif' ||
+                exportedUrl.ext === 'png' ? (
+                  <img
+                    src={exportedUrl.url}
+                    alt={exportedUrl.filename}
+                    className="max-h-56 w-full rounded-xl border border-white/10 bg-black object-contain"
+                  />
+                ) : (
+                  <video
+                    src={exportedUrl.url}
+                    controls
+                    playsInline
+                    className="max-h-56 w-full rounded-xl border border-white/10 bg-black"
+                  />
+                )}
                 <a
                   href={exportedUrl.url}
                   download={exportedUrl.filename}
@@ -4476,6 +5056,7 @@ export default function App() {
         <AppSettingsModal
           onClose={() => setShowAppSettings(false)}
           onKeyChanged={() => setGiphyKeyVersion((v) => v + 1)}
+          onStorageChanged={() => void refreshStorageSummary()}
         />
       )}
 

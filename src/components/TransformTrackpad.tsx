@@ -1,5 +1,6 @@
 import React, {useRef, useState} from 'react';
 import {
+  Diamond,
   Maximize2,
   Move,
   RotateCcw,
@@ -7,7 +8,10 @@ import {
   X,
 } from 'lucide-react';
 import type {Clip} from '../shared/types.ts';
-import {evaluateClipTransform} from '../lib/keyframeEngine.ts';
+import {
+  evaluateClipTransform,
+  upsertKeyframeAtTime,
+} from '../lib/keyframeEngine.ts';
 import type {CanvasTransformPatch} from './PreviewCanvas.tsx';
 
 export type TrackpadMode = 'position' | 'scale' | 'rotation';
@@ -23,6 +27,7 @@ interface TransformTrackpadProps {
     patch: CanvasTransformPatch,
     commit: boolean
   ) => void;
+  onUpdateClip?: (clipId: string, patch: Partial<Clip>) => void;
   onSnapGuidesChange: (guides: {x: boolean; y: boolean}) => void;
   onClose: () => void;
 }
@@ -48,6 +53,7 @@ export const TransformTrackpad: React.FC<TransformTrackpadProps> = ({
   snapEnabled,
   onLockLayer,
   onTransformClip,
+  onUpdateClip,
   onSnapGuidesChange,
   onClose,
 }) => {
@@ -79,6 +85,26 @@ export const TransformTrackpad: React.FC<TransformTrackpadProps> = ({
   } | null>(null);
 
   const currentTransform = evaluateClipTransform(clip, currentTime);
+  const keyframes = clip.keyframes ?? [];
+  const localTime = Math.max(
+    0,
+    Math.min(clip.duration, currentTime - clip.start)
+  );
+  const activeKf = keyframes.find(
+    (k) => Math.abs(k.timeOffset - localTime) <= 0.12
+  );
+
+  const handleToggleKeyframe = () => {
+    if (!onUpdateClip) return;
+    if (activeKf) {
+      onUpdateClip(clip.id, {
+        keyframes: keyframes.filter((k) => k.id !== activeKf.id),
+      });
+      return;
+    }
+    const {keyframes: next} = upsertKeyframeAtTime(clip, currentTime);
+    onUpdateClip(clip.id, {keyframes: next});
+  };
 
   const applySnap = (
     rawX: number,
@@ -403,6 +429,35 @@ export const TransformTrackpad: React.FC<TransformTrackpadProps> = ({
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
+          {onUpdateClip && (
+            <button
+              type="button"
+              onClick={handleToggleKeyframe}
+              className={`flex h-7 items-center gap-1 rounded-md border px-2 text-[11px] font-semibold transition active:scale-95 ${
+                activeKf
+                  ? 'border-rose-500/50 bg-rose-500/20 text-rose-200 hover:bg-rose-500/30'
+                  : 'border-amber-400/50 bg-amber-400/15 text-amber-200 hover:bg-amber-400/25'
+              }`}
+              title={
+                activeKf
+                  ? 'Удалить ключ в этой точке'
+                  : 'Добавить ключ трансформации в этой точке'
+              }
+            >
+              <Diamond
+                className={`h-3 w-3 ${
+                  activeKf ? 'text-rose-300' : 'fill-amber-400 text-amber-300'
+                }`}
+              />
+              <span>
+                {activeKf
+                  ? 'Удалить'
+                  : keyframes.length > 0
+                    ? `+ Ключ (${keyframes.length})`
+                    : '+ Ключ'}
+              </span>
+            </button>
+          )}
           <button
             type="button"
             onClick={handleResetActiveParam}

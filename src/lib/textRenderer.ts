@@ -980,8 +980,8 @@ export function drawTextClipCanvas(
     return {line, glyphs: items};
   });
 
-  const sxFactor = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
-  const syFactor = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
+  const sxFactor = kf.scaleX * (kf.flipHorizontal ? -1 : 1);
+  const syFactor = kf.scaleY * (kf.flipVertical ? -1 : 1);
 
   const renderTextBodyToTarget = (
     targetCtx: CanvasRenderingContext2D,
@@ -1437,8 +1437,8 @@ export function getTextClipUnwarpedBox(
     return {
       centerX: anchorX,
       centerY: anchorY,
-      layerW: cw * 0.45 * kf.scale * Math.abs(clip.scaleX ?? 1),
-      layerH: 80 * sf * kf.scale * Math.abs(clip.scaleY ?? 1),
+      layerW: cw * 0.45 * kf.scale * Math.abs(kf.scaleX),
+      layerH: 80 * sf * kf.scale * Math.abs(kf.scaleY),
       rotationDeg: effectiveRotation,
     };
   }
@@ -1450,8 +1450,8 @@ export function getTextClipUnwarpedBox(
     clip.textStyle,
     kf.scale * anim.scaleMul
   );
-  const sxFactor = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
-  const syFactor = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
+  const sxFactor = kf.scaleX * (kf.flipHorizontal ? -1 : 1);
+  const syFactor = kf.scaleY * (kf.flipVertical ? -1 : 1);
   const localCx = (layout.boxX + layout.boxW / 2) * sxFactor;
   const localCy = (layout.boxY + layout.boxH / 2) * syFactor;
   const rad = (effectiveRotation * Math.PI) / 180;
@@ -1515,8 +1515,8 @@ export function hitTestTextClip(
   const rad = (-kf.rotation * Math.PI) / 180;
   const cos = Math.cos(rad);
   const sin = Math.sin(rad);
-  const rx = (px * cos - py * sin) / Math.max(0.1, Math.abs(clip.scaleX ?? 1));
-  const ry = (px * sin + py * cos) / Math.max(0.1, Math.abs(clip.scaleY ?? 1));
+  const rx = (px * cos - py * sin) / Math.max(0.1, Math.abs(kf.scaleX));
+  const ry = (px * sin + py * cos) / Math.max(0.1, Math.abs(kf.scaleY));
 
   const hitPad = 14 * layout.sf;
   return (
@@ -1544,8 +1544,8 @@ export function textLocalToCanvasPx(
   const kf = evaluateClipTransform(clip, time);
   const sf = cw / 720;
   const scalePx = sf * kf.scale;
-  const sx = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
-  const sy = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
+  const sx = kf.scaleX * (kf.flipHorizontal ? -1 : 1);
+  const sy = kf.scaleY * (kf.flipVertical ? -1 : 1);
 
   const px = localX * scalePx * sx;
   const py = localY * scalePx * sy;
@@ -1570,8 +1570,8 @@ export function canvasNormToTextLocal(
   const kf = evaluateClipTransform(clip, time);
   const sf = cw / 720;
   const scalePx = Math.max(0.05, sf * kf.scale);
-  const sx = (clip.scaleX ?? 1) * (clip.flipHorizontal ? -1 : 1);
-  const sy = (clip.scaleY ?? 1) * (clip.flipVertical ? -1 : 1);
+  const sx = kf.scaleX * (kf.flipHorizontal ? -1 : 1);
+  const sy = kf.scaleY * (kf.flipVertical ? -1 : 1);
 
   const dx = nx * cw - cw * kf.x;
   const dy = ny * ch - ch * kf.y;

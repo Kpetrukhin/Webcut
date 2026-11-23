@@ -610,17 +610,32 @@ export async function extractAudioFromVideoClip(clip: Clip): Promise<{
 }
 
 /**
- * Mixes all active unmuted audio, synth, and video clips from 0..totalDuration
- * into a single WAV file using OfflineAudioContext.
+ * Offline-renders all active unmuted audio, synth, and video clips from 0..totalDuration
+ * into a stereo AudioBuffer (returns null if no audible clips exist).
  */
-export async function renderTimelineMixdownToWav(
+export async function renderTimelineAudioBuffer(
   clips: Clip[],
   tracks: Track[],
-  totalDuration: number
-): Promise<{file: File; duration: number}> {
-  const sampleRate = 44100;
-  const safeDuration = Math.max(1, totalDuration);
+  totalDuration: number,
+  sampleRate = 44100
+): Promise<AudioBuffer | null> {
+  const safeDuration = Math.max(0.2, totalDuration);
   const frameCount = Math.ceil(safeDuration * sampleRate);
+
+  const mutedTrackIds = new Set(
+    tracks.filter((t) => t.muted).map((t) => t.id)
+  );
+  const audibleClips = clips.filter(
+    (c) =>
+      !mutedTrackIds.has(c.trackId) &&
+      (c.volume ?? 1) > 0.01 &&
+      (c.track === 'audio' || c.kind === 'video') &&
+      c.start < safeDuration
+  );
+
+  if (audibleClips.length === 0) {
+    return null;
+  }
 
   const AudioCtx =
     window.AudioContext ||
@@ -629,22 +644,9 @@ export async function renderTimelineMixdownToWav(
   const decodeCtx = new AudioCtx();
   const offline = new OfflineAudioContext(2, frameCount, sampleRate);
   const cleanupFns: Array<() => void> = [];
+  let hasScheduledAudio = false;
 
   try {
-    const mutedTrackIds = new Set(
-      tracks.filter((t) => t.muted).map((t) => t.id)
-    );
-    const audibleClips = clips.filter(
-      (c) =>
-        !mutedTrackIds.has(c.trackId) &&
-        (c.volume ?? 1) > 0.01 &&
-        (c.track === 'audio' || c.kind === 'video')
-    );
-
-    if (audibleClips.length === 0) {
-      throw new Error('На таймлайне нет активных звуковых дорожек');
-    }
-
     const decodedCache = new Map<string, AudioBuffer>();
     for (const clip of audibleClips) {
       if (clip.kind === 'synth') {
@@ -655,6 +657,7 @@ export async function renderTimelineMixdownToWav(
         cleanupFns.push(fx.dispose);
         fx.output.connect(offline.destination);
         scheduleSynthClipOffline(offline, clip, fx.input);
+        hasScheduledAudio = true;
         continue;
       }
 
@@ -674,7 +677,7 @@ export async function renderTimelineMixdownToWav(
 
         const srcNode = offline.createBufferSource();
         srcNode.buffer = pitchedBuf;
-        srcNode.playbackRate.value = clip.speed || 1;
+        srcNode.playbackRate.value = Math.max(0.01, Math.min(100, clip.speed || 1));
 
         const gain = offline.createGain();
         gain.gain.value = Math.max(0, Math.min(1, clip.volume ?? 1));
@@ -691,23 +694,62 @@ export async function renderTimelineMixdownToWav(
 
         const startAt = Math.max(0, clip.start);
         const offset = Math.max(0, clip.trimStart || 0);
-        const srcDuration = Math.max(0.05, clip.duration * (clip.speed || 1));
-        srcNode.start(startAt, offset, srcDuration);
+        const playableTimelineDur = Math.min(
+          clip.duration,
+          Math.max(0, safeDuration - startAt)
+        );
+        const srcDuration = Math.max(
+          0.05,
+          playableTimelineDur * (clip.speed || 1)
+        );
+        if (offset < pitchedBuf.duration) {
+          srcNode.start(
+            startAt,
+            offset,
+            Math.min(srcDuration, Math.max(0.01, pitchedBuf.duration - offset))
+          );
+          hasScheduledAudio = true;
+        }
       } catch {
         // Skip silent video without an audio stream
       }
     }
 
-    const rendered = await offline.startRendering();
-    const wavBlob = encodeAudioBufferToWav(rendered);
-    const file = new File([wavBlob], `mixdown_${Date.now()}.wav`, {
-      type: 'audio/wav',
-    });
-    return {file, duration: Math.round(safeDuration * 100) / 100};
+    if (!hasScheduledAudio) {
+      return null;
+    }
+
+    return await offline.startRendering();
   } finally {
     for (const fn of cleanupFns) fn();
     void decodeCtx.close().catch(() => {});
   }
+}
+
+/**
+ * Mixes all active unmuted audio, synth, and video clips from 0..totalDuration
+ * into a single WAV file using OfflineAudioContext.
+ */
+export async function renderTimelineMixdownToWav(
+  clips: Clip[],
+  tracks: Track[],
+  totalDuration: number
+): Promise<{file: File; duration: number}> {
+  const safeDuration = Math.max(1, totalDuration);
+  const rendered = await renderTimelineAudioBuffer(
+    clips,
+    tracks,
+    safeDuration,
+    44100
+  );
+  if (!rendered) {
+    throw new Error('На таймлайне нет активных звуковых дорожек');
+  }
+  const wavBlob = encodeAudioBufferToWav(rendered);
+  const file = new File([wavBlob], `mixdown_${Date.now()}.wav`, {
+    type: 'audio/wav',
+  });
+  return {file, duration: Math.round(safeDuration * 100) / 100};
 }
 
 export async function probeAudioDuration(url: string): Promise<number> {

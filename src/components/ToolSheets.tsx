@@ -65,7 +65,6 @@ import type {
 
 export type ActiveToolTab =
   | 'edit'
-  | 'media'
   | 'overlay'
   | 'text'
   | 'effects'
@@ -75,7 +74,8 @@ export type ActiveToolTab =
 
 async function uploadOrLocalMedia(
   file: File,
-  fallbackKind: 'video' | 'image' | 'audio' | 'font'
+  fallbackKind: 'video' | 'image' | 'audio' | 'font',
+  onProgress?: (pct: number) => void
 ): Promise<{
   name: string;
   fileName: string;
@@ -85,7 +85,7 @@ async function uploadOrLocalMedia(
   fileSize?: number;
   fileHash?: string;
 }> {
-  const prepared = await uploadFileForP2P(file, fallbackKind);
+  const prepared = await uploadFileForP2P(file, fallbackKind, onProgress);
   return {
     name: prepared.name,
     fileName: prepared.fileName,
@@ -342,9 +342,9 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
               <input
                 type="range"
                 min={0.15}
-                max={1.4}
+                max={2.5}
                 step={0.05}
-                value={currentEval.scale}
+                value={Math.max(0.15, Math.min(2.5, currentEval.scale))}
                 onChange={(e) =>
                   handleUpdateActiveKfField({scale: Number(e.target.value)})
                 }
@@ -374,6 +374,64 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                 value={currentEval.rotation}
                 onChange={(e) =>
                   handleUpdateActiveKfField({rotation: Number(e.target.value)})
+                }
+                className="w-full accent-amber-400"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-1">
+                <span>Scale X (ключ)</span>
+                <ScrubNumberField
+                  compact
+                  accent="amber"
+                  value={Math.round(currentEval.scaleX * 100)}
+                  min={10}
+                  max={300}
+                  step={1}
+                  suffix="%"
+                  ariaLabel="Scale X ключа"
+                  onChange={(pct) =>
+                    handleUpdateActiveKfField({scaleX: pct / 100})
+                  }
+                />
+              </div>
+              <input
+                type="range"
+                min={0.1}
+                max={3}
+                step={0.02}
+                value={Math.max(0.1, Math.min(3, currentEval.scaleX))}
+                onChange={(e) =>
+                  handleUpdateActiveKfField({scaleX: Number(e.target.value)})
+                }
+                className="w-full accent-amber-400"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-1">
+                <span>Scale Y (ключ)</span>
+                <ScrubNumberField
+                  compact
+                  accent="amber"
+                  value={Math.round(currentEval.scaleY * 100)}
+                  min={10}
+                  max={300}
+                  step={1}
+                  suffix="%"
+                  ariaLabel="Scale Y ключа"
+                  onChange={(pct) =>
+                    handleUpdateActiveKfField({scaleY: pct / 100})
+                  }
+                />
+              </div>
+              <input
+                type="range"
+                min={0.1}
+                max={3}
+                step={0.02}
+                value={Math.max(0.1, Math.min(3, currentEval.scaleY))}
+                onChange={(e) =>
+                  handleUpdateActiveKfField({scaleY: Number(e.target.value)})
                 }
                 className="w-full accent-amber-400"
               />
@@ -480,20 +538,25 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
   );
   const [forceNewTrack, setForceNewTrack] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [uploadPct, setUploadPct] = useState<number>(0);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
     setUploading(true);
+    setUploadPct(0);
     setErrorMsg(null);
 
     try {
       for (const file of Array.from(files)) {
-        const isVideo = file.type.startsWith('video/');
+        const isVideo =
+          file.type.startsWith('video/') ||
+          /\.(mp4|mov|webm|mkv|avi|m4v|3gp)$/i.test(file.name);
         const uploaded = await uploadOrLocalMedia(
           file,
-          isVideo ? 'video' : 'image'
+          isVideo ? 'video' : 'image',
+          (pct) => setUploadPct(pct)
         );
         const mediaKind = uploaded.kind === 'video' ? 'video' : 'image';
         const dur = await probeMediaDuration(uploaded.src, mediaKind);
@@ -505,7 +568,7 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
           remoteUrl: uploaded.shareUrl,
           fileSize: uploaded.fileSize,
           fileHash: uploaded.fileHash,
-          duration: Math.min(30, dur),
+          duration: Math.min(1800, dur),
           track: targetTrack,
           forceNewTrack,
         });
@@ -517,6 +580,7 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
       );
     } finally {
       setUploading(false);
+      setUploadPct(0);
       e.target.value = '';
     }
   };
@@ -573,8 +637,10 @@ export const MediaPanel: React.FC<MediaPanelProps> = ({
         <Upload className="h-4 w-4 shrink-0 text-cyan-400" />
         <span>
           {uploading
-            ? 'Загрузка файла...'
-            : 'Выбрать видео или фото с устройства'}
+            ? uploadPct > 0
+              ? `Загрузка файла... ${uploadPct}%`
+              : 'Загрузка файла...'
+            : 'Выбрать видео (до 30 мин) или фото'}
         </span>
         <input
           type="file"
@@ -662,10 +728,38 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
   onClose,
 }) => {
   const isOverlay = selectedClip?.track === 'overlay';
+  const overlayEval =
+    isOverlay && selectedClip
+      ? evaluateClipTransform(selectedClip, currentTime)
+      : null;
+
+  const updateOverlayTransform = (patch: {
+    x?: number;
+    y?: number;
+    scale?: number;
+    rotation?: number;
+    flipHorizontal?: boolean;
+  }) => {
+    if (!selectedClip) return;
+    if (selectedClip.keyframes && selectedClip.keyframes.length > 0) {
+      const {keyframes} = upsertKeyframeAtTime(selectedClip, currentTime, patch);
+      onUpdateClip(selectedClip.id, {keyframes});
+      return;
+    }
+    const basePatch: Partial<Clip> = {};
+    if (patch.x !== undefined) basePatch.mediaX = patch.x;
+    if (patch.y !== undefined) basePatch.mediaY = patch.y;
+    if (patch.scale !== undefined) basePatch.mediaScale = patch.scale;
+    if (patch.rotation !== undefined) basePatch.rotation = patch.rotation;
+    if (patch.flipHorizontal !== undefined) {
+      basePatch.flipHorizontal = patch.flipHorizontal;
+    }
+    onUpdateClip(selectedClip.id, basePatch);
+  };
 
   return (
     <div className="space-y-4">
-      {isOverlay && (
+      {isOverlay && overlayEval && (
         <>
           <div className="space-y-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3">
             <div className="flex items-center justify-between">
@@ -675,12 +769,12 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
               <button
                 type="button"
                 onClick={() =>
-                  onUpdateClip(selectedClip.id, {
-                    flipHorizontal: !selectedClip.flipHorizontal,
+                  updateOverlayTransform({
+                    flipHorizontal: !overlayEval.flipHorizontal,
                   })
                 }
                 className={`flex items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium ${
-                  selectedClip.flipHorizontal
+                  overlayEval.flipHorizontal
                     ? 'border-indigo-400 bg-indigo-500 text-white'
                     : 'border-white/10 bg-zinc-900 text-zinc-300'
                 }`}
@@ -705,9 +799,9 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                     key={pos.label}
                     type="button"
                     onClick={() =>
-                      onUpdateClip(selectedClip.id, {
-                        mediaX: pos.x,
-                        mediaY: pos.y,
+                      updateOverlayTransform({
+                        x: pos.x,
+                        y: pos.y,
                       })
                     }
                     className="h-8 rounded-lg border border-white/10 bg-zinc-900 text-xs font-bold text-zinc-200 hover:border-indigo-400"
@@ -724,26 +818,26 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                 <ScrubNumberField
                   compact
                   accent="indigo"
-                  value={Math.round((selectedClip.mediaScale ?? 0.42) * 100)}
+                  value={Math.round(overlayEval.scale * 100)}
                   min={10}
                   max={250}
                   step={1}
                   suffix="%"
                   ariaLabel="Размер PIP"
                   onChange={(pct) =>
-                    onUpdateClip(selectedClip.id, {mediaScale: pct / 100})
+                    updateOverlayTransform({scale: pct / 100})
                   }
                 />
               </div>
               <input
                 type="range"
                 min={0.15}
-                max={0.95}
+                max={2.5}
                 step={0.05}
-                value={selectedClip.mediaScale ?? 0.42}
+                value={Math.max(0.15, Math.min(2.5, overlayEval.scale))}
                 onChange={(e) =>
-                  onUpdateClip(selectedClip.id, {
-                    mediaScale: Number(e.target.value),
+                  updateOverlayTransform({
+                    scale: Number(e.target.value),
                   })
                 }
                 className="w-full accent-indigo-400"
@@ -757,14 +851,14 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   <ScrubNumberField
                     compact
                     accent="indigo"
-                    value={Math.round(selectedClip.rotation ?? 0)}
+                    value={Math.round(overlayEval.rotation)}
                     min={-180}
                     max={180}
                     step={1}
                     suffix="°"
                     ariaLabel="Поворот PIP"
                     onChange={(deg) =>
-                      onUpdateClip(selectedClip.id, {rotation: deg})
+                      updateOverlayTransform({rotation: deg})
                     }
                   />
                 </div>
@@ -773,9 +867,9 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   min={-180}
                   max={180}
                   step={2}
-                  value={selectedClip.rotation ?? 0}
+                  value={overlayEval.rotation}
                   onChange={(e) =>
-                    onUpdateClip(selectedClip.id, {
+                    updateOverlayTransform({
                       rotation: Number(e.target.value),
                     })
                   }
@@ -2130,7 +2224,6 @@ export const TOOL_TABS: Array<{
   {id: 'edit', label: 'Изменить', icon: Scissors},
   {id: 'audio', label: 'Звук', icon: Music},
   {id: 'text', label: 'Текст', icon: Type},
-  {id: 'media', label: 'Медиа', icon: Plus},
   {id: 'overlay', label: 'Наложение', icon: Layers},
   {id: 'effects', label: 'Эффекты', icon: Sparkles},
   {id: 'settings', label: 'Настройки', icon: Settings},

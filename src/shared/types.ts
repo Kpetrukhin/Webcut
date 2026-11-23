@@ -199,6 +199,10 @@ export interface ClipKeyframe {
   x: number; // normalized 0..1
   y: number; // normalized 0..1
   scale: number;
+  scaleX?: number;
+  scaleY?: number;
+  flipHorizontal?: boolean;
+  flipVertical?: boolean;
   rotation: number; // degrees -180..180
   opacity: number; // 0..1
   warp?: ClipWarp;

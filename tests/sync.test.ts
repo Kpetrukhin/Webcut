@@ -17,7 +17,11 @@ import {
   normalizeProjectTracks,
 } from '../src/shared/types.ts';
 import type {Clip, ProjectState, ServerWsMessage} from '../src/shared/types.ts';
-import {evaluateClipTransform} from '../src/lib/keyframeEngine.ts';
+import {
+  evaluateClipTransform,
+  upsertKeyframeAtTime,
+} from '../src/lib/keyframeEngine.ts';
+import {createDefaultWarp} from '../src/lib/warpEngine.ts';
 import {sha256Hex, sha256SyncHex} from '../src/lib/sha256.ts';
 import {downloadMediaInBackground} from '../src/lib/lanSyncBridge.ts';
 import {
@@ -1282,4 +1286,342 @@ test('Основное видео и стартовые клипы не приб
   }
 });
 
+test('Экспорт: getExportDimensions возвращает чётные размеры для всех разрешений и соотношений сторон', async () => {
+  const {getExportDimensions} = await import('../src/lib/exportEngine.ts');
+  const aspects = ['9:16', '16:9', '1:1', '4:5', '3:4', '21:9'] as const;
+  const resolutions = ['480p', '720p', '1080p', '1440p', '2160p'] as const;
 
+  for (const aspect of aspects) {
+    for (const res of resolutions) {
+      const {width, height} = getExportDimensions(aspect, res);
+      assert.equal(width % 2, 0, `${aspect} ${res} width (${width}) must be even`);
+      assert.equal(height % 2, 0, `${aspect} ${res} height (${height}) must be even`);
+      assert.ok(width >= 480 && height >= 480);
+    }
+  }
+
+  assert.deepEqual(getExportDimensions('16:9', '1080p'), {width: 1920, height: 1080});
+  assert.deepEqual(getExportDimensions('9:16', '2160p'), {width: 2160, height: 3840});
+});
+
+test('Экспорт: buildAnimatedWebp собирает валидный RIFF WEBP (VP8X + ANIM + ANMF) с нечётным выравниванием', async () => {
+  const {buildAnimatedWebp} = await import('../src/lib/webpMuxer.ts');
+
+  const makeMockSingleWebp = (fourcc: 'VP8 ' | 'VP8L', payload: number[]): Uint8Array => {
+    const padded = payload.length + (payload.length & 1);
+    const total = 12 + 8 + padded;
+    const buf = new Uint8Array(total);
+    buf.set(Buffer.from('RIFF'), 0);
+    new DataView(buf.buffer).setUint32(4, total - 8, true);
+    buf.set(Buffer.from('WEBP'), 8);
+    buf.set(Buffer.from(fourcc), 12);
+    new DataView(buf.buffer).setUint32(16, payload.length, true);
+    buf.set(payload, 20);
+    return buf;
+  };
+
+  // Odd-length VP8 payload + VP8L payload with alpha bit (byte 4 & 0x10)
+  const frame1 = makeMockSingleWebp('VP8 ', [1, 2, 3, 4, 5]);
+  const frame2 = makeMockSingleWebp('VP8L', [0x2f, 0, 0, 0, 0x10, 9]);
+
+  const animated = buildAnimatedWebp(
+    [
+      {webpBytes: frame1, durationMs: 33},
+      {webpBytes: frame2, durationMs: 33},
+    ],
+    720,
+    1280,
+    0
+  );
+
+  const ascii = (offset: number, len: number) =>
+    Buffer.from(animated.subarray(offset, offset + len)).toString('ascii');
+
+  assert.equal(ascii(0, 4), 'RIFF');
+  assert.equal(ascii(8, 4), 'WEBP');
+  assert.equal(
+    new DataView(animated.buffer, animated.byteOffset, animated.byteLength).getUint32(4, true),
+    animated.length - 8
+  );
+  assert.equal(ascii(12, 4), 'VP8X');
+  // Animation (0x02) + Alpha (0x10) detected from VP8L frame2
+  assert.equal(animated[20], 0x12);
+  // VP8X canvas width - 1 = 719, height - 1 = 1279
+  const canvasWMinus1 = animated[24] | (animated[25] << 8) | (animated[26] << 16);
+  const canvasHMinus1 = animated[27] | (animated[28] << 8) | (animated[29] << 16);
+  assert.equal(canvasWMinus1, 719);
+  assert.equal(canvasHMinus1, 1279);
+  assert.equal(ascii(30, 4), 'ANIM');
+  assert.equal(ascii(44, 4), 'ANMF');
+});
+
+test('Хранилище медиа: validateServerStorageDir блокирует traversal и системные каталоги', async () => {
+  const {validateServerStorageDir} = await import(
+    '../src/lib/storagePathRules.ts'
+  );
+  const appRoot = process.cwd();
+
+  const validRel = validateServerStorageDir('custom-media/team', appRoot);
+  assert.equal(validRel.valid, true);
+  assert.equal(
+    validRel.resolvedPath,
+    path.resolve(appRoot, 'custom-media/team')
+  );
+
+  const validAbs = validateServerStorageDir('/tmp/cutsync-test-media', appRoot);
+  assert.equal(validAbs.valid, true);
+
+  assert.equal(validateServerStorageDir('../../etc/passwd', appRoot).valid, false);
+  assert.equal(validateServerStorageDir('/etc', appRoot).valid, false);
+  assert.equal(validateServerStorageDir('/usr/local', appRoot).valid, false);
+  assert.equal(validateServerStorageDir('/', appRoot).valid, false);
+  assert.equal(validateServerStorageDir('C:\\Windows\\System32', appRoot).valid, false);
+  assert.equal(validateServerStorageDir('node_modules/cache', appRoot).valid, false);
+  assert.equal(validateServerStorageDir('.git/objects', appRoot).valid, false);
+  assert.equal(validateServerStorageDir('bad\0path', appRoot).valid, false);
+});
+
+test('Хранилище медиа E2E: выбор папки сохранений, загрузка в неё и сброс на корень приложения', async () => {
+  process.env.CUTSYNC_NO_AUTOSTART = '1';
+  const os = await import('node:os');
+  const storageConfigFile = path.join(
+    process.cwd(),
+    'data',
+    'storage-config.json'
+  );
+  const hadStorageConfig = fs.existsSync(storageConfigFile);
+  const prevStorageConfig = hadStorageConfig
+    ? fs.readFileSync(storageConfigFile, 'utf-8')
+    : null;
+
+  const customDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'cutsync-custom-media-')
+  );
+  const {startServer, stopServer} = await import('../server.ts');
+  const {port} = await startServer({
+    port: 0,
+    disableVite: true,
+    disableBeacon: true,
+  });
+
+  const baseHttp = `http://127.0.0.1:${port}`;
+  try {
+    // 1. Default is app root uploads folder
+    const initRes = await fetch(`${baseHttp}/api/storage/config`);
+    assert.equal(initRes.status, 200);
+    const initCfg = (await initRes.json()) as {
+      currentDir: string;
+      defaultDir: string;
+      isDefault: boolean;
+    };
+    assert.equal(initCfg.isDefault, true);
+    assert.equal(
+      path.resolve(initCfg.currentDir),
+      path.resolve(process.cwd(), 'uploads')
+    );
+
+    // 2. Reject invalid system directory
+    const badRes = await fetch(`${baseHttp}/api/storage/config`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dirPath: '/etc'}),
+    });
+    assert.equal(badRes.status, 400);
+
+    // 3. Switch to custom folder
+    const setRes = await fetch(`${baseHttp}/api/storage/config`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dirPath: customDir, migrateExisting: false}),
+    });
+    assert.equal(setRes.status, 200);
+    const setCfg = (await setRes.json()) as {
+      currentDir: string;
+      isDefault: boolean;
+    };
+    assert.equal(setCfg.isDefault, false);
+    assert.equal(path.resolve(setCfg.currentDir), path.resolve(customDir));
+
+    // 4. Upload a sample media payload and verify it lands inside customDir
+    const sampleBytes = Buffer.from('CUSTOM-DIR-MEDIA-PAYLOAD-123');
+    const upRes = await fetch(
+      `${baseHttp}/media/upload?fileName=sync-photo.jpg`,
+      {
+        method: 'POST',
+        body: sampleBytes,
+      }
+    );
+    assert.equal(upRes.status, 200);
+    const upJson = (await upRes.json()) as {
+      ok: boolean;
+      fileName: string;
+      localUrl: string;
+    };
+    assert.equal(upJson.ok, true);
+    const storedOnDisk = path.join(customDir, upJson.fileName);
+    assert.equal(fs.existsSync(storedOnDisk), true);
+
+    // File is served directly from customDir
+    const dlCustomRes = await fetch(`${baseHttp}${upJson.localUrl}`);
+    assert.equal(dlCustomRes.status, 200);
+    assert.deepEqual(Buffer.from(await dlCustomRes.arrayBuffer()), sampleBytes);
+
+    // 5. Reset back to app root default with migration enabled
+    const resetRes = await fetch(`${baseHttp}/api/storage/config`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({reset: true, migrateExisting: true}),
+    });
+    assert.equal(resetRes.status, 200);
+    const resetCfg = (await resetRes.json()) as {
+      isDefault: boolean;
+      migratedCount: number;
+    };
+    assert.equal(resetCfg.isDefault, true);
+    assert.ok(resetCfg.migratedCount >= 1);
+
+    const migratedDefaultFile = path.join(
+      process.cwd(),
+      'uploads',
+      upJson.fileName
+    );
+    assert.equal(fs.existsSync(migratedDefaultFile), true);
+    const dlAfterReset = await fetch(`${baseHttp}${upJson.localUrl}`);
+    assert.equal(dlAfterReset.status, 200);
+    assert.deepEqual(Buffer.from(await dlAfterReset.arrayBuffer()), sampleBytes);
+    if (fs.existsSync(migratedDefaultFile)) {
+      fs.unlinkSync(migratedDefaultFile);
+    }
+  } finally {
+    await stopServer();
+    fs.rmSync(customDir, {recursive: true, force: true});
+    if (hadStorageConfig && prevStorageConfig !== null) {
+      fs.writeFileSync(storageConfigFile, prevStorageConfig, 'utf-8');
+    } else if (fs.existsSync(storageConfigFile)) {
+      fs.unlinkSync(storageConfigFile);
+    }
+  }
+});
+
+test('Трансформация по ключам: интерполяция scaleX/scaleY, flip, warp (включая переход к/от Обычной) и изоляция базовых свойств', () => {
+  const baseWarp = createDefaultWarp('none', 4);
+  const clip: Clip = {
+    id: 'kf-transform-1',
+    track: 'overlay',
+    trackId: 'track-o1',
+    kind: 'image',
+    name: 'Морфинг.png',
+    start: 1,
+    duration: 4,
+    trimStart: 0,
+    sourceDuration: 60,
+    speed: 1,
+    volume: 1,
+    opacity: 1,
+    filter: 'none',
+    brightness: 1,
+    contrast: 1,
+    saturate: 1,
+    transitionIn: 'none',
+    motionEffect: 'none',
+    mediaX: 0.5,
+    mediaY: 0.5,
+    mediaScale: 0.5,
+    rotation: 0,
+    scaleX: 1,
+    scaleY: 1,
+    flipHorizontal: false,
+    flipVertical: false,
+    warp: baseWarp,
+  };
+
+  // Add first keyframe at t=1.0 (offset 0)
+  const step1 = upsertKeyframeAtTime(clip, 1.0, {
+    scaleX: 1,
+    scaleY: 1,
+    flipHorizontal: false,
+    warp: createDefaultWarp('none', 4),
+  });
+  let current: Clip = {...clip, keyframes: step1.keyframes};
+
+  // Add second keyframe at t=3.0 (offset 2.0) with stretched scaleX/scaleY, flip, and perspective warp
+  const perspWarp = createDefaultWarp('perspective', 4);
+  perspWarp.corners[0] = {x: 0.2, y: 0.1};
+  perspWarp.corners[1] = {x: 0.8, y: 0.2};
+  const step2 = upsertKeyframeAtTime(current, 3.0, {
+    scaleX: 2.0,
+    scaleY: 0.6,
+    flipHorizontal: true,
+    warp: perspWarp,
+    easing: 'linear',
+  });
+  current = {...current, keyframes: step2.keyframes};
+
+  // Base clip.warp and clip.scaleX must remain untouched so keyframe #1 stays unwarped
+  assert.equal(current.warp?.mode, 'none');
+  assert.equal(current.scaleX, 1);
+
+  // Add third keyframe at t=5.0 (offset 4.0) morphing BACK to normal ('none') with flipVertical
+  const step3 = upsertKeyframeAtTime(current, 5.0, {
+    scaleX: 1.0,
+    scaleY: 1.4,
+    flipHorizontal: false,
+    flipVertical: true,
+    warp: createDefaultWarp('none', 4),
+    easing: 'linear',
+  });
+  current = {...current, keyframes: step3.keyframes};
+
+  // At t=1.0 (kf1): identity scale & no warp
+  const atStart = evaluateClipTransform(current, 1.0);
+  assert.equal(atStart.scaleX, 1);
+  assert.equal(atStart.scaleY, 1);
+  assert.equal(atStart.flipHorizontal, false);
+  assert.equal(atStart.warp?.mode, 'none');
+
+  // At t=2.0 (midpoint between kf1 and kf2): smooth interpolation from identity
+  const atMid12 = evaluateClipTransform(current, 2.0);
+  assert.ok(Math.abs(atMid12.scaleX - 1.5) < 0.001);
+  assert.ok(Math.abs(atMid12.scaleY - 0.8) < 0.001);
+  assert.equal(atMid12.flipHorizontal, false);
+  assert.equal(atMid12.warp?.mode, 'perspective');
+  assert.ok(Math.abs((atMid12.warp?.corners[0].x ?? 0) - 0.1) < 0.001);
+  assert.ok(Math.abs((atMid12.warp?.corners[1].x ?? 0) - 0.9) < 0.001);
+
+  // At t=3.0 (exact kf2)
+  const atKf2 = evaluateClipTransform(current, 3.0);
+  assert.ok(Math.abs(atKf2.scaleX - 2.0) < 0.001);
+  assert.ok(Math.abs(atKf2.scaleY - 0.6) < 0.001);
+  assert.equal(atKf2.flipHorizontal, true);
+  assert.equal(atKf2.flipVertical, false);
+  assert.ok(Math.abs((atKf2.warp?.corners[0].x ?? 0) - 0.2) < 0.001);
+
+  // At t=4.0 (midpoint between kf2 and kf3): morphing back toward identity corners (even if kf3 had stale coords)
+  const atMid23 = evaluateClipTransform(current, 4.0);
+  assert.ok(Math.abs(atMid23.scaleX - 1.5) < 0.001);
+  assert.ok(Math.abs(atMid23.scaleY - 1.0) < 0.001);
+  assert.equal(atMid23.warp?.mode, 'perspective');
+  assert.ok(Math.abs((atMid23.warp?.corners[0].x ?? 0) - 0.1) < 0.001);
+  assert.ok(Math.abs((atMid23.warp?.corners[1].x ?? 0) - 0.9) < 0.001);
+
+  // At t=5.0 (kf3): cleanly back to 'none' & flipVertical true
+  const atEnd = evaluateClipTransform(current, 5.0);
+  assert.equal(atEnd.scaleX, 1.0);
+  assert.equal(atEnd.scaleY, 1.4);
+  assert.equal(atEnd.flipHorizontal, false);
+  assert.equal(atEnd.flipVertical, true);
+  assert.equal(atEnd.warp?.mode, 'none');
+
+  // Verify JSON sync & split/duplicate preserve new ClipKeyframe fields
+  const patch = encodePatchForSync<Clip>({keyframes: current.keyframes});
+  const synced = applyClipPatch(clip, JSON.parse(JSON.stringify(patch)));
+  assert.equal(synced.keyframes?.length, 3);
+  assert.equal(synced.keyframes?.[1].scaleX, 2.0);
+  assert.equal(synced.keyframes?.[1].flipHorizontal, true);
+  assert.equal(synced.keyframes?.[2].flipVertical, true);
+
+  const split = applyClipSplit([synced], synced.id, 3.0, 'kf-transform-split-2');
+  assert.equal(split.length, 2);
+  assert.equal(split[1].keyframes?.[0].scaleX, 2.0);
+  assert.equal(split[1].keyframes?.[0].flipHorizontal, true);
+});

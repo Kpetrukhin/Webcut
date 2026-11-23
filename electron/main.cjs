@@ -127,6 +127,26 @@ async function startLocalBackend() {
   process.env.CUTSYNC_UPLOADS_DIR = uploadsDir;
   process.env.CUTSYNC_DIST_DIR = distDir;
 
+  globalThis.__cutsyncPickDirectory = async () => {
+    const ownerWindow =
+      mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const res = ownerWindow
+      ? await dialog.showOpenDialog(ownerWindow, {
+          title: 'Выберите папку для сохранения и обмена медиа',
+          defaultPath: uploadsDir,
+          properties: ['openDirectory', 'createDirectory'],
+        })
+      : await dialog.showOpenDialog({
+          title: 'Выберите папку для сохранения и обмена медиа',
+          defaultPath: uploadsDir,
+          properties: ['openDirectory', 'createDirectory'],
+        });
+    if (res.canceled || !res.filePaths || res.filePaths.length === 0) {
+      return null;
+    }
+    return res.filePaths[0];
+  };
+
   if (!fs.existsSync(serverBundlePath)) {
     throw new Error(
       `Собранный сервер не найден: ${serverBundlePath}. Выполните npm run build:server.`

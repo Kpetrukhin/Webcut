@@ -30,6 +30,7 @@ export class StudioAudioEngine {
   private synthFxMap = new Map<string, VoiceEffectGraph>();
   private synthClipSnapshot = new Map<string, Clip>();
   private exportDestination: MediaStreamAudioDestinationNode | null = null;
+  private connectedOutputs = new Set<AudioNode>();
   private mutePlayback = false;
 
   public setPlaybackMuted(muted: boolean) {
@@ -50,19 +51,48 @@ export class StudioAudioEngine {
     return this.ctx;
   }
 
-  public getExportAudioStream(clips: Clip[]): MediaStream | null {
+  public async resume(): Promise<void> {
+    const ctx = this.ensureContext();
+    if (ctx.state === 'suspended') {
+      await ctx.resume().catch(() => {});
+    }
+  }
+
+  public getExportAudioStream(clips: Clip[], tracks?: Track[]): MediaStream | null {
+    const mutedTrackIds = new Set(
+      (tracks ?? []).filter((t) => t.muted).map((t) => t.id)
+    );
     const hasAudio = clips.some(
-      (c) => (c.track === 'audio' || c.kind === 'video') && c.volume > 0
+      (c) =>
+        !mutedTrackIds.has(c.trackId) &&
+        (c.track === 'audio' || c.kind === 'video') &&
+        (c.volume ?? 1) > 0.01
     );
     if (!hasAudio) return null;
     const ctx = this.ensureContext();
     if (!this.exportDestination) {
       this.exportDestination = ctx.createMediaStreamDestination();
     }
+    for (const node of this.connectedOutputs) {
+      try {
+        node.connect(this.exportDestination);
+      } catch {
+        // ignore if already connected or disposed
+      }
+    }
     return this.exportDestination.stream;
   }
 
   public clearExportDestination() {
+    if (this.exportDestination) {
+      for (const node of this.connectedOutputs) {
+        try {
+          node.disconnect(this.exportDestination);
+        } catch {
+          // ignore
+        }
+      }
+    }
     this.exportDestination = null;
   }
 
@@ -80,9 +110,14 @@ export class StudioAudioEngine {
 
   private connectToOutput(node: AudioNode) {
     const ctx = this.ensureContext();
+    this.connectedOutputs.add(node);
     node.connect(ctx.destination);
     if (this.exportDestination) {
-      node.connect(this.exportDestination);
+      try {
+        node.connect(this.exportDestination);
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -135,6 +170,7 @@ export class StudioAudioEngine {
       } catch {
         // ignore
       }
+      this.connectedOutputs.delete(chain.effectGraph.output);
       chain.effectGraph.dispose();
       const nextFx = createVoiceEffectNodes(ctx, effect);
       chain.pitcher.output.connect(nextFx.input);

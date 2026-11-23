@@ -12,6 +12,22 @@ import {
   resolveMediaCandidateUrls,
 } from './serverConfig.ts';
 import {sha256Hex} from './sha256.ts';
+import {
+  readMediaFromLocalFolder,
+  saveMediaToLocalFolder,
+} from './mediaStorage.ts';
+import type {ServerStorageConfig} from './mediaStorage.ts';
+
+export interface NativeStorageConfig {
+  currentDir: string;
+  defaultDir: string;
+  isDefault: boolean;
+  mode: 'internal' | 'external' | 'saf' | 'custom';
+  displayName: string;
+  filesCount: number;
+  totalBytes: number;
+  presets?: Array<{label: string; path: string; isDefault?: boolean}>;
+}
 
 export interface NetworkInfoSnapshot {
   interfaces: NetworkInterfaceInfo[];
@@ -84,6 +100,17 @@ interface LanSyncPluginInterface {
     fileSize?: number;
     fileHash?: string;
   }>;
+  getStorageConfig?: () => Promise<NativeStorageConfig>;
+  setStorageFolder?: (options: {
+    dirPath: string;
+    migrateExisting?: boolean;
+  }) => Promise<NativeStorageConfig & {migratedCount?: number}>;
+  pickStorageFolder?: (options?: {
+    migrateExisting?: boolean;
+  }) => Promise<NativeStorageConfig & {canceled?: boolean; migratedCount?: number}>;
+  resetStorageFolder?: (options?: {
+    migrateExisting?: boolean;
+  }) => Promise<NativeStorageConfig & {migratedCount?: number}>;
   addListener(
     eventName: 'udpRoomsUpdate',
     listenerFunc: (data: {rooms: DiscoveredUdpRoom[]}) => void
@@ -345,17 +372,70 @@ export interface PreparedP2PMedia {
   fileHash?: string;
 }
 
+const MAX_CLIENT_HASH_BYTES = 250 * 1024 * 1024;
+
+function uploadFormWithProgress(
+  url: string,
+  form: FormData,
+  onProgress?: (pct: number) => void
+): Promise<{
+  ok: boolean;
+  data: {
+    name?: string;
+    kind?: 'video' | 'image' | 'audio' | 'font';
+    fileName?: string;
+    src?: string;
+    sizeBytes?: number;
+    fileHash?: string;
+  };
+}> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url, true);
+    xhr.upload.onprogress = (ev) => {
+      if (ev.lengthComputable && ev.total > 0) {
+        onProgress?.(Math.min(99, Math.round((ev.loaded / ev.total) * 99)));
+      }
+    };
+    xhr.onload = () => {
+      try {
+        const parsed = JSON.parse(xhr.responseText || '{}') as {
+          name?: string;
+          kind?: 'video' | 'image' | 'audio' | 'font';
+          fileName?: string;
+          src?: string;
+          sizeBytes?: number;
+          fileHash?: string;
+        };
+        onProgress?.(100);
+        resolve({
+          ok: xhr.status >= 200 && xhr.status < 300,
+          data: parsed,
+        });
+      } catch {
+        reject(new Error('Некорректный ответ сервера при загрузке'));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Сетевая ошибка при загрузке файла'));
+    xhr.onabort = () => reject(new Error('Загрузка прервана'));
+    xhr.send(form);
+  });
+}
+
 export async function uploadFileForP2P(
   file: File,
-  fallbackKind: 'video' | 'image' | 'audio' | 'font'
+  fallbackKind: 'video' | 'image' | 'audio' | 'font',
+  onProgress?: (pct: number) => void
 ): Promise<PreparedP2PMedia> {
   const safeBase = file.name.replace(/[^a-zA-Z0-9._-]/g, '_') || 'media.bin';
   const stampedName = `${Date.now()}-${safeBase}`;
   let localHash: string | undefined;
-  try {
-    localHash = await sha256Hex(await file.arrayBuffer());
-  } catch {
-    localHash = undefined;
+  if (file.size <= MAX_CLIENT_HASH_BYTES) {
+    try {
+      localHash = await sha256Hex(await file.arrayBuffer());
+    } catch {
+      localHash = undefined;
+    }
   }
   const localSize = file.size;
 
@@ -383,6 +463,7 @@ export async function uploadFileForP2P(
           srv.primaryIp || '127.0.0.1'
         );
         const shareUrl = `http://${shareIp}:${srv.port}/media/${encodeURIComponent(data.fileName)}`;
+        onProgress?.(100);
         return {
           name: file.name,
           fileName: data.fileName,
@@ -398,23 +479,30 @@ export async function uploadFileForP2P(
     }
   }
 
-  // 2. Web / Node Express HTTP /api/upload or /media/upload
+  // 2. Web / Node Express HTTP /api/upload
   const uploadEndpoint = getApiUrl('/api/upload');
   if (uploadEndpoint) {
     try {
       const form = new FormData();
       form.append('file', file);
-      const res = await fetch(uploadEndpoint, {method: 'POST', body: form});
-      const data = (await res.json()) as {
-        name?: string;
-        kind?: 'video' | 'image' | 'audio' | 'font';
-        fileName?: string;
-        src?: string;
-        sizeBytes?: number;
-        fileHash?: string;
-      };
-      if (res.ok && data.src) {
+      const {ok, data} =
+        typeof XMLHttpRequest !== 'undefined'
+          ? await uploadFormWithProgress(uploadEndpoint, form, onProgress)
+          : await (async () => {
+              const r = await fetch(uploadEndpoint, {method: 'POST', body: form});
+              const j = (await r.json()) as {
+                name?: string;
+                kind?: 'video' | 'image' | 'audio' | 'font';
+                fileName?: string;
+                src?: string;
+                sizeBytes?: number;
+                fileHash?: string;
+              };
+              return {ok: r.ok, data: j};
+            })();
+      if (ok && data.src) {
         const fileName = data.fileName || data.src.split('/').pop() || stampedName;
+        void saveMediaToLocalFolder(fileName, file).catch(() => {});
         const origin =
           isNativeCapacitorApp() && getSavedServerUrl()
             ? getSavedServerUrl()
@@ -437,7 +525,9 @@ export async function uploadFileForP2P(
     }
   }
 
+  void saveMediaToLocalFolder(stampedName, file).catch(() => {});
   const blobUrl = URL.createObjectURL(file);
+  onProgress?.(100);
   return {
     name: file.name,
     fileName: stampedName,
@@ -624,7 +714,31 @@ export async function downloadMediaInBackground(opts: {
     });
   }
 
-  // Browser / PWA / Node path: stream fetch with size + SHA-256 verification and up to 3 attempts
+  // Browser / PWA / Node path: check local storage folder first, else stream fetch + save
+  try {
+    const cachedFile = await readMediaFromLocalFolder(fileName, expectedSize);
+    if (cachedFile) {
+      let hashOk = true;
+      if (expectedHash && cachedFile.size <= MAX_CLIENT_HASH_BYTES) {
+        try {
+          const buf = await cachedFile.arrayBuffer();
+          const actualHash = await sha256Hex(buf);
+          if (actualHash !== expectedHash.toLowerCase()) {
+            hashOk = false;
+          }
+        } catch {
+          hashOk = false;
+        }
+      }
+      if (hashOk) {
+        onProgress?.(100);
+        return URL.createObjectURL(cachedFile);
+      }
+    }
+  } catch {
+    // ignore local read error and fetch over network
+  }
+
   let lastError: Error = new Error('Не удалось скачать медиафайл');
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     onAttempt?.(attempt, maxAttempts);
@@ -636,6 +750,7 @@ export async function downloadMediaInBackground(opts: {
         expectedHash,
         onProgress,
       });
+      await saveMediaToLocalFolder(fileName, blob).catch(() => {});
       return URL.createObjectURL(blob);
     } catch (err) {
       lastError =
@@ -646,6 +761,97 @@ export async function downloadMediaInBackground(opts: {
     }
   }
   throw lastError;
+}
+
+export async function fetchServerStorageConfig(): Promise<ServerStorageConfig | null> {
+  const endpoint = getApiUrl('/api/storage/config');
+  if (!endpoint) return null;
+  try {
+    const res = await fetch(endpoint);
+    if (!res.ok) return null;
+    return (await res.json()) as ServerStorageConfig;
+  } catch {
+    return null;
+  }
+}
+
+export async function updateServerStorageConfig(opts: {
+  dirPath?: string;
+  reset?: boolean;
+  migrateExisting?: boolean;
+}): Promise<ServerStorageConfig & {migratedCount?: number}> {
+  const endpoint = getApiUrl('/api/storage/config');
+  if (!endpoint) {
+    throw new Error('Сервер хранения не подключён');
+  }
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(opts),
+  });
+  const data = (await res.json()) as ServerStorageConfig & {
+    migratedCount?: number;
+    error?: string;
+  };
+  if (!res.ok) {
+    throw new Error(data.error || 'Не удалось изменить папку сервера');
+  }
+  return data;
+}
+
+export async function pickServerStorageFolder(): Promise<{
+  supported: boolean;
+  canceled: boolean;
+  dirPath: string | null;
+}> {
+  const endpoint = getApiUrl('/api/storage/pick-folder');
+  if (!endpoint) return {supported: false, canceled: true, dirPath: null};
+  const res = await fetch(endpoint, {method: 'POST'});
+  if (!res.ok) return {supported: false, canceled: true, dirPath: null};
+  return (await res.json()) as {
+    supported: boolean;
+    canceled: boolean;
+    dirPath: string | null;
+  };
+}
+
+export async function getNativeStorageConfig(): Promise<NativeStorageConfig | null> {
+  if (!hasNativeLanPlugin() || typeof LanSync.getStorageConfig !== 'function') {
+    return null;
+  }
+  try {
+    return await LanSync.getStorageConfig();
+  } catch {
+    return null;
+  }
+}
+
+export async function setNativeStorageFolder(
+  dirPath: string,
+  migrateExisting = true
+): Promise<(NativeStorageConfig & {migratedCount?: number}) | null> {
+  if (!hasNativeLanPlugin() || typeof LanSync.setStorageFolder !== 'function') {
+    return null;
+  }
+  return await LanSync.setStorageFolder({dirPath, migrateExisting});
+}
+
+export async function pickNativeStorageFolder(
+  migrateExisting = true
+): Promise<(NativeStorageConfig & {canceled?: boolean; migratedCount?: number}) | null> {
+  if (!hasNativeLanPlugin() || typeof LanSync.pickStorageFolder !== 'function') {
+    return null;
+  }
+  return await LanSync.pickStorageFolder({migrateExisting});
+}
+
+export async function resetNativeStorageFolder(
+  migrateExisting = true
+): Promise<(NativeStorageConfig & {migratedCount?: number}) | null> {
+  if (!hasNativeLanPlugin() || typeof LanSync.resetStorageFolder !== 'function') {
+    return null;
+  }
+  return await LanSync.resetStorageFolder({migrateExisting});
 }
 
 export interface CompressedMediaResult {

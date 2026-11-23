@@ -98,6 +98,7 @@ interface PreviewCanvasProps {
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onSelectClip: (clipId: string | null) => void;
   onDoubleClickTextClip?: (clipId: string) => void;
+  disableSizeTransition?: boolean;
   onTransformClip: (
     clipId: string,
     patch: CanvasTransformPatch,
@@ -141,6 +142,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   collaborators,
   mediaPool,
   audioEngine,
+  disableSizeTransition = false,
   snapEnabled = true,
   onToggleSnap,
   showSelectionOutline = true,
@@ -530,8 +532,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           }
         } else {
           const tr = evaluateClipTransform(c, currentTime);
-          const halfW = Math.max(0.12, (tr.scale * (c.scaleX ?? 1)) / 2);
-          const halfH = Math.max(0.12, (tr.scale * (c.scaleY ?? 1)) / 2);
+          const halfW = Math.max(0.12, (tr.scale * tr.scaleX) / 2);
+          const halfH = Math.max(0.12, (tr.scale * tr.scaleY) / 2);
           if (Math.abs(nx - tr.x) <= halfW && Math.abs(ny - tr.y) <= halfH) {
             return c;
           }
@@ -1575,7 +1577,11 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         className="flex h-full w-full min-h-0 min-w-0 items-center justify-center"
       >
         <div
-          className="relative rounded-xl border border-white/10 shadow-2xl transition-[width,height] duration-300 ease-out"
+          className={`relative rounded-xl border border-white/10 shadow-2xl ${
+            disableSizeTransition
+              ? ''
+              : 'transition-[width,height] duration-300 ease-out'
+          }`}
           style={{
             ...containerBgStyle,
             width: fittedSize ? `${fittedSize.w}px` : undefined,

@@ -134,20 +134,36 @@ export function interpolateWarp(
   const mode: WarpMode =
     b.mode !== 'none' ? b.mode : a.mode !== 'none' ? a.mode : 'none';
   if (mode === 'none') return createDefaultWarp('none', b.meshSize);
+  if (clampedT <= 0.0001 && a.mode === 'none') {
+    return createDefaultWarp('none', a.meshSize);
+  }
+  if (clampedT >= 0.9999 && b.mode === 'none') {
+    return createDefaultWarp('none', b.meshSize);
+  }
+
+  const targetSize = b.meshSize;
+  const aCorners =
+    a.mode === 'none' ? createIdentityCorners() : a.corners;
+  const bCorners =
+    b.mode === 'none' ? createIdentityCorners() : b.corners;
 
   const corners: [WarpPoint, WarpPoint, WarpPoint, WarpPoint] = [0, 1, 2, 3].map(
     (i) => ({
-      x: a.corners[i].x + (b.corners[i].x - a.corners[i].x) * clampedT,
-      y: a.corners[i].y + (b.corners[i].y - a.corners[i].y) * clampedT,
+      x: aCorners[i].x + (bCorners[i].x - aCorners[i].x) * clampedT,
+      y: aCorners[i].y + (bCorners[i].y - aCorners[i].y) * clampedT,
     })
   ) as [WarpPoint, WarpPoint, WarpPoint, WarpPoint];
 
-  const targetSize = b.meshSize;
   const aMesh =
-    a.meshSize === targetSize
-      ? a.meshPoints
-      : resampleMeshGrid(a.meshPoints, a.meshSize, targetSize);
-  const bMesh = b.meshPoints;
+    a.mode === 'none'
+      ? createIdentityMeshPoints(targetSize)
+      : a.meshSize === targetSize
+        ? a.meshPoints
+        : resampleMeshGrid(a.meshPoints, a.meshSize, targetSize);
+  const bMesh =
+    b.mode === 'none'
+      ? createIdentityMeshPoints(targetSize)
+      : b.meshPoints;
 
   const meshPoints = bMesh.map((bp, i) => {
     const ap = aMesh[i] ?? bp;

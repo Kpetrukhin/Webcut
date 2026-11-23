@@ -1,14 +1,17 @@
 package com.cutsync.webcut
 
 import android.content.Context
+import android.content.Intent
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
 import android.net.wifi.WifiManager
+import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.provider.DocumentsContract
 import android.webkit.MimeTypeMap
 import androidx.annotation.OptIn
 import androidx.media3.common.MediaItem
@@ -99,9 +102,186 @@ data class LayerLockEntry(
 
 class KtorLanEngine(private val context: Context) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val mediaDir = File(context.cacheDir, "cutsync_media").apply { mkdirs() }
+    private val storagePrefs = context.getSharedPreferences("cutsync_storage", Context.MODE_PRIVATE)
+    private val defaultMediaDir = File(context.filesDir, "cutsync_media").apply { mkdirs() }
+    private val legacyCacheDir = File(context.cacheDir, "cutsync_media").apply { mkdirs() }
+
+    @Volatile
+    private var mediaDir: File = loadConfiguredMediaDir()
+
+    @Volatile
+    private var safTreeUriString: String? = storagePrefs.getString("saf_tree_uri", null)
+
+    @Volatile
+    private var safDisplayName: String? = storagePrefs.getString("saf_display_name", null)
+
     private val registeredFiles = ConcurrentHashMap<String, File>()
     private val fileHashCache = ConcurrentHashMap<String, String>()
+
+    private fun loadConfiguredMediaDir(): File {
+        val custom = storagePrefs.getString("custom_media_dir", null)?.trim()
+        if (!custom.isNullOrEmpty()) {
+            val dir = File(custom)
+            if ((dir.exists() || dir.mkdirs()) && dir.isDirectory && dir.canWrite()) {
+                return dir
+            }
+        }
+        defaultMediaDir.mkdirs()
+        return defaultMediaDir
+    }
+
+    private fun copyMediaBetweenDirs(fromDir: File, toDir: File): Int {
+        if (fromDir.absolutePath == toDir.absolutePath) return 0
+        if (!fromDir.exists() || !fromDir.isDirectory) return 0
+        toDir.mkdirs()
+        var count = 0
+        fromDir.listFiles()?.forEach { f ->
+            if (f.isFile && !f.name.endsWith(".part")) {
+                val dest = File(toDir, f.name)
+                if (!dest.exists()) {
+                    try {
+                        f.copyTo(dest, overwrite = false)
+                        registeredFiles[f.name] = dest
+                        count++
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
+        }
+        return count
+    }
+
+    private fun mirrorFileToSafIfConfigured(file: File) {
+        val uriStr = safTreeUriString ?: return
+        if (!file.exists() || !file.isFile) return
+        try {
+            val treeUri = Uri.parse(uriStr)
+            val parentDocUri = DocumentsContract.buildDocumentUriUsingTree(
+                treeUri,
+                DocumentsContract.getTreeDocumentId(treeUri)
+            )
+            val mime = contentTypeForFile(file).toString()
+            val createdUri = DocumentsContract.createDocument(
+                context.contentResolver,
+                parentDocUri,
+                mime,
+                file.name
+            ) ?: return
+            context.contentResolver.openOutputStream(createdUri)?.use { out ->
+                FileInputStream(file).use { input ->
+                    input.copyTo(out)
+                }
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun getStorageConfigJson(): JSONObject {
+        val active = mediaDir
+        val files = active.listFiles()?.filter { it.isFile && !it.name.endsWith(".part") } ?: emptyList()
+        val totalBytes = files.sumOf { it.length() }
+        val isSaf = !safTreeUriString.isNullOrBlank()
+        val isDefault = !isSaf && active.absolutePath == defaultMediaDir.absolutePath
+        val presets = JSONArray().apply {
+            put(JSONObject().apply {
+                put("label", "По стандарту (корень приложения)")
+                put("path", defaultMediaDir.absolutePath)
+                put("isDefault", true)
+            })
+            context.getExternalFilesDir(Environment.DIRECTORY_MOVIES)?.let { extMovies ->
+                val target = File(extMovies, "CutSyncMedia")
+                put(JSONObject().apply {
+                    put("label", "Папка приложения (Android/data)")
+                    put("path", target.absolutePath)
+                })
+            }
+        }
+        return JSONObject().apply {
+            put("currentDir", if (isSaf) (safDisplayName ?: safTreeUriString) else active.absolutePath)
+            put("defaultDir", defaultMediaDir.absolutePath)
+            put("isDefault", isDefault)
+            put("mode", when {
+                isSaf -> "saf"
+                isDefault -> "internal"
+                else -> "custom"
+            })
+            put("displayName", when {
+                isSaf -> safDisplayName ?: "Выбранная папка Android"
+                isDefault -> "Корень приложения (внутри CutSync)"
+                else -> active.name
+            })
+            put("filesCount", files.size)
+            put("totalBytes", totalBytes)
+            put("presets", presets)
+        }
+    }
+
+    fun setStorageFolderPath(rawPath: String, migrateExisting: Boolean): Pair<JSONObject, Int> {
+        val target = File(rawPath.trim())
+        if (!target.exists() && !target.mkdirs()) {
+            throw IllegalArgumentException("Не удалось создать папку: $rawPath")
+        }
+        if (!target.isDirectory || !target.canWrite()) {
+            throw IllegalArgumentException("Нет прав на запись в папку: $rawPath")
+        }
+        val prevDir = mediaDir
+        mediaDir = target
+        safTreeUriString = null
+        safDisplayName = null
+        val isDefault = target.absolutePath == defaultMediaDir.absolutePath
+        storagePrefs.edit().apply {
+            if (isDefault) remove("custom_media_dir") else putString("custom_media_dir", target.absolutePath)
+            remove("saf_tree_uri")
+            remove("saf_display_name")
+            apply()
+        }
+        val migrated = if (migrateExisting) copyMediaBetweenDirs(prevDir, target) else 0
+        return getStorageConfigJson() to migrated
+    }
+
+    fun setSafStorageTree(treeUri: Uri, migrateExisting: Boolean): Pair<JSONObject, Int> {
+        val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        try {
+            context.contentResolver.takePersistableUriPermission(treeUri, flags)
+        } catch (_: Throwable) {
+        }
+        val docId = try {
+            DocumentsContract.getTreeDocumentId(treeUri)
+        } catch (_: Throwable) {
+            treeUri.lastPathSegment ?: "Выбранная папка"
+        }
+        val display = docId.substringAfter(':').ifEmpty { docId }
+        safTreeUriString = treeUri.toString()
+        safDisplayName = display
+        storagePrefs.edit()
+            .putString("saf_tree_uri", treeUri.toString())
+            .putString("saf_display_name", display)
+            .apply()
+        var migrated = 0
+        if (migrateExisting) {
+            mediaDir.listFiles()?.forEach { f ->
+                if (f.isFile && !f.name.endsWith(".part")) {
+                    mirrorFileToSafIfConfigured(f)
+                    migrated++
+                }
+            }
+        }
+        return getStorageConfigJson() to migrated
+    }
+
+    fun resetStorageFolder(migrateExisting: Boolean): Pair<JSONObject, Int> {
+        val prevDir = mediaDir
+        mediaDir = defaultMediaDir.apply { mkdirs() }
+        safTreeUriString = null
+        safDisplayName = null
+        storagePrefs.edit()
+            .remove("custom_media_dir")
+            .remove("saf_tree_uri")
+            .remove("saf_display_name")
+            .apply()
+        val migrated = if (migrateExisting) copyMediaBetweenDirs(prevDir, defaultMediaDir) else 0
+        return getStorageConfigJson() to migrated
+    }
 
     private var server: ApplicationEngine? = null
     private var serverPort: Int = 8080
@@ -244,7 +424,10 @@ class KtorLanEngine(private val context: Context) {
 
     fun getCachedFileMetadata(fileName: String): Pair<Long, String> {
         val safe = File(fileName).name
-        val target = registeredFiles[safe] ?: File(mediaDir, safe)
+        val target = registeredFiles[safe]
+            ?: File(mediaDir, safe).takeIf { it.exists() }
+            ?: File(defaultMediaDir, safe).takeIf { it.exists() }
+            ?: File(legacyCacheDir, safe)
         if (!target.exists()) return 0L to ""
         return target.length() to computeFileSha256(target)
     }
@@ -295,6 +478,8 @@ class KtorLanEngine(private val context: Context) {
             val safe = File(fileName).name
             registeredFiles[safe]?.takeIf { it.exists() }?.let { return it }
             File(mediaDir, safe).takeIf { it.exists() }?.let { return it }
+            File(defaultMediaDir, safe).takeIf { it.exists() }?.let { return it }
+            File(legacyCacheDir, safe).takeIf { it.exists() }?.let { return it }
         }
         if (!sourceUrl.isNullOrEmpty() && sourceUrl.contains("/media/")) {
             val rawPart = sourceUrl.substringAfterLast("/media/").substringBefore("?")
@@ -306,6 +491,8 @@ class KtorLanEngine(private val context: Context) {
             val safe = File(decoded).name
             registeredFiles[safe]?.takeIf { it.exists() }?.let { return it }
             File(mediaDir, safe).takeIf { it.exists() }?.let { return it }
+            File(defaultMediaDir, safe).takeIf { it.exists() }?.let { return it }
+            File(legacyCacheDir, safe).takeIf { it.exists() }?.let { return it }
         }
         return null
     }
@@ -394,7 +581,10 @@ class KtorLanEngine(private val context: Context) {
                     applyCors(call)
                     val rawName = call.parameters["fileName"] ?: ""
                     val safeName = File(rawName).name
-                    val file = registeredFiles[safeName] ?: File(mediaDir, safeName)
+                    val file = registeredFiles[safeName]?.takeIf { it.exists() }
+                        ?: File(mediaDir, safeName).takeIf { it.exists() }
+                        ?: File(defaultMediaDir, safeName).takeIf { it.exists() }
+                        ?: File(legacyCacheDir, safeName)
                     if (!file.exists() || !file.isFile) {
                         call.respond(HttpStatusCode.NotFound, "Media not found")
                         return@get
@@ -414,12 +604,14 @@ class KtorLanEngine(private val context: Context) {
                     val rawName = call.request.queryParameters["fileName"]
                         ?: "clip-${System.currentTimeMillis()}.bin"
                     val safeName = File(rawName).name.replace(Regex("[^a-zA-Z0-9._-]"), "_")
-                    val destFile = File(mediaDir, safeName)
+                    val activeDir = mediaDir.apply { mkdirs() }
+                    val destFile = File(activeDir, safeName)
                     val channel: ByteReadChannel = call.receiveChannel()
                     withContext(Dispatchers.IO) {
                         FileOutputStream(destFile).use { fos ->
                             channel.copyTo(fos)
                         }
+                        mirrorFileToSafIfConfigured(destFile)
                     }
                     registeredFiles[safeName] = destFile
                     val sha = computeFileSha256(destFile)
@@ -1290,10 +1482,16 @@ class KtorLanEngine(private val context: Context) {
                         throw IllegalStateException("Контрольная сумма сервера SHA-256 не совпала")
                     }
 
-                    if (targetFile.exists()) targetFile.delete()
-                    tempFile.renameTo(targetFile)
-                    registeredFiles[safeName] = targetFile
-                    fileHashCache["${targetFile.name}:${targetFile.length()}:${targetFile.lastModified()}"] = actualHash
+                    val activeDir = mediaDir.apply { mkdirs() }
+                    val destTargetFile = File(activeDir, safeName)
+                    if (destTargetFile.exists()) destTargetFile.delete()
+                    if (!tempFile.renameTo(destTargetFile)) {
+                        tempFile.copyTo(destTargetFile, overwrite = true)
+                        tempFile.delete()
+                    }
+                    mirrorFileToSafIfConfigured(destTargetFile)
+                    registeredFiles[safeName] = destTargetFile
+                    fileHashCache["${destTargetFile.name}:${destTargetFile.length()}:${destTargetFile.lastModified()}"] = actualHash
                     ensureMediaServerStarted()
 
                     val localUrl = "http://127.0.0.1:$serverPort/media/$safeName"

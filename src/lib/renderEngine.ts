@@ -4,7 +4,6 @@ import type {
   Clip,
   Collaborator,
   FilterPreset,
-  ProjectFont,
   Track,
 } from '../shared/types.ts';
 import type {StudioAudioEngine} from './audioEngine.ts';
@@ -14,7 +13,6 @@ import {
   getClipEffectiveAdjustments,
   isNeutralColorGrade,
 } from './colorPresets.ts';
-import {loadCustomFont, preloadProjectFonts} from './fontLoader.ts';
 import {evaluateClipTransform} from './keyframeEngine.ts';
 import {applyMaskToCanvas, drawMaskInteractiveGuide} from './maskEngine.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
@@ -703,8 +701,8 @@ function drawCoverMedia(
     }
   }
 
-  const sxFactor = clip.scaleX ?? 1;
-  const syFactor = clip.scaleY ?? 1;
+  const sxFactor = kf.scaleX;
+  const syFactor = kf.scaleY;
   const drawW = effW * baseScale * zoom * sxFactor;
   const drawH = effH * baseScale * zoom * syFactor;
   const centerX = cw * kf.x + offsetX;
@@ -765,8 +763,8 @@ function drawCoverMedia(
       const warped = renderWarpedLayer({
         source: sourceToDraw,
         cropRect: {x: crop.x, y: crop.y, w: crop.width, h: crop.height},
-        flipH: Boolean(clip.flipHorizontal),
-        flipV: Boolean(clip.flipVertical),
+        flipH: kf.flipHorizontal,
+        flipV: kf.flipVertical,
         centerX,
         centerY,
         layerW: drawW,
@@ -797,8 +795,8 @@ function drawCoverMedia(
     if (!maskOnly && clip.blur && clip.blur > 0) {
       targetCtx.filter = `blur(${clip.blur}px)`;
     }
-    if (clip.flipHorizontal || clip.flipVertical) {
-      targetCtx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+    if (kf.flipHorizontal || kf.flipVertical) {
+      targetCtx.scale(kf.flipHorizontal ? -1 : 1, kf.flipVertical ? -1 : 1);
     }
     targetCtx.drawImage(
       sourceToDraw,
@@ -1044,8 +1042,8 @@ function drawShapeClip(
   const style = normalizeShapeStyle(clip.shapeStyle);
   const meta = getShapeCatalogItem(style.shapeType);
   const kf = evaluateClipTransform(clip, time);
-  const sxFactor = clip.scaleX ?? 1;
-  const syFactor = clip.scaleY ?? 1;
+  const sxFactor = kf.scaleX;
+  const syFactor = kf.scaleY;
   const layerW = Math.max(12, cw * kf.scale * sxFactor);
   const layerH = Math.max(12, (cw * kf.scale / meta.aspect) * syFactor);
   const cx = cw * kf.x;
@@ -1092,10 +1090,10 @@ function drawShapeClip(
       if (off) {
         off.ctx.save();
         off.ctx.translate(texW / 2, texH / 2);
-        if (clip.flipHorizontal || clip.flipVertical) {
+        if (kf.flipHorizontal || kf.flipVertical) {
           off.ctx.scale(
-            clip.flipHorizontal ? -1 : 1,
-            clip.flipVertical ? -1 : 1
+            kf.flipHorizontal ? -1 : 1,
+            kf.flipVertical ? -1 : 1
           );
         }
         drawShapeGeometry(off.ctx, texW, texH, style, sf, maskOnly);
@@ -1160,8 +1158,8 @@ function drawShapeClip(
     if (!maskOnly && clip.blur && clip.blur > 0) {
       targetCtx.filter = `blur(${clip.blur}px)`;
     }
-    if (clip.flipHorizontal || clip.flipVertical) {
-      targetCtx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+    if (kf.flipHorizontal || kf.flipVertical) {
+      targetCtx.scale(kf.flipHorizontal ? -1 : 1, kf.flipVertical ? -1 : 1);
     }
     drawShapeGeometry(targetCtx, drawW, drawH, style, sf, maskOnly);
     targetCtx.restore();
@@ -1271,8 +1269,8 @@ function drawOverlayClip(
   const kf = evaluateClipTransform(clip, time);
   const scale = kf.scale;
   const aspect = effW && effH ? effW / effH : clip.isSticker ? 1 : 9 / 16;
-  const sxFactor = clip.scaleX ?? 1;
-  const syFactor = clip.scaleY ?? 1;
+  const sxFactor = kf.scaleX;
+  const syFactor = kf.scaleY;
   const pipW = cw * scale * sxFactor;
   const pipH = (cw * scale / aspect) * syFactor;
   const cx = cw * kf.x;
@@ -1349,8 +1347,8 @@ function drawOverlayClip(
       let warpSource: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement =
         sourceToDraw;
       let warpCrop = {x: crop.x, y: crop.y, w: crop.width, h: crop.height};
-      let bakeFlipH = Boolean(clip.flipHorizontal);
-      let bakeFlipV = Boolean(clip.flipVertical);
+      let bakeFlipH = kf.flipHorizontal;
+      let bakeFlipV = kf.flipVertical;
 
       if (radius > 0.5 || (!maskOnly && clip.borderWidth && clip.borderWidth > 0)) {
         const texW = Math.max(8, Math.min(2048, Math.ceil(drawW)));
@@ -1484,8 +1482,8 @@ function drawOverlayClip(
       const sh = crop.height * srcDims.h;
 
       targetCtx.save();
-      if (clip.flipHorizontal || clip.flipVertical) {
-        targetCtx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+      if (kf.flipHorizontal || kf.flipVertical) {
+        targetCtx.scale(kf.flipHorizontal ? -1 : 1, kf.flipVertical ? -1 : 1);
       }
       if (!maskOnly && clip.blur && clip.blur > 0) {
         targetCtx.filter = `blur(${clip.blur}px)`;
@@ -1737,8 +1735,8 @@ export function getClipLayerBox(
     return null;
   }
   const kf = evaluateClipTransform(clip, time);
-  const sxFactor = clip.scaleX ?? 1;
-  const syFactor = clip.scaleY ?? 1;
+  const sxFactor = kf.scaleX;
+  const syFactor = kf.scaleY;
 
   if (clip.track === 'text') {
     return getTextClipUnwarpedBox(clip, cw, ch, time);
@@ -1845,8 +1843,8 @@ export function sampleClipColorAtNormalizedPoint(
   const sh = crop.height * mh;
 
   const kf = evaluateClipTransform(clip, time);
-  const sxFactor = clip.scaleX ?? 1;
-  const syFactor = clip.scaleY ?? 1;
+  const sxFactor = kf.scaleX;
+  const syFactor = kf.scaleY;
   if (clip.track === 'overlay') {
     const aspect = effW / effH;
     const pipW = cw * kf.scale * sxFactor;
@@ -1855,8 +1853,8 @@ export function sampleClipColorAtNormalizedPoint(
     const cy = ch * kf.y;
     sctx.translate(cx, cy);
     if (kf.rotation) sctx.rotate((kf.rotation * Math.PI) / 180);
-    if (clip.flipHorizontal || clip.flipVertical) {
-      sctx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+    if (kf.flipHorizontal || kf.flipVertical) {
+      sctx.scale(kf.flipHorizontal ? -1 : 1, kf.flipVertical ? -1 : 1);
     }
     sctx.drawImage(media, sx, sy, sw, sh, -pipW / 2, -pipH / 2, pipW, pipH);
   } else {
@@ -1869,8 +1867,8 @@ export function sampleClipColorAtNormalizedPoint(
     const cy = ch * kf.y;
     sctx.translate(cx, cy);
     if (kf.rotation) sctx.rotate((kf.rotation * Math.PI) / 180);
-    if (clip.flipHorizontal || clip.flipVertical) {
-      sctx.scale(clip.flipHorizontal ? -1 : 1, clip.flipVertical ? -1 : 1);
+    if (kf.flipHorizontal || kf.flipVertical) {
+      sctx.scale(kf.flipHorizontal ? -1 : 1, kf.flipVertical ? -1 : 1);
     }
     sctx.drawImage(media, sx, sy, sw, sh, -drawW / 2, -drawH / 2, drawW, drawH);
   }
@@ -2216,124 +2214,4 @@ export function renderCompositeFrame(
     }
     ctx.restore();
   }
-}
-
-export async function exportProjectToVideo(opts: {
-  clips: Clip[];
-  tracks: Track[];
-  aspectRatio: AspectRatio;
-  backgroundColor?: string;
-  canvasBackground?: CanvasBackground;
-  customFonts?: ProjectFont[];
-  duration: number;
-  pool: MediaPool;
-  audioEngine: StudioAudioEngine;
-  onProgress: (pct: number) => void;
-}): Promise<{blob: Blob; ext: string}> {
-  await preloadProjectFonts(opts.customFonts);
-  for (const c of opts.clips) {
-    if (c.textStyle?.fontFamily && c.textStyle?.fontSrc) {
-      await loadCustomFont(c.textStyle.fontFamily, c.textStyle.fontSrc);
-    }
-  }
-
-  const {width, height} = getCanvasDimensions(opts.aspectRatio);
-  const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) throw new Error('Не удалось создать Canvas 2D контекст');
-
-  const fps = 30;
-  const stream = canvas.captureStream(fps);
-  const audioStream = opts.audioEngine.getExportAudioStream(opts.clips);
-  if (audioStream) {
-    for (const track of audioStream.getAudioTracks()) {
-      stream.addTrack(track);
-    }
-  }
-
-  const mimeCandidates = [
-    'video/webm;codecs=vp9,opus',
-    'video/webm;codecs=vp8,opus',
-    'video/webm',
-    'video/mp4',
-  ];
-  const mimeType =
-    mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
-
-  const recorder = new MediaRecorder(
-    stream,
-    mimeType
-      ? {mimeType, videoBitsPerSecond: 4_500_000}
-      : {videoBitsPerSecond: 4_500_000}
-  );
-  const chunks: BlobPart[] = [];
-  recorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) chunks.push(e.data);
-  };
-
-  const donePromise = new Promise<Blob>((resolve) => {
-    recorder.onstop = () => {
-      resolve(new Blob(chunks, {type: mimeType || 'video/webm'}));
-    };
-  });
-
-  recorder.start(200);
-  const totalDuration = Math.max(1, opts.duration);
-  const startWall = performance.now();
-
-  await new Promise<void>((resolve) => {
-    const tick = () => {
-      const elapsedSec = (performance.now() - startWall) / 1000;
-      const t = Math.min(totalDuration, elapsedSec);
-      opts.pool.syncVideos(
-        opts.clips,
-        t,
-        true,
-        opts.tracks,
-        opts.audioEngine
-      );
-      opts.audioEngine.sync(opts.clips, t, true, opts.tracks);
-      renderCompositeFrame(
-        ctx,
-        width,
-        height,
-        opts.clips,
-        t,
-        opts.pool,
-        null,
-        [],
-        opts.tracks,
-        opts.backgroundColor,
-        undefined,
-        undefined,
-        undefined,
-        opts.canvasBackground
-      );
-      opts.onProgress(Math.min(99, Math.round((t / totalDuration) * 100)));
-
-      if (t >= totalDuration) {
-        opts.audioEngine.stopAll();
-        opts.audioEngine.clearExportDestination();
-        opts.pool.syncVideos(
-          opts.clips,
-          0,
-          false,
-          opts.tracks,
-          opts.audioEngine
-        );
-        resolve();
-        return;
-      }
-      requestAnimationFrame(tick);
-    };
-    requestAnimationFrame(tick);
-  });
-
-  recorder.stop();
-  const blob = await donePromise;
-  opts.onProgress(100);
-  const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
-  return {blob, ext};
 }

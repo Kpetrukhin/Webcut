@@ -20,7 +20,7 @@ import {getTextAnimationSpec} from '../lib/textRenderer.ts';
 import {ScrubNumberField} from './ScrubNumberField.tsx';
 
 const BASE_PX_PER_SEC = 64;
-const MIN_ZOOM_PCT = 30;
+const MIN_ZOOM_PCT = 5;
 const MAX_ZOOM_PCT = 300;
 const MIN_PX_PER_SEC = (BASE_PX_PER_SEC * MIN_ZOOM_PCT) / 100;
 const MAX_PX_PER_SEC = (BASE_PX_PER_SEC * MAX_ZOOM_PCT) / 100;
@@ -524,12 +524,29 @@ export const Timeline: React.FC<TimelineProps> = ({
     }
   };
 
-  const secStep = pxPerSec >= 90 ? 1 : pxPerSec >= 55 ? 2 : 5;
+  const secStep =
+    pxPerSec >= 90
+      ? 1
+      : pxPerSec >= 55
+        ? 2
+        : pxPerSec >= 24
+          ? 5
+          : pxPerSec >= 12
+            ? 15
+            : pxPerSec >= 6
+              ? 30
+              : 60;
   const totalSecTicks = Math.ceil(totalWidth / pxPerSec);
   const ticks: number[] = [];
   for (let s = 0; s <= totalSecTicks; s += secStep) {
     ticks.push(s);
   }
+  const formatTickLabel = (sec: number) => {
+    if (sec < 60) return `${sec}s`;
+    const m = Math.floor(sec / 60);
+    const sRem = sec % 60;
+    return `${m}:${String(sRem).padStart(2, '0')}`;
+  };
 
   return (
     <div className="flex h-full flex-col border-t border-white/10 bg-[#111114] select-none">
@@ -622,7 +639,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                   className="pointer-events-none absolute top-0 flex h-full flex-col justify-between"
                 >
                   <span className="pl-1 pt-0.5 font-mono text-[10px] leading-none text-zinc-500 tabular-nums">
-                    {sec}s
+                    {formatTickLabel(sec)}
                   </span>
                   <span className="h-1.5 w-px bg-white/20" />
                 </div>

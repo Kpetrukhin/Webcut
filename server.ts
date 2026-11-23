@@ -28,6 +28,7 @@ import type {
   RoomSummary,
   ServerWsMessage,
 } from './src/shared/types.ts';
+import {validateServerStorageDir} from './src/lib/storagePathRules.ts';
 
 let ACTIVE_PORT = Number(process.env.PORT) || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -35,16 +36,142 @@ const DEFAULT_LOCK_TIMEOUT_MS = Number(process.env.LOCK_TIMEOUT_MS) || 5000;
 let lockTimeoutMs = DEFAULT_LOCK_TIMEOUT_MS;
 
 const ROOT_DIR = process.cwd();
-const UPLOADS_DIR = process.env.CUTSYNC_UPLOADS_DIR
+const DEFAULT_UPLOADS_DIR = process.env.CUTSYNC_UPLOADS_DIR
   ? path.resolve(process.env.CUTSYNC_UPLOADS_DIR)
   : path.join(ROOT_DIR, 'uploads');
 const DATA_DIR = process.env.CUTSYNC_DATA_DIR
   ? path.resolve(process.env.CUTSYNC_DATA_DIR)
   : path.join(ROOT_DIR, 'data');
 const ROOMS_FILE = path.join(DATA_DIR, 'rooms.json');
+const STORAGE_CONFIG_FILE = path.join(DATA_DIR, 'storage-config.json');
 
-fs.mkdirSync(UPLOADS_DIR, {recursive: true});
+fs.mkdirSync(DEFAULT_UPLOADS_DIR, {recursive: true});
 fs.mkdirSync(DATA_DIR, {recursive: true});
+
+let activeUploadsDir = DEFAULT_UPLOADS_DIR;
+
+function loadStorageConfigFromDisk() {
+  try {
+    if (!fs.existsSync(STORAGE_CONFIG_FILE)) return;
+    const raw = fs.readFileSync(STORAGE_CONFIG_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as {customDir?: string | null};
+    if (typeof parsed.customDir === 'string' && parsed.customDir.trim()) {
+      const check = validateServerStorageDir(parsed.customDir, ROOT_DIR);
+      if (check.valid && check.resolvedPath) {
+        fs.mkdirSync(check.resolvedPath, {recursive: true});
+        activeUploadsDir = check.resolvedPath;
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load storage-config.json:', err);
+  }
+}
+
+function saveStorageConfigToDisk(customDir: string | null) {
+  try {
+    fs.writeFileSync(
+      STORAGE_CONFIG_FILE,
+      JSON.stringify({customDir}, null, 2),
+      'utf-8'
+    );
+  } catch (err) {
+    console.error('Failed to save storage-config.json:', err);
+  }
+}
+
+function getActiveUploadsDir(): string {
+  try {
+    fs.mkdirSync(activeUploadsDir, {recursive: true});
+    return activeUploadsDir;
+  } catch {
+    fs.mkdirSync(DEFAULT_UPLOADS_DIR, {recursive: true});
+    return DEFAULT_UPLOADS_DIR;
+  }
+}
+
+function computeDirStats(dirPath: string): {filesCount: number; totalBytes: number} {
+  let filesCount = 0;
+  let totalBytes = 0;
+  try {
+    const entries = fs.readdirSync(dirPath, {withFileTypes: true});
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (entry.name.startsWith('.cutsync-probe-')) continue;
+      try {
+        const st = fs.statSync(path.join(dirPath, entry.name));
+        if (st.isFile()) {
+          filesCount += 1;
+          totalBytes += st.size;
+        }
+      } catch {
+        // ignore
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return {filesCount, totalBytes};
+}
+
+function copyMediaFilesBetweenDirs(fromDir: string, toDir: string): number {
+  if (path.resolve(fromDir) === path.resolve(toDir)) return 0;
+  let migratedCount = 0;
+  try {
+    fs.mkdirSync(toDir, {recursive: true});
+    const entries = fs.readdirSync(fromDir, {withFileTypes: true});
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (entry.name.startsWith('.cutsync-probe-')) continue;
+      const srcPath = path.join(fromDir, entry.name);
+      const dstPath = path.join(toDir, entry.name);
+      try {
+        if (!fs.existsSync(dstPath)) {
+          fs.copyFileSync(srcPath, dstPath);
+          migratedCount += 1;
+        }
+      } catch {
+        // ignore individual copy error
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return migratedCount;
+}
+
+function getServerStorageSummary() {
+  const currentDir = getActiveUploadsDir();
+  const stats = computeDirStats(currentDir);
+  const canNativePick =
+    typeof (globalThis as {__cutsyncPickDirectory?: unknown})
+      .__cutsyncPickDirectory === 'function';
+  const presets: Array<{label: string; path: string; isDefault?: boolean}> = [
+    {
+      label: 'По стандарту (корень приложения)',
+      path: DEFAULT_UPLOADS_DIR,
+      isDefault: true,
+    },
+    {
+      label: 'Папка media-sync в корне приложения',
+      path: path.join(ROOT_DIR, 'media-sync'),
+    },
+    {
+      label: 'Домашняя папка / CutSyncMedia',
+      path: path.join(os.homedir(), 'CutSyncMedia'),
+    },
+  ];
+  return {
+    currentDir,
+    defaultDir: DEFAULT_UPLOADS_DIR,
+    isDefault: path.resolve(currentDir) === path.resolve(DEFAULT_UPLOADS_DIR),
+    filesCount: stats.filesCount,
+    totalBytes: stats.totalBytes,
+    canNativePick,
+    presets,
+  };
+}
+
+loadStorageConfigFromDisk();
 
 const rooms = new Map<string, ProjectState>();
 const roomConnections = new Map<string, Set<ClientSession>>();
@@ -365,7 +492,7 @@ app.use(express.json({limit: '10mb'}));
 
 const storage = multer.diskStorage({
   destination: (_req, _file, cb) => {
-    cb(null, UPLOADS_DIR);
+    cb(null, getActiveUploadsDir());
   },
   filename: (_req, file, cb) => {
     const ext =
@@ -379,10 +506,13 @@ const storage = multer.diskStorage({
 });
 
 const FONT_EXTS = new Set(['.ttf', '.otf', '.woff', '.woff2']);
+const VIDEO_EXTS = new Set(['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.3gp']);
+const AUDIO_EXTS = new Set(['.mp3', '.wav', '.aac', '.m4a', '.ogg', '.opus', '.flac']);
+const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.avif']);
 
 const upload = multer({
   storage,
-  limits: {fileSize: 150 * 1024 * 1024},
+  limits: {fileSize: 2 * 1024 * 1024 * 1024},
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     if (
@@ -391,7 +521,10 @@ const upload = multer({
       file.mimetype.startsWith('audio/') ||
       file.mimetype.startsWith('font/') ||
       file.mimetype.includes('font') ||
-      FONT_EXTS.has(ext)
+      FONT_EXTS.has(ext) ||
+      VIDEO_EXTS.has(ext) ||
+      AUDIO_EXTS.has(ext) ||
+      IMAGE_EXTS.has(ext)
     ) {
       cb(null, true);
     } else {
@@ -422,23 +555,43 @@ const staticMediaHeaders = (
   }
 };
 
-app.use(
-  '/uploads',
-  express.static(UPLOADS_DIR, {
-    acceptRanges: true,
-    maxAge: '1d',
-    setHeaders: staticMediaHeaders,
-  })
-);
+let cachedStaticDir = '';
+let cachedStaticHandler: express.RequestHandler | null = null;
+const defaultStaticHandler = express.static(DEFAULT_UPLOADS_DIR, {
+  acceptRanges: true,
+  maxAge: '1d',
+  setHeaders: staticMediaHeaders,
+});
 
-app.use(
-  '/media',
-  express.static(UPLOADS_DIR, {
-    acceptRanges: true,
-    maxAge: '1d',
-    setHeaders: staticMediaHeaders,
-  })
-);
+function dynamicMediaStatic(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const currentDir = getActiveUploadsDir();
+  if (!cachedStaticHandler || cachedStaticDir !== currentDir) {
+    cachedStaticDir = currentDir;
+    cachedStaticHandler = express.static(currentDir, {
+      acceptRanges: true,
+      maxAge: '1d',
+      setHeaders: staticMediaHeaders,
+    });
+  }
+  cachedStaticHandler(req, res, (err) => {
+    if (err) {
+      next(err);
+      return;
+    }
+    if (path.resolve(currentDir) !== path.resolve(DEFAULT_UPLOADS_DIR)) {
+      defaultStaticHandler(req, res, next);
+      return;
+    }
+    next();
+  });
+}
+
+app.use('/uploads', dynamicMediaStatic);
+app.use('/media', dynamicMediaStatic);
 
 app.post('/media/upload', (req, res, next) => {
   const rawName = req.query.fileName;
@@ -451,7 +604,12 @@ app.post('/media/upload', (req, res, next) => {
       ? path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_')
       : `media-${Date.now()}.bin`;
   const finalName = `${Date.now()}-${safeBase}`;
-  const destPath = path.join(UPLOADS_DIR, finalName);
+  const targetDir = getActiveUploadsDir();
+  const destPath = path.resolve(targetDir, finalName);
+  if (!destPath.startsWith(path.resolve(targetDir) + path.sep)) {
+    res.status(400).json({error: 'Недопустимое имя файла'});
+    return;
+  }
   const ws = fs.createWriteStream(destPath);
   req.pipe(ws);
   ws.on('finish', () => {
@@ -478,6 +636,89 @@ app.post('/media/upload', (req, res, next) => {
   });
   ws.on('error', (err) => {
     res.status(500).json({error: err.message});
+  });
+});
+
+app.get('/api/storage/config', (_req, res) => {
+  res.json(getServerStorageSummary());
+});
+
+app.post('/api/storage/pick-folder', async (_req, res) => {
+  const picker = (
+    globalThis as {__cutsyncPickDirectory?: () => Promise<string | null>}
+  ).__cutsyncPickDirectory;
+  if (typeof picker !== 'function') {
+    res.json({supported: false, canceled: true, dirPath: null});
+    return;
+  }
+  try {
+    const picked = await picker();
+    res.json({supported: true, canceled: !picked, dirPath: picked});
+  } catch (err) {
+    res.status(500).json({
+      supported: true,
+      error: err instanceof Error ? err.message : 'Не удалось открыть диалог выбора папки',
+    });
+  }
+});
+
+app.post('/api/storage/config', (req, res) => {
+  const reset = Boolean(req.body?.reset);
+  const migrateExisting = req.body?.migrateExisting !== false;
+  const prevDir = getActiveUploadsDir();
+
+  if (reset) {
+    activeUploadsDir = DEFAULT_UPLOADS_DIR;
+    fs.mkdirSync(activeUploadsDir, {recursive: true});
+    const migratedCount = migrateExisting
+      ? copyMediaFilesBetweenDirs(prevDir, activeUploadsDir)
+      : 0;
+    saveStorageConfigToDisk(null);
+    res.json({
+      ok: true,
+      migratedCount,
+      ...getServerStorageSummary(),
+    });
+    return;
+  }
+
+  const rawDirPath =
+    typeof req.body?.dirPath === 'string' ? req.body.dirPath : '';
+  const validation = validateServerStorageDir(rawDirPath, ROOT_DIR);
+  if (!validation.valid || !validation.resolvedPath) {
+    res.status(400).json({
+      error: validation.error || 'Некорректный путь к папке',
+    });
+    return;
+  }
+
+  const nextDir = validation.resolvedPath;
+  try {
+    fs.mkdirSync(nextDir, {recursive: true});
+    const probeFile = path.join(nextDir, `.cutsync-probe-${Date.now()}`);
+    fs.writeFileSync(probeFile, 'ok');
+    fs.unlinkSync(probeFile);
+  } catch (err) {
+    res.status(400).json({
+      error: `Папка недоступна для записи: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    });
+    return;
+  }
+
+  activeUploadsDir = nextDir;
+  const isDefault =
+    path.resolve(nextDir) === path.resolve(DEFAULT_UPLOADS_DIR);
+  saveStorageConfigToDisk(isDefault ? null : nextDir);
+  const migratedCount = migrateExisting
+    ? copyMediaFilesBetweenDirs(prevDir, nextDir)
+    : 0;
+
+  res.json({
+    ok: true,
+    migratedCount,
+    ...getServerStorageSummary(),
   });
 });
 
@@ -581,9 +822,9 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     file.mimetype.startsWith('font/') ||
     file.mimetype.includes('font')
       ? 'font'
-      : file.mimetype.startsWith('video/')
+      : file.mimetype.startsWith('video/') || VIDEO_EXTS.has(ext)
         ? 'video'
-        : file.mimetype.startsWith('audio/')
+        : file.mimetype.startsWith('audio/') || AUDIO_EXTS.has(ext)
           ? 'audio'
           : 'image';
 
@@ -621,6 +862,8 @@ app.use(
 const server = http.createServer(app);
 let wss = new WebSocketServer({noServer: true});
 let wssClosed = false;
+let viteDevWsActive = false;
+let viteServer: {close: () => Promise<void>} | null = null;
 
 server.on('upgrade', (request, socket, head) => {
   const pathname = (request.url || '').split('?')[0];
@@ -628,6 +871,9 @@ server.on('upgrade', (request, socket, head) => {
     wss.handleUpgrade(request, socket, head, (ws) => {
       wss.emit('connection', ws, request);
     });
+  } else if (viteDevWsActive && pathname === '/__vite_ws') {
+    // Handled by Vite's WebSocket upgrade listener attached to `server`
+    return;
   } else {
     socket.destroy();
   }
@@ -1374,11 +1620,18 @@ export async function startServer(opts?: {
   const prodMode = opts?.isProd ?? IS_PROD;
   if (!opts?.disableVite) {
     if (!prodMode) {
+      viteDevWsActive = true;
       const {createServer: createViteServer} = await import('vite');
       const vite = await createViteServer({
-        server: {middlewareMode: true, hmr: false},
+        server: {
+          middlewareMode: true,
+          hmr: false,
+          allowedHosts: true,
+          ws: {server, path: '/__vite_ws'},
+        },
         appType: 'spa',
       });
+      viteServer = vite;
       app.use(vite.middlewares);
     } else {
       const distDir = process.env.CUTSYNC_DIST_DIR
@@ -1459,6 +1712,11 @@ export async function stopServer(): Promise<void> {
   }
   allSockets.clear();
   wssClosed = true;
+  viteDevWsActive = false;
+  if (viteServer) {
+    await viteServer.close();
+    viteServer = null;
+  }
   await new Promise<void>((resolve) => {
     wss.close(() => {
       server.close(() => resolve());
