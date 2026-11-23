@@ -84,13 +84,13 @@ object AIModelRegistry {
      * Built-in modular catalog. No model weights are bundled in the APK (~17 MB limit).
      * Models are downloaded on demand from GitHub Releases or imported via a .zip AI pack.
      */
-        private val builtInModels: List<AIModelSpec> = listOf(
+            private val builtInModels: List<AIModelSpec> = listOf(
         AIModelSpec(
             id = "sam2_tiny_seg",
             title = "AI Авто-маска (Сегментация)",
             category = ModelCategory.MASK,
             fileName = "mobile_sam_image_encoder.onnx",
-            format = "zip",
+            format = "onnx",
             downloadUrl = "https://github.com",
             expectedSizeBytes = 0L,
             sha256 = "",
@@ -101,7 +101,7 @@ object AIModelRegistry {
             title = "AI Авто-трекинг (Ключи)",
             category = ModelCategory.KEYFRAME,
             fileName = "object_tracking_vittrack_2023sep.onnx",
-            format = "zip",
+            format = "onnx",
             downloadUrl = "https://github.com",
             expectedSizeBytes = 0L,
             sha256 = "",
@@ -112,7 +112,7 @@ object AIModelRegistry {
             title = "AI Авто-субтитры (Речь -> Текст)",
             category = ModelCategory.TEXT,
             fileName = "encoder_model_quantized.onnx",
-            format = "zip",
+            format = "onnx",
             downloadUrl = "https://github.com",
             expectedSizeBytes = 0L,
             sha256 = "",
