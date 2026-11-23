@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import androidx.activity.result.ActivityResult
 import com.cutsync.webcut.ai.AIModelManager
+import com.cutsync.webcut.ai.SamSegmenterEngine
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.Plugin
@@ -311,6 +312,60 @@ class WebcutAIPlugin : Plugin() {
     fun cancelTracking(call: PluginCall) {
         aiManager.cancelObjectTracking()
         call.resolve(JSObject().apply { put("ok", true) })
+    }
+
+    @PluginMethod
+    fun encodeSamFrame(call: PluginCall) {
+        val frameInput = call.getString("frame")
+            ?: call.getString("imageBase64")
+            ?: call.getString("sourceUrl")
+            ?: ""
+        if (frameInput.isBlank()) {
+            call.reject("Missing frame (base64 or path)")
+            return
+        }
+        pluginScope.launch {
+            try {
+                val res = aiManager.encodeSamFrame(frameInput)
+                call.resolve(jsonObjectToJsObject(res))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Ошибка кодирования кадра (MobileSAM)")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun decodeSamPoints(call: PluginCall) {
+        val pointsArr = call.getArray("points")
+        if (pointsArr == null || pointsArr.length() == 0) {
+            call.reject("Missing points array")
+            return
+        }
+        val normalizedCoords = call.getBoolean("normalized", true) ?: true
+        val points = ArrayList<SamSegmenterEngine.SamPoint>(pointsArr.length())
+        for (i in 0 until pointsArr.length()) {
+            val obj = pointsArr.optJSONObject(i) ?: continue
+            val x = obj.optDouble("x", 0.5).toFloat()
+            val y = obj.optDouble("y", 0.5).toFloat()
+            val label = obj.optInt("label", 1)
+            points += SamSegmenterEngine.SamPoint(x = x, y = y, label = label)
+        }
+        if (points.isEmpty()) {
+            call.reject("No valid points provided")
+            return
+        }
+
+        pluginScope.launch {
+            try {
+                val res = aiManager.decodeSamPoints(
+                    points = points,
+                    normalizedCoords = normalizedCoords
+                )
+                call.resolve(jsonObjectToJsObject(res))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Ошибка декодирования маски (MobileSAM)")
+            }
+        }
     }
 
     private fun jsonObjectToJsObject(obj: JSONObject): JSObject {

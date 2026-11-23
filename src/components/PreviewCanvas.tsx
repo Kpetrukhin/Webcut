@@ -19,7 +19,7 @@ import type {
   Track,
   WarpPoint,
 } from '../shared/types.ts';
-import type {TrackBbox} from '../lib/webcutAi.ts';
+import type {SamPointInput, TrackBbox} from '../lib/webcutAi.ts';
 import {
   evaluateShapePoints,
   evaluateTrackerAtTime,
@@ -116,6 +116,14 @@ interface PreviewCanvasProps {
     livePoint?: {x: number; y: number} | null;
   } | null;
   onChangeObjectTrackBbox?: (bbox: TrackBbox) => void;
+  magicWandSession?: {
+    points: SamPointInput[];
+    tintedMaskDataUrl: string | null;
+    contourPoints: PolygonPoint[];
+    isBusy: boolean;
+  } | null;
+  onAddMagicWandPoint?: (nx: number, ny: number) => void;
+  onRemoveMagicWandPoint?: (index: number) => void;
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onSelectClip: (clipId: string | null) => void;
   onDoubleClickTextClip?: (clipId: string) => void;
@@ -186,6 +194,9 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   onUpdatePolygonPoints,
   objectTrackPicker = null,
   onChangeObjectTrackBbox,
+  magicWandSession = null,
+  onAddMagicWandPoint,
+  onRemoveMagicWandPoint,
   onLockLayer,
   onSelectClip,
   onDoubleClickTextClip,
@@ -919,7 +930,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       colorPickerActive ||
       maskEditActive ||
       warpEditActive ||
-      Boolean(objectTrackPicker)
+      Boolean(objectTrackPicker) ||
+      Boolean(magicWandSession)
     ) {
       return null;
     }
@@ -2224,13 +2236,16 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
               const bound = pt.trackerId
                 ? trackers.find((t) => t.id === pt.trackerId)
                 : undefined;
-              const r = Math.max(9, width * 0.0145);
+              const isDenseContour = polygonOverlay.ptsPx.length > 14;
+              const r = isDenseContour
+                ? Math.max(5.5, width * 0.008)
+                : Math.max(9, width * 0.0145);
               return (
                 <g key={pt.id}>
                   <circle
                     cx={pt.cx}
                     cy={pt.cy}
-                    r={r + Math.max(3, width * 0.0045)}
+                    r={r + Math.max(2.2, width * 0.0035)}
                     fill="rgba(9, 9, 11, 0.52)"
                   />
                   <circle
@@ -2239,7 +2254,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
                     r={r}
                     fill={bound ? bound.color || '#a78bfa' : '#22d3ee'}
                     stroke="#ffffff"
-                    strokeWidth={Math.max(2, width * 0.0034)}
+                    strokeWidth={Math.max(1.5, width * 0.0028)}
                   />
                   {bound && (
                     <circle
@@ -2249,19 +2264,21 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
                       fill="#09090b"
                     />
                   )}
-                  <text
-                    x={pt.cx}
-                    y={pt.cy - r - Math.max(6, width * 0.009)}
-                    textAnchor="middle"
-                    fill="#ffffff"
-                    stroke="rgba(9,9,11,0.85)"
-                    strokeWidth={Math.max(2.5, width * 0.004)}
-                    paintOrder="stroke"
-                    fontSize={Math.max(11, Math.round(width * 0.02))}
-                    fontWeight="700"
-                  >
-                    {bound ? `${idx + 1}🎯` : `${idx + 1}`}
-                  </text>
+                  {(!isDenseContour || bound) && (
+                    <text
+                      x={pt.cx}
+                      y={pt.cy - r - Math.max(6, width * 0.009)}
+                      textAnchor="middle"
+                      fill="#ffffff"
+                      stroke="rgba(9,9,11,0.85)"
+                      strokeWidth={Math.max(2.5, width * 0.004)}
+                      paintOrder="stroke"
+                      fontSize={Math.max(11, Math.round(width * 0.02))}
+                      fontWeight="700"
+                    >
+                      {bound ? `${idx + 1}🎯` : `${idx + 1}`}
+                    </text>
+                  )}
                 </g>
               );
             })}
@@ -2499,6 +2516,90 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
                 <div className="h-4 w-4 rounded-full border-2 border-white bg-violet-400 shadow-lg" />
               </div>
             )}
+          </div>
+        )}
+
+        {/* MobileSAM Magic Wand Interactive Segmentation Overlay */}
+        {magicWandSession && onAddMagicWandPoint && (
+          <div
+            data-testid="magic_wand_canvas_overlay"
+            onPointerDown={(e) => {
+              e.stopPropagation();
+              if (magicWandSession.isBusy) return;
+              const rect = e.currentTarget.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) return;
+              const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+              const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+              const hitThresh = 18 / Math.max(1, Math.min(rect.width, rect.height));
+              let hitIdx = -1;
+              let bestDist = Infinity;
+              magicWandSession.points.forEach((pt, idx) => {
+                const d = Math.hypot(nx - pt.x, ny - pt.y);
+                if (d <= hitThresh && d < bestDist) {
+                  bestDist = d;
+                  hitIdx = idx;
+                }
+              });
+              if (hitIdx >= 0 && onRemoveMagicWandPoint) {
+                onRemoveMagicWandPoint(hitIdx);
+              } else {
+                onAddMagicWandPoint(nx, ny);
+              }
+            }}
+            className="absolute inset-0 z-20 touch-none select-none cursor-crosshair"
+          >
+            {magicWandSession.tintedMaskDataUrl && (
+              <img
+                src={magicWandSession.tintedMaskDataUrl}
+                alt="Предпросмотр выделения"
+                className="pointer-events-none absolute inset-0 h-full w-full object-fill"
+              />
+            )}
+
+            {magicWandSession.contourPoints.length >= 3 && (
+              <svg
+                viewBox={`0 0 ${width} ${height}`}
+                className="pointer-events-none absolute inset-0 h-full w-full"
+              >
+                <path
+                  d={
+                    magicWandSession.contourPoints
+                      .map(
+                        (p, idx) =>
+                          `${idx === 0 ? 'M' : 'L'} ${(p.x * width).toFixed(1)} ${(p.y * height).toFixed(1)}`
+                      )
+                      .join(' ') + ' Z'
+                  }
+                  fill="none"
+                  stroke="#00bfff"
+                  strokeWidth={Math.max(2.5, width * 0.004)}
+                  strokeLinejoin="round"
+                  strokeDasharray={`${Math.max(6, width * 0.009)} ${Math.max(4, width * 0.006)}`}
+                />
+              </svg>
+            )}
+
+            {magicWandSession.points.map((pt, idx) => {
+              const isPositive = pt.label === 1;
+              return (
+                <div
+                  key={`sam-pt-${idx}-${pt.x}-${pt.y}`}
+                  className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2"
+                  style={{
+                    left: `${pt.x * 100}%`,
+                    top: `${pt.y * 100}%`,
+                  }}
+                >
+                  <div
+                    className={`flex h-6 w-6 items-center justify-center rounded-full border-2 border-white text-xs font-black text-white shadow-[0_2px_8px_rgba(0,0,0,0.75)] ${
+                      isPositive ? 'bg-sky-500' : 'bg-rose-500'
+                    }`}
+                  >
+                    {isPositive ? '+' : '−'}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
 

@@ -149,6 +149,39 @@ export interface TrackObjectResult {
   points: TrackPointResult[];
 }
 
+export interface SamPointInput {
+  x: number; // normalized [0..1]
+  y: number; // normalized [0..1]
+  label: 0 | 1; // 1 = include, 0 = exclude
+}
+
+export interface SamEncodeResult {
+  ok: boolean;
+  cached: boolean;
+  origWidth: number;
+  origHeight: number;
+  resizedWidth: number;
+  resizedHeight: number;
+  encoderSize: number;
+  encodeTimeMs: number;
+}
+
+export interface SamDecodeResult {
+  ok: boolean;
+  maskDataUrl: string;
+  width: number;
+  height: number;
+  iou: number;
+  coverage: number;
+  bounds: {
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  };
+  decodeTimeMs: number;
+}
+
 interface WebcutAINativePlugin {
   getAvailableModelsStatus(): Promise<AIModelsStatusSnapshot>;
   downloadModel(options: {
@@ -183,6 +216,13 @@ interface WebcutAINativePlugin {
     sampleFps?: number;
   }): Promise<TrackObjectResult>;
   cancelTracking(): Promise<{ok: boolean}>;
+  encodeSamFrame(options: {
+    frame: string;
+  }): Promise<SamEncodeResult>;
+  decodeSamPoints(options: {
+    points: SamPointInput[];
+    normalized?: boolean;
+  }): Promise<SamDecodeResult>;
   addListener(
     eventName: 'aiModelDownloadProgress',
     listenerFunc: (data: {modelId: string; progress: number}) => void
@@ -214,18 +254,18 @@ const WebcutAINative = registerPlugin<WebcutAINativePlugin>('WebcutAI');
 export const BUILTIN_AI_MODEL_CATALOG: AIModelInfo[] = [
   {
     id: 'sam2_tiny_seg',
-    title: 'AI Авто-маска (Сегментация)',
+    title: 'AI Авто-маска (Волшебная палочка)',
     category: 'mask',
     categoryLabel: 'Маски и вырезка фона',
-    fileName: 'sam2_tiny_image_encoder.onnx',
+    fileName: 'mobile_sam_image_encoder.onnx',
     format: 'onnx',
     downloadUrl:
-      'https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/sam2_tiny_image_encoder.onnx',
+      'https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/mobile_sam_image_encoder.onnx',
     expectedSizeBytes: 0,
     installedBytes: 0,
     sha256: '',
     description:
-      'Выделение объекта и автоматическое построение маски на кадре (ONNX FP16).',
+      'Интерактивное выделение объекта по тапу и построение контура (MobileSAM ONNX).',
     status: 'not_installed',
     downloadProgress: 0,
     isActiveInRam: false,
@@ -314,6 +354,11 @@ export interface WebcutAIBridge {
   trackObject(options: TrackObjectOptions): Promise<TrackObjectResult>;
   cancelTracking(): Promise<void>;
   onTrackProgress(listener: (ev: TrackProgressEvent) => void): () => void;
+  encodeSamFrame(frame: string): Promise<SamEncodeResult>;
+  decodeSamPoints(
+    points: SamPointInput[],
+    normalized?: boolean
+  ): Promise<SamDecodeResult>;
 }
 
 const progressListeners = new Set<
@@ -584,6 +629,25 @@ export const webcutAI: WebcutAIBridge = {
     return () => {
       trackProgressListeners.delete(listener);
     };
+  },
+
+  async encodeSamFrame(frame: string): Promise<SamEncodeResult> {
+    if (!hasNativeWebcutAI()) {
+      throw new Error(NATIVE_REQUIRED_ERROR);
+    }
+    ensureNativeEventListeners();
+    return await WebcutAINative.encodeSamFrame({frame});
+  },
+
+  async decodeSamPoints(
+    points: SamPointInput[],
+    normalized = true
+  ): Promise<SamDecodeResult> {
+    if (!hasNativeWebcutAI()) {
+      throw new Error(NATIVE_REQUIRED_ERROR);
+    }
+    ensureNativeEventListeners();
+    return await WebcutAINative.decodeSamPoints({points, normalized});
   },
 };
 

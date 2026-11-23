@@ -26,6 +26,7 @@ import {
   evaluateShapePoints,
   getDefaultPolygonPoints,
 } from '../lib/trackerEngine.ts';
+import {requestAIFeature} from '../lib/webcutAi.ts';
 import {ScrubNumberField} from './ScrubNumberField.tsx';
 
 interface ShapesPanelProps {
@@ -44,6 +45,7 @@ interface ShapesPanelProps {
     commit: boolean
   ) => void;
   onCreateTracker?: () => void;
+  onStartMagicWand?: () => void;
   onOpenAdjust?: () => void;
   onClose?: () => void;
 }
@@ -208,6 +210,7 @@ export const ShapesPanel: React.FC<ShapesPanelProps> = ({
   onUpdateClip,
   onUpdatePolygonPoints,
   onCreateTracker,
+  onStartMagicWand,
   onOpenAdjust,
   onClose,
 }) => {
@@ -346,6 +349,28 @@ export const ShapesPanel: React.FC<ShapesPanelProps> = ({
             </button>
           ))}
         </div>
+
+        <button
+          type="button"
+          data-testid="shapes_magic_wand_button"
+          onClick={() => {
+            onClose?.();
+            if (onStartMagicWand) {
+              onStartMagicWand();
+            } else {
+              requestAIFeature('sam2_tiny_seg', '✨ Волшебная палочка (MobileSAM)');
+            }
+          }}
+          className="flex h-10 w-full items-center justify-between gap-2 rounded-xl border border-sky-400/45 bg-sky-500/15 px-3 text-xs font-semibold text-sky-100 transition hover:bg-sky-500/25 active:scale-[0.99]"
+        >
+          <span className="flex items-center gap-1.5">
+            <Sparkles className="h-3.5 w-3.5 text-sky-300" />
+            <span>✨ Волшебная палочка</span>
+          </span>
+          <span className="rounded-md bg-sky-500/30 px-1.5 py-0.5 font-mono text-[9px] text-sky-200">
+            Выделить объект
+          </span>
+        </button>
       </div>
 
       {/* Properties of Selected Shape */}

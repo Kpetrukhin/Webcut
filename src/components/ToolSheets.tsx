@@ -733,6 +733,7 @@ interface OverlayPanelProps {
   onSeek: (time: number) => void;
   onAddMediaClip: MediaPanelProps['onAddMediaClip'];
   onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+  onStartMagicWand?: () => void;
   onClose?: () => void;
 }
 
@@ -750,6 +751,7 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
   onSeek,
   onAddMediaClip,
   onUpdateClip,
+  onStartMagicWand,
   onClose,
 }) => {
   const isOverlay = selectedClip?.track === 'overlay';
@@ -784,6 +786,28 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
 
   return (
     <div className="space-y-4">
+      <button
+        type="button"
+        data-testid="overlay_magic_wand_button"
+        onClick={() => {
+          onClose?.();
+          if (onStartMagicWand) {
+            onStartMagicWand();
+          } else {
+            requestAIFeature('sam2_tiny_seg', '✨ Волшебная палочка (MobileSAM)');
+          }
+        }}
+        className="flex h-10 w-full items-center justify-between gap-2 rounded-xl border border-sky-400/45 bg-sky-500/15 px-3 text-xs font-semibold text-sky-100 transition hover:bg-sky-500/25 active:scale-[0.99]"
+      >
+        <span className="flex items-center gap-1.5">
+          <Sparkles className="h-3.5 w-3.5 text-sky-300" />
+          <span>✨ Волшебная палочка (Слой по контуру)</span>
+        </span>
+        <span className="rounded-md bg-sky-500/30 px-1.5 py-0.5 font-mono text-[9px] text-sky-200">
+          MobileSAM
+        </span>
+      </button>
+
       {isOverlay && overlayEval && (
         <>
           <div className="space-y-3 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-3">

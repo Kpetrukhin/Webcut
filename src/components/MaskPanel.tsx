@@ -13,6 +13,7 @@ interface MaskPanelProps {
     patch: Partial<Clip>,
     opts?: {skipUndo?: boolean; skipSync?: boolean}
   ) => void;
+  onStartMagicWand?: () => void;
 }
 
 const MaskShapeIcon: React.FC<{shape: MaskShape; active: boolean}> = ({
@@ -123,6 +124,7 @@ export const MaskPanel: React.FC<MaskPanelProps> = ({
   clip,
   currentTime,
   onUpdateClip,
+  onStartMagicWand,
 }) => {
   const mask = clip.mask;
 
@@ -186,17 +188,22 @@ export const MaskPanel: React.FC<MaskPanelProps> = ({
 
       <button
         type="button"
-        onClick={() =>
-          requestAIFeature('sam2_tiny_seg', 'AI Авто-маска (Сегментация)')
-        }
-        className="flex h-10 w-full items-center justify-between gap-2 rounded-xl border border-violet-400/40 bg-violet-500/15 px-3 text-xs font-semibold text-violet-100 transition hover:bg-violet-500/25 active:scale-[0.99]"
+        data-testid="mask_magic_wand_button"
+        onClick={() => {
+          if (onStartMagicWand) {
+            onStartMagicWand();
+          } else {
+            requestAIFeature('sam2_tiny_seg', '✨ Волшебная палочка (MobileSAM)');
+          }
+        }}
+        className="flex h-10 w-full items-center justify-between gap-2 rounded-xl border border-sky-400/45 bg-sky-500/15 px-3 text-xs font-semibold text-sky-100 transition hover:bg-sky-500/25 active:scale-[0.99]"
       >
         <span className="flex items-center gap-1.5">
-          <Sparkles className="h-3.5 w-3.5 text-violet-300" />
-          <span>✨ AI Авто-маска объекта</span>
+          <Sparkles className="h-3.5 w-3.5 text-sky-300" />
+          <span>✨ Волшебная палочка</span>
         </span>
-        <span className="rounded-md bg-violet-500/30 px-1.5 py-0.5 font-mono text-[9px] text-violet-200">
-          ONNX
+        <span className="rounded-md bg-sky-500/30 px-1.5 py-0.5 font-mono text-[9px] text-sky-200">
+          MobileSAM
         </span>
       </button>
 

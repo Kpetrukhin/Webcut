@@ -74,8 +74,15 @@ class AIModelManager private constructor(private val appContext: Context) {
     @Volatile
     private var companionDecoderOptions: OrtSession.SessionOptions? = null
 
+    @Volatile
+    private var companionSamDecoderSession: OrtSession? = null
+
+    @Volatile
+    private var companionSamDecoderOptions: OrtSession.SessionOptions? = null
+
     private val whisperEngine = WhisperSubtitleEngine(appContext, modelsDir)
     private val vitTrackEngine = VitTrackEngine(appContext)
+    private val samEngine = SamSegmenterEngine(appContext)
 
     private val downloadJobs = ConcurrentHashMap<String, Job>()
     private val downloadProgress = ConcurrentHashMap<String, Int>()
@@ -434,8 +441,93 @@ class AIModelManager private constructor(private val appContext: Context) {
         vitTrackEngine.cancel()
     }
 
+    /**
+     * Stage 1 of MobileSAM: encodes [frameInput] (base64 or image path/URI) once via
+     * `mobile_sam_image_encoder.onnx` and caches `image_embeddings` in RAM.
+     */
+    suspend fun encodeSamFrame(frameInput: String): JSONObject {
+        val encoderFile = File(modelsDir, SamSegmenterEngine.ENCODER_FILE)
+        val decoderFile = File(modelsDir, SamSegmenterEngine.DECODER_FILE)
+
+        if (!encoderFile.exists() || encoderFile.length() <= 16L) {
+            throw IllegalStateException("Файл ${SamSegmenterEngine.ENCODER_FILE} не найден в ai_models/")
+        }
+        if (!decoderFile.exists() || decoderFile.length() <= 16L) {
+            throw IllegalStateException("Файл ${SamSegmenterEngine.DECODER_FILE} не найден в ai_models/")
+        }
+
+        prepareModel("sam2_tiny_seg")
+
+        return sessionMutex.withLock {
+            val env = ortEnv ?: OrtEnvironment.getEnvironment().also { ortEnv = it }
+            val encoderSession = activeSession
+                ?: throw IllegalStateException("Сессия ${SamSegmenterEngine.ENCODER_FILE} не инициализирована")
+
+            if (companionSamDecoderSession == null) {
+                val (decSess, decOpts) = HardwareCascadeSelector.createCpuSession(
+                    context = appContext,
+                    env = env,
+                    modelFile = decoderFile
+                )
+                companionSamDecoderSession = decSess
+                companionSamDecoderOptions = decOpts
+            }
+
+            val res = samEngine.encodeFrame(
+                env = env,
+                encoderSession = encoderSession,
+                frameInput = frameInput,
+                createCpuFallbackEncoder = {
+                    HardwareCascadeSelector.createCpuSession(
+                        context = appContext,
+                        env = env,
+                        modelFile = encoderFile
+                    )
+                }
+            )
+            res.toJson()
+        }
+    }
+
+    /**
+     * Stage 2 of MobileSAM: runs `sam_mask_decoder_single.onnx` against RAM-cached embeddings
+     * using interactive prompt points [{ x, y, label }].
+     */
+    suspend fun decodeSamPoints(
+        points: List<SamSegmenterEngine.SamPoint>,
+        normalizedCoords: Boolean = true
+    ): JSONObject {
+        val decoderFile = File(modelsDir, SamSegmenterEngine.DECODER_FILE)
+        if (!decoderFile.exists() || decoderFile.length() <= 16L) {
+            throw IllegalStateException("Файл ${SamSegmenterEngine.DECODER_FILE} не найден в ai_models/")
+        }
+
+        return sessionMutex.withLock {
+            val env = ortEnv ?: OrtEnvironment.getEnvironment().also { ortEnv = it }
+            val decoderSession = companionSamDecoderSession ?: run {
+                val (decSess, decOpts) = HardwareCascadeSelector.createCpuSession(
+                    context = appContext,
+                    env = env,
+                    modelFile = decoderFile
+                )
+                companionSamDecoderSession = decSess
+                companionSamDecoderOptions = decOpts
+                decSess
+            }
+            val res = samEngine.decodePoints(
+                env = env,
+                decoderSession = decoderSession,
+                points = points,
+                normalizedCoords = normalizedCoords
+            )
+            res.toJson()
+        }
+    }
+
     private fun releaseActiveModelLocked() {
         val prevId = activeModelId
+        samEngine.clearCache()
+
         try {
             companionDecoderSession?.close()
         } catch (err: Throwable) {
@@ -447,6 +539,18 @@ class AIModelManager private constructor(private val appContext: Context) {
         }
         companionDecoderSession = null
         companionDecoderOptions = null
+
+        try {
+            companionSamDecoderSession?.close()
+        } catch (err: Throwable) {
+            Log.w(TAG, "Error closing companion SAM decoder session: ${err.message}")
+        }
+        try {
+            companionSamDecoderOptions?.close()
+        } catch (_: Throwable) {
+        }
+        companionSamDecoderSession = null
+        companionSamDecoderOptions = null
 
         try {
             activeSession?.close()
