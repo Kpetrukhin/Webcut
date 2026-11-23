@@ -200,7 +200,6 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
     patch.colorAdjustments = nextAdj;
     onUpdateClip(clip.id, patch, {
       skipUndo: !commit,
-      skipSync: !commit,
     });
   };
 
@@ -250,7 +249,7 @@ export const ColorAdjustPanel: React.FC<ColorAdjustPanelProps> = ({
           curves: nextCurves,
         },
       },
-      {skipUndo: !commit, skipSync: !commit}
+      {skipUndo: !commit}
     );
   };
 

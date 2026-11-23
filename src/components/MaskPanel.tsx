@@ -145,7 +145,7 @@ export const MaskPanel: React.FC<MaskPanelProps> = ({
     onUpdateClip(
       clip.id,
       {mask: {...mask, ...patch}},
-      {skipUndo: !commit, skipSync: !commit}
+      {skipUndo: !commit}
     );
   };
 

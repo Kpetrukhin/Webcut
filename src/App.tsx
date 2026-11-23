@@ -191,6 +191,8 @@ export default function App() {
     ktorStatus,
     downloadQueue,
     status,
+    syncStatus,
+    localRevision,
     project,
     collaborators,
     allCollaborators,
@@ -1775,14 +1777,14 @@ export default function App() {
                   : points,
             },
           },
-          {skipUndo: !commit, skipSync: !commit}
+          {skipUndo: !commit}
         );
         return;
       }
       updateClip(
         clipId,
         {shapeStyle: {...baseStyle, points}},
-        {skipUndo: !commit, skipSync: !commit}
+        {skipUndo: !commit}
       );
     },
     [currentTime, updateClip]
@@ -2636,11 +2638,11 @@ export default function App() {
               className={`h-2 w-2 shrink-0 rounded-full ${
                 p2pMode === 'host'
                   ? 'bg-emerald-400 animate-pulse'
-                  : status === 'connected'
-                    ? 'bg-emerald-400'
-                    : status === 'offline'
-                      ? 'bg-zinc-500'
-                      : 'bg-amber-400 animate-pulse'
+                  : status === 'offline'
+                    ? 'bg-zinc-500'
+                    : syncStatus === 'syncing' || status !== 'connected'
+                      ? 'bg-amber-400 animate-pulse'
+                      : 'bg-emerald-400'
               }`}
             />
             <Wifi className="h-3.5 w-3.5 text-emerald-400" />
@@ -3333,7 +3335,7 @@ export default function App() {
                                 clip={selectedClip}
                                 currentTime={currentTime}
                                 onSeek={handleSeek}
-                                onUpdateClip={(id, patch) => updateClip(id, patch)}
+                                onUpdateClip={updateClip}
                                 onStartObjectTracking={(c) =>
                                   void handleStartObjectTracking(c)
                                 }
@@ -3412,7 +3414,7 @@ export default function App() {
                     currentTime={currentTime}
                     onSeek={handleSeek}
                     onAddMediaClip={handleAddMediaClip}
-                    onUpdateClip={(id, patch) => updateClip(id, patch)}
+                    onUpdateClip={updateClip}
                     onStartMagicWand={() => void handleStartMagicWand()}
                   />
                 )}
@@ -3461,7 +3463,7 @@ export default function App() {
             {desktopTab === 'effects' && (
               <EffectsPanel
                 selectedClip={selectedClip}
-                onUpdateClip={(id, patch) => updateClip(id, patch)}
+                onUpdateClip={updateClip}
                 onAddAdjustmentLayer={handleAddAdjustmentLayer}
               />
             )}
@@ -3517,6 +3519,8 @@ export default function App() {
                 availableRooms={availableRooms}
                 chat={project.chat}
                 status={status}
+                syncStatus={syncStatus}
+                localRevision={localRevision}
                 onUpdateProfile={updateUserProfile}
                 onOpenLobby={() => setShowLobbyModal(true)}
                 onSwitchRoom={switchRoom}
@@ -4345,7 +4349,7 @@ export default function App() {
                   clip={selectedClip}
                   currentTime={currentTime}
                   onSeek={handleSeek}
-                  onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  onUpdateClip={updateClip}
                   onStartObjectTracking={(c) =>
                     void handleStartObjectTracking(c)
                   }
@@ -4370,7 +4374,7 @@ export default function App() {
                         updateClip(
                           selectedClip.id,
                           {volume: pct / 100},
-                          {skipUndo: true, skipSync: true}
+                          {skipUndo: true}
                         )
                       }
                       onCommit={(pct) =>
@@ -4385,8 +4389,20 @@ export default function App() {
                     step={0.05}
                     value={selectedClip.volume}
                     onChange={(e) =>
+                      updateClip(
+                        selectedClip.id,
+                        {volume: Number(e.target.value)},
+                        {skipUndo: true}
+                      )
+                    }
+                    onPointerUp={(e) =>
                       updateClip(selectedClip.id, {
-                        volume: Number(e.target.value),
+                        volume: Number((e.target as HTMLInputElement).value),
+                      })
+                    }
+                    onTouchEnd={(e) =>
+                      updateClip(selectedClip.id, {
+                        volume: Number((e.target as HTMLInputElement).value),
                       })
                     }
                     className="w-full accent-emerald-400"
@@ -4397,7 +4413,7 @@ export default function App() {
               {selectedClip.track !== 'audio' && (
                 <EffectsPanel
                   selectedClip={selectedClip}
-                  onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  onUpdateClip={updateClip}
                   onAddAdjustmentLayer={handleAddAdjustmentLayer}
                 />
               )}
@@ -4781,7 +4797,7 @@ export default function App() {
                   clip={selectedClip}
                   currentTime={currentTime}
                   onSeek={handleSeek}
-                  onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  onUpdateClip={updateClip}
                   onStartObjectTracking={(c) =>
                     void handleStartObjectTracking(c)
                   }
@@ -5473,7 +5489,7 @@ export default function App() {
             currentTime={currentTime}
             onSeek={handleSeek}
             onAddMediaClip={handleAddMediaClip}
-            onUpdateClip={(id, patch) => updateClip(id, patch)}
+            onUpdateClip={updateClip}
             onStartMagicWand={() => void handleStartMagicWand()}
             onClose={() => setMobileSheet(null)}
           />
@@ -5534,7 +5550,7 @@ export default function App() {
         >
           <EffectsPanel
             selectedClip={selectedClip}
-            onUpdateClip={(id, patch) => updateClip(id, patch)}
+            onUpdateClip={updateClip}
             onAddAdjustmentLayer={handleAddAdjustmentLayer}
           />
         </BottomSheet>
@@ -5608,6 +5624,8 @@ export default function App() {
             availableRooms={availableRooms}
             chat={project.chat}
             status={status}
+            syncStatus={syncStatus}
+            localRevision={localRevision}
             onUpdateProfile={updateUserProfile}
             onOpenLobby={() => {
               setMobileSheet(null);

@@ -106,7 +106,7 @@ export const TransformPanel: React.FC<TransformPanelProps> = ({
     patch: ClipTransformPatch,
     commit: boolean
   ) => {
-    const opts = {skipUndo: !commit, skipSync: !commit};
+    const opts = {skipUndo: !commit};
     if (onUpdateTransform) {
       onUpdateTransform(clip.id, patch, opts);
       return;

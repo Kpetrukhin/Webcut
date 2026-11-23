@@ -123,7 +123,11 @@ interface KeyframeControlsProps {
   clip: Clip;
   currentTime: number;
   onSeek: (time: number) => void;
-  onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+  onUpdateClip: (
+    clipId: string,
+    patch: Partial<Clip>,
+    opts?: {skipUndo?: boolean; skipSync?: boolean}
+  ) => void;
   onStartObjectTracking?: (clip: Clip) => void;
 }
 
@@ -168,9 +172,12 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
     onUpdateClip(clip.id, {keyframes: next});
   };
 
-  const handleUpdateActiveKfField = (patch: Partial<ClipKeyframe>) => {
+  const handleUpdateActiveKfField = (
+    patch: Partial<ClipKeyframe>,
+    commit = true
+  ) => {
     const {keyframes: next} = upsertKeyframeAtTime(clip, currentTime, patch);
-    onUpdateClip(clip.id, {keyframes: next});
+    onUpdateClip(clip.id, {keyframes: next}, {skipUndo: !commit});
   };
 
   const isAdjustment =
@@ -331,7 +338,10 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                 suffix="%"
                 ariaLabel="Интенсивность эффекта ключа"
                 onChange={(pct) =>
-                  handleUpdateActiveKfField({opacity: pct / 100})
+                  handleUpdateActiveKfField({opacity: pct / 100}, false)
+                }
+                onCommit={(pct) =>
+                  handleUpdateActiveKfField({opacity: pct / 100}, true)
                 }
               />
             </div>
@@ -342,7 +352,22 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
               step={0.01}
               value={currentEval.opacity}
               onChange={(e) =>
-                handleUpdateActiveKfField({opacity: Number(e.target.value)})
+                handleUpdateActiveKfField(
+                  {opacity: Number(e.target.value)},
+                  false
+                )
+              }
+              onPointerUp={(e) =>
+                handleUpdateActiveKfField(
+                  {opacity: Number((e.target as HTMLInputElement).value)},
+                  true
+                )
+              }
+              onTouchEnd={(e) =>
+                handleUpdateActiveKfField(
+                  {opacity: Number((e.target as HTMLInputElement).value)},
+                  true
+                )
               }
               className="w-full accent-violet-400"
             />
@@ -361,7 +386,12 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                   step={1}
                   suffix="%"
                   ariaLabel="Масштаб ключа"
-                  onChange={(pct) => handleUpdateActiveKfField({scale: pct / 100})}
+                  onChange={(pct) =>
+                    handleUpdateActiveKfField({scale: pct / 100}, false)
+                  }
+                  onCommit={(pct) =>
+                    handleUpdateActiveKfField({scale: pct / 100}, true)
+                  }
                 />
               </div>
               <input
@@ -371,7 +401,22 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                 step={0.05}
                 value={Math.max(0.15, Math.min(2.5, currentEval.scale))}
                 onChange={(e) =>
-                  handleUpdateActiveKfField({scale: Number(e.target.value)})
+                  handleUpdateActiveKfField(
+                    {scale: Number(e.target.value)},
+                    false
+                  )
+                }
+                onPointerUp={(e) =>
+                  handleUpdateActiveKfField(
+                    {scale: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
+                }
+                onTouchEnd={(e) =>
+                  handleUpdateActiveKfField(
+                    {scale: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
                 }
                 className="w-full accent-amber-400"
               />
@@ -388,7 +433,12 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                   step={1}
                   suffix="°"
                   ariaLabel="Поворот ключа"
-                  onChange={(deg) => handleUpdateActiveKfField({rotation: deg})}
+                  onChange={(deg) =>
+                    handleUpdateActiveKfField({rotation: deg}, false)
+                  }
+                  onCommit={(deg) =>
+                    handleUpdateActiveKfField({rotation: deg}, true)
+                  }
                 />
               </div>
               <input
@@ -398,7 +448,22 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                 step={2}
                 value={currentEval.rotation}
                 onChange={(e) =>
-                  handleUpdateActiveKfField({rotation: Number(e.target.value)})
+                  handleUpdateActiveKfField(
+                    {rotation: Number(e.target.value)},
+                    false
+                  )
+                }
+                onPointerUp={(e) =>
+                  handleUpdateActiveKfField(
+                    {rotation: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
+                }
+                onTouchEnd={(e) =>
+                  handleUpdateActiveKfField(
+                    {rotation: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
                 }
                 className="w-full accent-amber-400"
               />
@@ -416,7 +481,10 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                   suffix="%"
                   ariaLabel="Scale X ключа"
                   onChange={(pct) =>
-                    handleUpdateActiveKfField({scaleX: pct / 100})
+                    handleUpdateActiveKfField({scaleX: pct / 100}, false)
+                  }
+                  onCommit={(pct) =>
+                    handleUpdateActiveKfField({scaleX: pct / 100}, true)
                   }
                 />
               </div>
@@ -427,7 +495,22 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                 step={0.02}
                 value={Math.max(0.1, Math.min(3, currentEval.scaleX))}
                 onChange={(e) =>
-                  handleUpdateActiveKfField({scaleX: Number(e.target.value)})
+                  handleUpdateActiveKfField(
+                    {scaleX: Number(e.target.value)},
+                    false
+                  )
+                }
+                onPointerUp={(e) =>
+                  handleUpdateActiveKfField(
+                    {scaleX: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
+                }
+                onTouchEnd={(e) =>
+                  handleUpdateActiveKfField(
+                    {scaleX: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
                 }
                 className="w-full accent-amber-400"
               />
@@ -445,7 +528,10 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                   suffix="%"
                   ariaLabel="Scale Y ключа"
                   onChange={(pct) =>
-                    handleUpdateActiveKfField({scaleY: pct / 100})
+                    handleUpdateActiveKfField({scaleY: pct / 100}, false)
+                  }
+                  onCommit={(pct) =>
+                    handleUpdateActiveKfField({scaleY: pct / 100}, true)
                   }
                 />
               </div>
@@ -456,7 +542,22 @@ export const KeyframeControls: React.FC<KeyframeControlsProps> = ({
                 step={0.02}
                 value={Math.max(0.1, Math.min(3, currentEval.scaleY))}
                 onChange={(e) =>
-                  handleUpdateActiveKfField({scaleY: Number(e.target.value)})
+                  handleUpdateActiveKfField(
+                    {scaleY: Number(e.target.value)},
+                    false
+                  )
+                }
+                onPointerUp={(e) =>
+                  handleUpdateActiveKfField(
+                    {scaleY: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
+                }
+                onTouchEnd={(e) =>
+                  handleUpdateActiveKfField(
+                    {scaleY: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
                 }
                 className="w-full accent-amber-400"
               />
@@ -732,7 +833,11 @@ interface OverlayPanelProps {
   currentTime: number;
   onSeek: (time: number) => void;
   onAddMediaClip: MediaPanelProps['onAddMediaClip'];
-  onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+  onUpdateClip: (
+    clipId: string,
+    patch: Partial<Clip>,
+    opts?: {skipUndo?: boolean; skipSync?: boolean}
+  ) => void;
   onStartMagicWand?: () => void;
   onClose?: () => void;
 }
@@ -760,17 +865,20 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
       ? evaluateClipTransform(selectedClip, currentTime)
       : null;
 
-  const updateOverlayTransform = (patch: {
-    x?: number;
-    y?: number;
-    scale?: number;
-    rotation?: number;
-    flipHorizontal?: boolean;
-  }) => {
+  const updateOverlayTransform = (
+    patch: {
+      x?: number;
+      y?: number;
+      scale?: number;
+      rotation?: number;
+      flipHorizontal?: boolean;
+    },
+    commit = true
+  ) => {
     if (!selectedClip) return;
     if (selectedClip.keyframes && selectedClip.keyframes.length > 0) {
       const {keyframes} = upsertKeyframeAtTime(selectedClip, currentTime, patch);
-      onUpdateClip(selectedClip.id, {keyframes});
+      onUpdateClip(selectedClip.id, {keyframes}, {skipUndo: !commit});
       return;
     }
     const basePatch: Partial<Clip> = {};
@@ -781,7 +889,7 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
     if (patch.flipHorizontal !== undefined) {
       basePatch.flipHorizontal = patch.flipHorizontal;
     }
-    onUpdateClip(selectedClip.id, basePatch);
+    onUpdateClip(selectedClip.id, basePatch, {skipUndo: !commit});
   };
 
   return (
@@ -874,7 +982,10 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   suffix="%"
                   ariaLabel="Размер PIP"
                   onChange={(pct) =>
-                    updateOverlayTransform({scale: pct / 100})
+                    updateOverlayTransform({scale: pct / 100}, false)
+                  }
+                  onCommit={(pct) =>
+                    updateOverlayTransform({scale: pct / 100}, true)
                   }
                 />
               </div>
@@ -885,9 +996,22 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                 step={0.05}
                 value={Math.max(0.15, Math.min(2.5, overlayEval.scale))}
                 onChange={(e) =>
-                  updateOverlayTransform({
-                    scale: Number(e.target.value),
-                  })
+                  updateOverlayTransform(
+                    {scale: Number(e.target.value)},
+                    false
+                  )
+                }
+                onPointerUp={(e) =>
+                  updateOverlayTransform(
+                    {scale: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
+                }
+                onTouchEnd={(e) =>
+                  updateOverlayTransform(
+                    {scale: Number((e.target as HTMLInputElement).value)},
+                    true
+                  )
                 }
                 className="w-full accent-indigo-400"
               />
@@ -907,7 +1031,10 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                     suffix="°"
                     ariaLabel="Поворот PIP"
                     onChange={(deg) =>
-                      updateOverlayTransform({rotation: deg})
+                      updateOverlayTransform({rotation: deg}, false)
+                    }
+                    onCommit={(deg) =>
+                      updateOverlayTransform({rotation: deg}, true)
                     }
                   />
                 </div>
@@ -918,9 +1045,22 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   step={2}
                   value={overlayEval.rotation}
                   onChange={(e) =>
-                    updateOverlayTransform({
-                      rotation: Number(e.target.value),
-                    })
+                    updateOverlayTransform(
+                      {rotation: Number(e.target.value)},
+                      false
+                    )
+                  }
+                  onPointerUp={(e) =>
+                    updateOverlayTransform(
+                      {rotation: Number((e.target as HTMLInputElement).value)},
+                      true
+                    )
+                  }
+                  onTouchEnd={(e) =>
+                    updateOverlayTransform(
+                      {rotation: Number((e.target as HTMLInputElement).value)},
+                      true
+                    )
                   }
                   className="w-full accent-indigo-400"
                 />
@@ -939,6 +1079,13 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                     suffix="px"
                     ariaLabel="Скругление углов"
                     onChange={(px) =>
+                      onUpdateClip(
+                        selectedClip.id,
+                        {borderRadius: px},
+                        {skipUndo: true}
+                      )
+                    }
+                    onCommit={(px) =>
                       onUpdateClip(selectedClip.id, {borderRadius: px})
                     }
                   />
@@ -950,8 +1097,20 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   step={4}
                   value={selectedClip.borderRadius ?? 20}
                   onChange={(e) =>
+                    onUpdateClip(
+                      selectedClip.id,
+                      {borderRadius: Number(e.target.value)},
+                      {skipUndo: true}
+                    )
+                  }
+                  onPointerUp={(e) =>
                     onUpdateClip(selectedClip.id, {
-                      borderRadius: Number(e.target.value),
+                      borderRadius: Number((e.target as HTMLInputElement).value),
+                    })
+                  }
+                  onTouchEnd={(e) =>
+                    onUpdateClip(selectedClip.id, {
+                      borderRadius: Number((e.target as HTMLInputElement).value),
                     })
                   }
                   className="w-full accent-indigo-400"
@@ -971,6 +1130,13 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                     suffix="px"
                     ariaLabel="Толщина рамки"
                     onChange={(px) =>
+                      onUpdateClip(
+                        selectedClip.id,
+                        {borderWidth: px},
+                        {skipUndo: true}
+                      )
+                    }
+                    onCommit={(px) =>
                       onUpdateClip(selectedClip.id, {borderWidth: px})
                     }
                   />
@@ -982,8 +1148,20 @@ export const OverlayPanel: React.FC<OverlayPanelProps> = ({
                   step={1}
                   value={selectedClip.borderWidth ?? 0}
                   onChange={(e) =>
+                    onUpdateClip(
+                      selectedClip.id,
+                      {borderWidth: Number(e.target.value)},
+                      {skipUndo: true}
+                    )
+                  }
+                  onPointerUp={(e) =>
                     onUpdateClip(selectedClip.id, {
-                      borderWidth: Number(e.target.value),
+                      borderWidth: Number((e.target as HTMLInputElement).value),
+                    })
+                  }
+                  onTouchEnd={(e) =>
+                    onUpdateClip(selectedClip.id, {
+                      borderWidth: Number((e.target as HTMLInputElement).value),
                     })
                   }
                   className="w-full accent-indigo-400"
@@ -1058,7 +1236,11 @@ export type {TextColorField} from './TextPanel.tsx';
 
 interface EffectsPanelProps {
   selectedClip: Clip | null;
-  onUpdateClip: (clipId: string, patch: Partial<Clip>) => void;
+  onUpdateClip: (
+    clipId: string,
+    patch: Partial<Clip>,
+    opts?: {skipUndo?: boolean; skipSync?: boolean}
+  ) => void;
   onAddAdjustmentLayer?: () => void;
 }
 
@@ -1258,6 +1440,13 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
               suffix="%"
               ariaLabel="Яркость"
               onChange={(pct) =>
+                onUpdateClip(
+                  selectedClip.id,
+                  {brightness: pct / 100},
+                  {skipUndo: true}
+                )
+              }
+              onCommit={(pct) =>
                 onUpdateClip(selectedClip.id, {brightness: pct / 100})
               }
             />
@@ -1269,8 +1458,20 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             step={0.05}
             value={selectedClip.brightness}
             onChange={(e) =>
+              onUpdateClip(
+                selectedClip.id,
+                {brightness: Number(e.target.value)},
+                {skipUndo: true}
+              )
+            }
+            onPointerUp={(e) =>
               onUpdateClip(selectedClip.id, {
-                brightness: Number(e.target.value),
+                brightness: Number((e.target as HTMLInputElement).value),
+              })
+            }
+            onTouchEnd={(e) =>
+              onUpdateClip(selectedClip.id, {
+                brightness: Number((e.target as HTMLInputElement).value),
               })
             }
             className="w-full accent-cyan-400"
@@ -1290,6 +1491,13 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
               suffix="%"
               ariaLabel="Контраст"
               onChange={(pct) =>
+                onUpdateClip(
+                  selectedClip.id,
+                  {contrast: pct / 100},
+                  {skipUndo: true}
+                )
+              }
+              onCommit={(pct) =>
                 onUpdateClip(selectedClip.id, {contrast: pct / 100})
               }
             />
@@ -1301,7 +1509,21 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             step={0.05}
             value={selectedClip.contrast}
             onChange={(e) =>
-              onUpdateClip(selectedClip.id, {contrast: Number(e.target.value)})
+              onUpdateClip(
+                selectedClip.id,
+                {contrast: Number(e.target.value)},
+                {skipUndo: true}
+              )
+            }
+            onPointerUp={(e) =>
+              onUpdateClip(selectedClip.id, {
+                contrast: Number((e.target as HTMLInputElement).value),
+              })
+            }
+            onTouchEnd={(e) =>
+              onUpdateClip(selectedClip.id, {
+                contrast: Number((e.target as HTMLInputElement).value),
+              })
             }
             className="w-full accent-cyan-400"
           />
@@ -1320,6 +1542,13 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
               suffix="%"
               ariaLabel="Насыщенность"
               onChange={(pct) =>
+                onUpdateClip(
+                  selectedClip.id,
+                  {saturate: pct / 100},
+                  {skipUndo: true}
+                )
+              }
+              onCommit={(pct) =>
                 onUpdateClip(selectedClip.id, {saturate: pct / 100})
               }
             />
@@ -1331,7 +1560,21 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             step={0.05}
             value={selectedClip.saturate}
             onChange={(e) =>
-              onUpdateClip(selectedClip.id, {saturate: Number(e.target.value)})
+              onUpdateClip(
+                selectedClip.id,
+                {saturate: Number(e.target.value)},
+                {skipUndo: true}
+              )
+            }
+            onPointerUp={(e) =>
+              onUpdateClip(selectedClip.id, {
+                saturate: Number((e.target as HTMLInputElement).value),
+              })
+            }
+            onTouchEnd={(e) =>
+              onUpdateClip(selectedClip.id, {
+                saturate: Number((e.target as HTMLInputElement).value),
+              })
             }
             className="w-full accent-cyan-400"
           />
@@ -1350,6 +1593,13 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
               suffix="%"
               ariaLabel="Прозрачность"
               onChange={(pct) =>
+                onUpdateClip(
+                  selectedClip.id,
+                  {opacity: pct / 100},
+                  {skipUndo: true}
+                )
+              }
+              onCommit={(pct) =>
                 onUpdateClip(selectedClip.id, {opacity: pct / 100})
               }
             />
@@ -1361,7 +1611,21 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             step={0.01}
             value={selectedClip.opacity}
             onChange={(e) =>
-              onUpdateClip(selectedClip.id, {opacity: Number(e.target.value)})
+              onUpdateClip(
+                selectedClip.id,
+                {opacity: Number(e.target.value)},
+                {skipUndo: true}
+              )
+            }
+            onPointerUp={(e) =>
+              onUpdateClip(selectedClip.id, {
+                opacity: Number((e.target as HTMLInputElement).value),
+              })
+            }
+            onTouchEnd={(e) =>
+              onUpdateClip(selectedClip.id, {
+                opacity: Number((e.target as HTMLInputElement).value),
+              })
             }
             className="w-full accent-cyan-400"
           />
@@ -1379,7 +1643,10 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
               step={1}
               suffix="px"
               ariaLabel="Размытие"
-              onChange={(px) => onUpdateClip(selectedClip.id, {blur: px})}
+              onChange={(px) =>
+                onUpdateClip(selectedClip.id, {blur: px}, {skipUndo: true})
+              }
+              onCommit={(px) => onUpdateClip(selectedClip.id, {blur: px})}
             />
           </div>
           <input
@@ -1389,7 +1656,21 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             step={1}
             value={selectedClip.blur ?? 0}
             onChange={(e) =>
-              onUpdateClip(selectedClip.id, {blur: Number(e.target.value)})
+              onUpdateClip(
+                selectedClip.id,
+                {blur: Number(e.target.value)},
+                {skipUndo: true}
+              )
+            }
+            onPointerUp={(e) =>
+              onUpdateClip(selectedClip.id, {
+                blur: Number((e.target as HTMLInputElement).value),
+              })
+            }
+            onTouchEnd={(e) =>
+              onUpdateClip(selectedClip.id, {
+                blur: Number((e.target as HTMLInputElement).value),
+              })
             }
             className="w-full accent-cyan-400"
           />
@@ -1408,6 +1689,13 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
               suffix="%"
               ariaLabel="Виньетка"
               onChange={(pct) =>
+                onUpdateClip(
+                  selectedClip.id,
+                  {vignette: pct / 100},
+                  {skipUndo: true}
+                )
+              }
+              onCommit={(pct) =>
                 onUpdateClip(selectedClip.id, {vignette: pct / 100})
               }
             />
@@ -1419,7 +1707,21 @@ export const EffectsPanel: React.FC<EffectsPanelProps> = ({
             step={0.05}
             value={selectedClip.vignette ?? 0}
             onChange={(e) =>
-              onUpdateClip(selectedClip.id, {vignette: Number(e.target.value)})
+              onUpdateClip(
+                selectedClip.id,
+                {vignette: Number(e.target.value)},
+                {skipUndo: true}
+              )
+            }
+            onPointerUp={(e) =>
+              onUpdateClip(selectedClip.id, {
+                vignette: Number((e.target as HTMLInputElement).value),
+              })
+            }
+            onTouchEnd={(e) =>
+              onUpdateClip(selectedClip.id, {
+                vignette: Number((e.target as HTMLInputElement).value),
+              })
             }
             className="w-full accent-cyan-400"
           />
@@ -1449,6 +1751,8 @@ interface TeamPanelProps {
   availableRooms: RoomSummary[];
   chat: ChatMessage[];
   status: 'connecting' | 'connected' | 'reconnecting' | 'offline';
+  syncStatus?: 'synced' | 'syncing' | 'offline';
+  localRevision?: number;
   onUpdateProfile: (name: string, color: string) => void;
   onOpenLobby: () => void;
   onSwitchRoom: (nextRoomId: string) => void;
@@ -1486,6 +1790,8 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
   availableRooms,
   chat,
   status,
+  syncStatus = 'synced',
+  localRevision = 0,
   onUpdateProfile,
   onOpenLobby,
   onSwitchRoom,
@@ -1622,10 +1928,36 @@ export const TeamPanel: React.FC<TeamPanelProps> = ({
             type="button"
             onClick={onForceSyncProject}
             disabled={status === 'offline'}
-            className="flex h-8 w-full items-center justify-center gap-1.5 rounded-lg border border-cyan-500/35 bg-cyan-500/10 text-[11px] font-semibold text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-45"
+            className={`flex h-9 w-full items-center justify-between gap-2 rounded-lg border px-3 text-[11px] font-semibold transition disabled:opacity-45 ${
+              status === 'connected' && syncStatus === 'synced'
+                ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-200 hover:bg-emerald-500/20'
+                : 'border-amber-500/40 bg-amber-500/10 text-amber-200 hover:bg-amber-500/20'
+            }`}
           >
-            <RefreshCw className="h-3.5 w-3.5" />
-            <span>Принудительно синхронизировать проект</span>
+            <span className="flex items-center gap-1.5 min-w-0">
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  status === 'connected' && syncStatus === 'synced'
+                    ? 'bg-emerald-400'
+                    : 'bg-amber-400 animate-pulse'
+                }`}
+              />
+              <RefreshCw
+                className={`h-3.5 w-3.5 shrink-0 ${
+                  syncStatus === 'syncing' ? 'animate-spin' : ''
+                }`}
+              />
+              <span className="truncate">
+                {status === 'offline'
+                  ? 'Оффлайн (синхронизация)'
+                  : status === 'connected' && syncStatus === 'synced'
+                    ? 'Синхронизировано'
+                    : 'Синхронизация...'}
+              </span>
+            </span>
+            <span className="shrink-0 font-mono text-[10px] opacity-80">
+              v{localRevision} · Ресинк
+            </span>
           </button>
         )}
       </div>

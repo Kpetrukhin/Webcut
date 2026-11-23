@@ -14,6 +14,8 @@ import {
   createDefaultTracks,
   createStarterClips,
   encodePatchForSync,
+  evaluateDeltaRevision,
+  evaluateEphemeralRevision,
   normalizeProjectTracks,
 } from '../src/shared/types.ts';
 import type {
@@ -1882,5 +1884,304 @@ test('Волшебная палочка (MobileSAM): трассировка ко
   assert.equal(clipDraft.shapeStyle?.strokeWidth, 0);
   assert.equal(clipDraft.shapeStyle?.points?.length, pts.length);
 });
+
+test('State Versioning: evaluateDeltaRevision и evaluateEphemeralRevision (последовательность, дубли, разрыв ревизий)', () => {
+  assert.deepEqual(evaluateDeltaRevision(0, 1), {
+    action: 'apply',
+    nextRevision: 1,
+  });
+  assert.deepEqual(evaluateDeltaRevision(4, 5), {
+    action: 'apply',
+    nextRevision: 5,
+  });
+  assert.deepEqual(evaluateDeltaRevision(5, 5), {
+    action: 'ignore_stale',
+    currentRevision: 5,
+    receivedRevision: 5,
+  });
+  assert.deepEqual(evaluateDeltaRevision(5, 3), {
+    action: 'ignore_stale',
+    currentRevision: 5,
+    receivedRevision: 3,
+  });
+  assert.deepEqual(evaluateDeltaRevision(5, 7), {
+    action: 'resync',
+    reason: 'gap',
+    expectedRevision: 6,
+    receivedRevision: 7,
+  });
+
+  assert.deepEqual(evaluateEphemeralRevision(3, 3), {
+    action: 'apply_preview',
+  });
+  assert.deepEqual(evaluateEphemeralRevision(3, 2), {
+    action: 'ignore_stale',
+  });
+  assert.deepEqual(evaluateEphemeralRevision(3, 4), {
+    action: 'resync',
+    reason: 'gap',
+    expectedRevision: 3,
+    receivedRevision: 4,
+  });
+});
+
+test('WebSocket Auto-Resync E2E: revision=0, ephemeral drag без инкремента, sync:ack и восстановление через REQUEST_SYNC при потере пакета', async () => {
+  process.env.CUTSYNC_NO_AUTOSTART = '1';
+
+  const roomsFile = path.join(process.cwd(), 'data', 'rooms.json');
+  const hadRoomsFile = fs.existsSync(roomsFile);
+  const prevRoomsContent = hadRoomsFile
+    ? fs.readFileSync(roomsFile, 'utf-8')
+    : null;
+
+  const {startServer, stopServer} = await import('../server.ts');
+  const {port} = await startServer({
+    port: 0,
+    disableVite: true,
+    disableBeacon: true,
+    lockTimeoutMs: 1200,
+  });
+
+  const wsUrl = `ws://127.0.0.1:${port}/sync`;
+  const roomId = `resync-e2e-${Date.now()}`;
+
+  const connectClient = async (user: {
+    id: string;
+    name: string;
+    color: string;
+  }) => {
+    const ws = new WebSocket(wsUrl);
+    const queue: ServerWsMessage[] = [];
+    const waiters: Array<{
+      pred: (m: ServerWsMessage) => boolean;
+      resolve: (m: ServerWsMessage) => void;
+      reject: (e: Error) => void;
+    }> = [];
+
+    ws.on('message', (raw) => {
+      const msg = JSON.parse(raw.toString()) as ServerWsMessage;
+      const idx = waiters.findIndex((w) => w.pred(msg));
+      if (idx !== -1) {
+        const w = waiters.splice(idx, 1)[0];
+        w.resolve(msg);
+      } else {
+        queue.push(msg);
+      }
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve());
+      ws.once('error', reject);
+    });
+
+    const waitFor = <T extends ServerWsMessage['type']>(
+      type: T,
+      pred?: (m: Extract<ServerWsMessage, {type: T}>) => boolean,
+      timeoutMs = 3000
+    ): Promise<Extract<ServerWsMessage, {type: T}>> => {
+      const idx = queue.findIndex(
+        (m) =>
+          m.type === type &&
+          (!pred || pred(m as Extract<ServerWsMessage, {type: T}>))
+      );
+      if (idx !== -1) {
+        return Promise.resolve(
+          queue.splice(idx, 1)[0] as Extract<ServerWsMessage, {type: T}>
+        );
+      }
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error(`Timeout waiting for ${type}`)),
+          timeoutMs
+        );
+        waiters.push({
+          pred: (m) =>
+            m.type === type &&
+            (!pred || pred(m as Extract<ServerWsMessage, {type: T}>)),
+          resolve: (m) => {
+            clearTimeout(timer);
+            resolve(m as Extract<ServerWsMessage, {type: T}>);
+          },
+          reject: (e) => {
+            clearTimeout(timer);
+            reject(e);
+          },
+        });
+      });
+    };
+
+    ws.send(JSON.stringify({type: 'join', roomId, user}));
+    const init = await waitFor('room:init');
+    return {ws, init, waitFor};
+  };
+
+  let aliceWs: WebSocket | null = null;
+  let bobWs: WebSocket | null = null;
+
+  try {
+    const alice = await connectClient({
+      id: 'alice-rev',
+      name: 'Алиса',
+      color: '#22d3ee',
+    });
+    aliceWs = alice.ws;
+    const bob = await connectClient({
+      id: 'bob-rev',
+      name: 'Боб',
+      color: '#f97316',
+    });
+    bobWs = bob.ws;
+
+    // 1. Начальная ревизия комнаты === 0
+    assert.equal(alice.init.revision, 0);
+    assert.equal(alice.init.prevRevision, 0);
+    assert.equal(alice.init.project.revision, 0);
+    let bobLocalRevision = bob.init.revision;
+    assert.equal(bobLocalRevision, 0);
+
+    const targetClipId = alice.init.project.clips[0]?.id;
+    assert.ok(targetClipId);
+    const origMediaX = alice.init.project.clips[0]?.mediaX ?? 0.5;
+
+    // 2. Ephemeral drag: стримится пиру с revision=0, не меняет серверный снапшот
+    alice.ws.send(
+      JSON.stringify({
+        type: 'op:clip_update',
+        clipId: targetClipId,
+        patch: {mediaX: 0.18},
+        ephemeral: true,
+      })
+    );
+    const ephMsg = await bob.waitFor(
+      'op:clip_update',
+      (m) => m.clipId === targetClipId && m.ephemeral === true
+    );
+    assert.equal(ephMsg.revision, 0);
+    assert.equal(ephMsg.prevRevision, 0);
+    assert.equal(ephMsg.patch.mediaX, 0.18);
+    assert.deepEqual(
+      evaluateEphemeralRevision(bobLocalRevision, ephMsg.revision),
+      {action: 'apply_preview'}
+    );
+
+    // REQUEST_SYNC подтверждает, что ephemeral не инкрементировал revision и не перезаписал снапшот
+    bob.ws.send(
+      JSON.stringify({type: 'REQUEST_SYNC', clientRevision: bobLocalRevision})
+    );
+    const snapAfterEph = await bob.waitFor('SYNC_FULL_STATE');
+    assert.equal(snapAfterEph.revision, 0);
+    assert.equal(snapAfterEph.prevRevision, 0);
+    assert.equal(
+      snapAfterEph.project.clips.find((c) => c.id === targetClipId)?.mediaX ??
+        0.5,
+      origMediaX
+    );
+
+    // 3. Финальный коммит (pointerup): увеличивает revision 0 -> 1 и шлёт sync:ack отправителю
+    alice.ws.send(
+      JSON.stringify({
+        type: 'op:clip_update',
+        clipId: targetClipId,
+        patch: {mediaX: 0.72, rotation: 15},
+      })
+    );
+    const [ack1, delta1] = await Promise.all([
+      alice.waitFor('sync:ack', (m) => m.revision === 1),
+      bob.waitFor(
+        'op:clip_update',
+        (m) => m.clipId === targetClipId && !m.ephemeral
+      ),
+    ]);
+    assert.equal(ack1.prevRevision, 0);
+    assert.equal(ack1.opType, 'op:clip_update');
+    assert.equal(delta1.prevRevision, 0);
+    assert.equal(delta1.revision, 1);
+
+    const d1 = evaluateDeltaRevision(bobLocalRevision, delta1.revision);
+    assert.deepEqual(d1, {action: 'apply', nextRevision: 1});
+    bobLocalRevision = 1;
+
+    // 4. Имитация потери пакета: Алиса делает ещё 2 коммита (rev 2 и rev 3),
+    //    Боб "теряет" rev 2 и видит rev 3 при bobLocalRevision=1 -> REQUEST_SYNC
+    alice.ws.send(
+      JSON.stringify({
+        type: 'op:clip_update',
+        clipId: targetClipId,
+        patch: {rotation: 30},
+      })
+    );
+    const delta2Lost = await bob.waitFor(
+      'op:clip_update',
+      (m) => m.revision === 2
+    );
+    assert.equal(delta2Lost.revision, 2);
+    // intentionally NOT updating bobLocalRevision to simulate dropped packet #2
+
+    alice.ws.send(
+      JSON.stringify({
+        type: 'op:clip_update',
+        clipId: targetClipId,
+        patch: {opacity: 0.65, rotation: 45},
+      })
+    );
+    const delta3 = await bob.waitFor(
+      'op:clip_update',
+      (m) => m.revision === 3
+    );
+    assert.equal(delta3.prevRevision, 2);
+    assert.equal(delta3.revision, 3);
+
+    const gapDecision = evaluateDeltaRevision(
+      bobLocalRevision,
+      delta3.revision
+    );
+    assert.deepEqual(gapDecision, {
+      action: 'resync',
+      reason: 'gap',
+      expectedRevision: 2,
+      receivedRevision: 3,
+    });
+
+    bob.ws.send(
+      JSON.stringify({type: 'REQUEST_SYNC', clientRevision: bobLocalRevision})
+    );
+    const recovered = await bob.waitFor(
+      'SYNC_FULL_STATE',
+      (m) => m.revision === 3
+    );
+    assert.equal(recovered.prevRevision, 3);
+    assert.equal(recovered.project.revision, 3);
+    const recoveredClip = recovered.project.clips.find(
+      (c) => c.id === targetClipId
+    );
+    assert.ok(recoveredClip);
+    assert.equal(recoveredClip.mediaX, 0.72);
+    assert.equal(recoveredClip.rotation, 45);
+    assert.equal(recoveredClip.opacity, 0.65);
+  } finally {
+    try {
+      aliceWs?.terminate();
+    } catch {
+      // ignore
+    }
+    try {
+      bobWs?.terminate();
+    } catch {
+      // ignore
+    }
+    await stopServer();
+    await new Promise((r) => setTimeout(r, 350));
+    try {
+      if (hadRoomsFile && prevRoomsContent !== null) {
+        fs.writeFileSync(roomsFile, prevRoomsContent, 'utf-8');
+      } else if (!hadRoomsFile && fs.existsSync(roomsFile)) {
+        fs.unlinkSync(roomsFile);
+      }
+    } catch {
+      // ignore
+    }
+  }
+});
+
 
 

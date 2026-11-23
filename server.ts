@@ -262,7 +262,7 @@ function createDefaultProject(
     trackers: [],
     tracks: createDefaultTracks(),
     clips: opts?.blank ? [] : createStarterClips(),
-    revision: 1,
+    revision: 0,
     updatedAt: Date.now(),
     chat: [
       {
@@ -401,6 +401,24 @@ function broadcastToRoom(
     if (conn.ws.readyState === WebSocket.OPEN) {
       conn.ws.send(serialized);
     }
+  }
+}
+
+function sendSyncAck(
+  ws: WebSocket,
+  revision: number,
+  prevRevision: number,
+  opType?: string
+) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(
+      JSON.stringify({
+        type: 'sync:ack',
+        revision,
+        prevRevision,
+        opType,
+      } satisfies ServerWsMessage)
+    );
   }
 }
 
@@ -982,6 +1000,8 @@ targetWss.on('connection', (ws) => {
       const initPayload: ServerWsMessage = {
         type: 'room:init',
         project,
+        revision: project.revision,
+        prevRevision: project.revision,
         collaborators: getRoomCollaborators(roomId),
         rooms: getPublicRoomSummaries(),
       };
@@ -1004,11 +1024,13 @@ targetWss.on('connection', (ws) => {
     if (!project) return;
     session.user.lastActive = Date.now();
 
-    if (msg.type === 'SYNC_FULL_STATE') {
+    if (msg.type === 'REQUEST_SYNC' || msg.type === 'SYNC_FULL_STATE') {
       ws.send(
         JSON.stringify({
           type: 'SYNC_FULL_STATE',
           project,
+          revision: project.revision,
+          prevRevision: project.revision,
           collaborators: getRoomCollaborators(session.roomId),
           rooms: getPublicRoomSummaries(),
         } satisfies ServerWsMessage)
@@ -1031,6 +1053,7 @@ targetWss.on('connection', (ws) => {
       case 'op:track_add': {
         if (project.tracks.some((t) => t.id === msg.track.id)) return;
         project.tracks = insertTrackAt(project.tracks, msg.track, msg.insertAt);
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1041,10 +1064,12 @@ targetWss.on('connection', (ws) => {
             track: msg.track,
             insertAt: msg.insertAt,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }
@@ -1057,6 +1082,7 @@ targetWss.on('connection', (ws) => {
           ...msg.patch,
           id: project.tracks[idx].id,
         };
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1067,10 +1093,12 @@ targetWss.on('connection', (ws) => {
             trackId: msg.trackId,
             patch: msg.patch,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         break;
       }
 
@@ -1078,6 +1106,7 @@ targetWss.on('connection', (ws) => {
         if (project.tracks.length <= 1) return;
         project.tracks = project.tracks.filter((t) => t.id !== msg.trackId);
         project.clips = project.clips.filter((c) => c.trackId !== msg.trackId);
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1087,16 +1116,19 @@ targetWss.on('connection', (ws) => {
             type: 'op:track_delete',
             trackId: msg.trackId,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }
 
       case 'op:track_reorder': {
         project.tracks = applyTrackReorder(project.tracks, msg.trackIds);
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1106,10 +1138,12 @@ targetWss.on('connection', (ws) => {
             type: 'op:track_reorder',
             trackIds: msg.trackIds,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         break;
       }
 
@@ -1123,6 +1157,7 @@ targetWss.on('connection', (ws) => {
           );
         }
         project.clips.push(msg.clip);
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1134,10 +1169,12 @@ targetWss.on('connection', (ws) => {
             newTrack: msg.newTrack,
             insertAt: msg.insertAt,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }
@@ -1145,13 +1182,30 @@ targetWss.on('connection', (ws) => {
       case 'op:clip_update': {
         const idx = project.clips.findIndex((c) => c.id === msg.clipId);
         if (idx === -1) return;
+        if (project.clips[idx].lockedByUserId === session.user.id) {
+          touchLayerLock(session.roomId, msg.clipId);
+        }
+        if (msg.ephemeral === true) {
+          broadcastToRoom(
+            session.roomId,
+            {
+              type: 'op:clip_update',
+              clipId: msg.clipId,
+              patch: msg.patch,
+              ephemeral: true,
+              revision: project.revision,
+              prevRevision: project.revision,
+              senderId: session.user.id,
+            },
+            ws
+          );
+          break;
+        }
         project.clips[idx] = applyClipPatch(
           project.clips[idx],
           msg.patch as Record<string, unknown>
         );
-        if (project.clips[idx].lockedByUserId === session.user.id) {
-          touchLayerLock(session.roomId, msg.clipId);
-        }
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1162,10 +1216,12 @@ targetWss.on('connection', (ws) => {
             clipId: msg.clipId,
             patch: msg.patch,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         break;
       }
 
@@ -1173,6 +1229,7 @@ targetWss.on('connection', (ws) => {
         const prevLen = project.clips.length;
         project.clips = project.clips.filter((c) => c.id !== msg.clipId);
         if (project.clips.length === prevLen) return;
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1182,10 +1239,12 @@ targetWss.on('connection', (ws) => {
             type: 'op:clip_delete',
             clipId: msg.clipId,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }
@@ -1199,6 +1258,7 @@ targetWss.on('connection', (ws) => {
         );
         if (nextClips === project.clips) return;
         project.clips = nextClips;
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1210,10 +1270,12 @@ targetWss.on('connection', (ws) => {
             splitTime: msg.splitTime,
             newClipId: msg.newClipId,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         break;
       }
 
@@ -1225,6 +1287,7 @@ targetWss.on('connection', (ws) => {
         );
         if (nextClips === project.clips) return;
         project.clips = nextClips;
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1235,10 +1298,12 @@ targetWss.on('connection', (ws) => {
             clipId: msg.clipId,
             newClipId: msg.newClipId,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }
@@ -1268,6 +1333,7 @@ targetWss.on('connection', (ws) => {
         if (typeof msg.patch.isPublicLan === 'boolean') {
           project.isPublicLan = msg.patch.isPublicLan;
         }
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1277,10 +1343,12 @@ targetWss.on('connection', (ws) => {
             type: 'op:project_meta',
             patch: msg.patch,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }
@@ -1302,6 +1370,7 @@ targetWss.on('connection', (ws) => {
         if (Array.isArray(msg.trackers)) {
           project.trackers = msg.trackers;
         }
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1318,10 +1387,12 @@ targetWss.on('connection', (ws) => {
             customFonts: project.customFonts,
             trackers: project.trackers,
             revision: project.revision,
+            prevRevision,
             senderId: session.user.id,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }
@@ -1406,6 +1477,7 @@ targetWss.on('connection', (ws) => {
             mediaFileHash: msg.fileHash ?? msg.clip.mediaFileHash,
           });
         }
+        const prevRevision = project.revision;
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1423,9 +1495,11 @@ targetWss.on('connection', (ws) => {
             newTrack: msg.newTrack,
             insertAt: msg.insertAt,
             revision: project.revision,
+            prevRevision,
           },
           ws
         );
+        sendSyncAck(ws, project.revision, prevRevision, msg.type);
         broadcastLobbyRooms();
         break;
       }

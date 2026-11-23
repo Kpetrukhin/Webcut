@@ -486,7 +486,7 @@ export type ClientWsMessage =
   | {type: 'op:track_delete'; trackId: string}
   | {type: 'op:track_reorder'; trackIds: string[]}
   | {type: 'op:clip_add'; clip: Clip; newTrack?: Track; insertAt?: number}
-  | {type: 'op:clip_update'; clipId: string; patch: Partial<Clip>}
+  | {type: 'op:clip_update'; clipId: string; patch: Partial<Clip>; ephemeral?: boolean}
   | {type: 'op:clip_delete'; clipId: string}
   | {type: 'op:clip_duplicate'; clipId: string; newClipId: string}
   | {
@@ -530,6 +530,7 @@ export type ClientWsMessage =
     }
   | {type: 'chat:send'; text: string; messageId: string}
   | {type: 'ping'; ts: number}
+  | {type: 'REQUEST_SYNC'; clientRevision?: number}
   | {type: 'SYNC_FULL_STATE'}
   | {
       type: 'LAYER_MEDIA_UPDATED';
@@ -556,6 +557,8 @@ export type ServerWsMessage =
   | {
       type: 'room:init';
       project: ProjectState;
+      revision: number;
+      prevRevision: number;
       collaborators: Collaborator[];
       rooms: RoomSummary[];
     }
@@ -565,6 +568,7 @@ export type ServerWsMessage =
       track: Track;
       insertAt?: number;
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
   | {
@@ -572,13 +576,21 @@ export type ServerWsMessage =
       trackId: string;
       patch: Partial<Track>;
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
-  | {type: 'op:track_delete'; trackId: string; revision: number; senderId: string}
+  | {
+      type: 'op:track_delete';
+      trackId: string;
+      revision: number;
+      prevRevision: number;
+      senderId: string;
+    }
   | {
       type: 'op:track_reorder';
       trackIds: string[];
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
   | {
@@ -587,21 +599,31 @@ export type ServerWsMessage =
       newTrack?: Track;
       insertAt?: number;
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
   | {
       type: 'op:clip_update';
       clipId: string;
       patch: Partial<Clip>;
+      ephemeral?: boolean;
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
-  | {type: 'op:clip_delete'; clipId: string; revision: number; senderId: string}
+  | {
+      type: 'op:clip_delete';
+      clipId: string;
+      revision: number;
+      prevRevision: number;
+      senderId: string;
+    }
   | {
       type: 'op:clip_duplicate';
       clipId: string;
       newClipId: string;
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
   | {
@@ -610,6 +632,7 @@ export type ServerWsMessage =
       splitTime: number;
       newClipId: string;
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
   | {
@@ -628,6 +651,7 @@ export type ServerWsMessage =
         >
       >;
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
   | {
@@ -641,14 +665,23 @@ export type ServerWsMessage =
       customFonts?: ProjectFont[];
       trackers?: MotionTrackerBeacon[];
       revision: number;
+      prevRevision: number;
       senderId: string;
     }
   | {type: 'presence:update'; collaborators: Collaborator[]}
   | {type: 'chat:message'; message: ChatMessage}
   | {type: 'pong'; ts: number; serverTime?: number}
   | {
+      type: 'sync:ack';
+      revision: number;
+      prevRevision: number;
+      opType?: string;
+    }
+  | {
       type: 'SYNC_FULL_STATE';
       project: ProjectState;
+      revision: number;
+      prevRevision: number;
       collaborators: Collaborator[];
       rooms: RoomSummary[];
     }
@@ -663,7 +696,8 @@ export type ServerWsMessage =
       clip?: Clip;
       newTrack?: Track;
       insertAt?: number;
-      revision?: number;
+      revision: number;
+      prevRevision: number;
     }
   | {
       type: 'LAYER_LOCK';
@@ -674,6 +708,70 @@ export type ServerWsMessage =
       locked: boolean;
     }
   | {type: 'error'; message: string};
+
+export type DeltaRevisionDecision =
+  | {action: 'apply'; nextRevision: number}
+  | {
+      action: 'resync';
+      reason: 'gap';
+      expectedRevision: number;
+      receivedRevision: number;
+    }
+  | {
+      action: 'ignore_stale';
+      currentRevision: number;
+      receivedRevision: number;
+    };
+
+export function evaluateDeltaRevision(
+  localRevision: number,
+  incomingRevision: number
+): DeltaRevisionDecision {
+  if (incomingRevision <= localRevision) {
+    return {
+      action: 'ignore_stale',
+      currentRevision: localRevision,
+      receivedRevision: incomingRevision,
+    };
+  }
+  if (incomingRevision === localRevision + 1) {
+    return {action: 'apply', nextRevision: incomingRevision};
+  }
+  return {
+    action: 'resync',
+    reason: 'gap',
+    expectedRevision: localRevision + 1,
+    receivedRevision: incomingRevision,
+  };
+}
+
+export type EphemeralRevisionDecision =
+  | {action: 'apply_preview'}
+  | {
+      action: 'resync';
+      reason: 'gap';
+      expectedRevision: number;
+      receivedRevision: number;
+    }
+  | {action: 'ignore_stale'};
+
+export function evaluateEphemeralRevision(
+  localRevision: number,
+  incomingRevision: number
+): EphemeralRevisionDecision {
+  if (incomingRevision < localRevision) {
+    return {action: 'ignore_stale'};
+  }
+  if (incomingRevision > localRevision) {
+    return {
+      action: 'resync',
+      reason: 'gap',
+      expectedRevision: localRevision,
+      receivedRevision: incomingRevision,
+    };
+  }
+  return {action: 'apply_preview'};
+}
 
 export const SAMPLE_MEDIA_ASSETS: MediaAsset[] = [
   {
@@ -899,6 +997,12 @@ export function normalizeProjectTracks(project: ProjectState): ProjectState {
 
   return {
     ...project,
+    revision:
+      typeof project.revision === 'number' &&
+      Number.isFinite(project.revision) &&
+      project.revision >= 0
+        ? project.revision
+        : 0,
     backgroundColor: project.backgroundColor || '#09090b',
     canvasBackground: project.canvasBackground ?? {
       type: 'solid',

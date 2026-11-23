@@ -235,7 +235,7 @@ export const ShapesPanel: React.FC<ShapesPanelProps> = ({
     onUpdateClip(
       selectedClip.id,
       {shapeStyle: next},
-      {skipUndo: !commit, skipSync: !commit}
+      {skipUndo: !commit}
     );
   };
 

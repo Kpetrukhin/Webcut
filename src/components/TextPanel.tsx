@@ -76,7 +76,7 @@ interface TextPanelProps {
   onUpdateClip: (
     clipId: string,
     patch: Partial<Clip>,
-    opts?: {skipUndo?: boolean; skipSync?: boolean}
+    opts?: {skipUndo?: boolean}
   ) => void;
   onAddCustomFont: (font: ProjectFont) => void;
   onOpenTrackpad?: () => void;
@@ -268,7 +268,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
 
   const updateStyle = (
     patch: Partial<TextStyle>,
-    opts?: {skipUndo?: boolean; skipSync?: boolean}
+    opts?: {skipUndo?: boolean}
   ) => {
     if (!selectedClip || !isTextSelected) return;
     const next: TextStyle = {
@@ -952,7 +952,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                   suffix="px"
                   ariaLabel="Размер текста"
                   onChange={(px) =>
-                    updateStyle({fontSize: px}, {skipUndo: true, skipSync: true})
+                    updateStyle({fontSize: px}, {skipUndo: true})
                   }
                   onCommit={(px) => updateStyle({fontSize: px})}
                 />
@@ -965,7 +965,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                   onChange={(e) =>
                     updateStyle(
                       {fontSize: Number(e.target.value)},
-                      {skipUndo: true, skipSync: true}
+                      {skipUndo: true}
                     )
                   }
                   onPointerUp={(e) =>
@@ -1021,7 +1021,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                 onChange={(w) =>
                   updateStyle(
                     {strokeWidth: w, outline: w > 0},
-                    {skipUndo: true, skipSync: true}
+                    {skipUndo: true}
                   )
                 }
                 onCommit={(w) =>
@@ -1083,10 +1083,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     suffix="px"
                     ariaLabel="Смещение тени X"
                     onChange={(v) =>
-                      updateStyle(
-                        {shadowOffsetX: v},
-                        {skipUndo: true, skipSync: true}
-                      )
+                      updateStyle({shadowOffsetX: v}, {skipUndo: true})
                     }
                     onCommit={(v) => updateStyle({shadowOffsetX: v})}
                   />
@@ -1103,10 +1100,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     suffix="px"
                     ariaLabel="Смещение тени Y"
                     onChange={(v) =>
-                      updateStyle(
-                        {shadowOffsetY: v},
-                        {skipUndo: true, skipSync: true}
-                      )
+                      updateStyle({shadowOffsetY: v}, {skipUndo: true})
                     }
                     onCommit={(v) => updateStyle({shadowOffsetY: v})}
                   />
@@ -1123,10 +1117,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     suffix="px"
                     ariaLabel="Размытие тени"
                     onChange={(v) =>
-                      updateStyle(
-                        {shadowBlur: v},
-                        {skipUndo: true, skipSync: true}
-                      )
+                      updateStyle({shadowBlur: v}, {skipUndo: true})
                     }
                     onCommit={(v) => updateStyle({shadowBlur: v})}
                   />
@@ -1184,10 +1175,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                       suffix="%"
                       ariaLabel="Прозрачность фона текста"
                       onChange={(pct) =>
-                        updateStyle(
-                          {bgOpacity: pct / 100},
-                          {skipUndo: true, skipSync: true}
-                        )
+                        updateStyle({bgOpacity: pct / 100}, {skipUndo: true})
                       }
                       onCommit={(pct) =>
                         updateStyle({bgOpacity: pct / 100})
@@ -1202,7 +1190,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                       onChange={(e) =>
                         updateStyle(
                           {bgOpacity: Number(e.target.value) / 100},
-                          {skipUndo: true, skipSync: true}
+                          {skipUndo: true}
                         )
                       }
                       onPointerUp={(e) =>
@@ -1262,10 +1250,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                 suffix="px"
                 ariaLabel="Межбуквенный интервал"
                 onChange={(v) =>
-                  updateStyle(
-                    {letterSpacing: v},
-                    {skipUndo: true, skipSync: true}
-                  )
+                  updateStyle({letterSpacing: v}, {skipUndo: true})
                 }
                 onCommit={(v) => updateStyle({letterSpacing: v})}
               />
@@ -1278,7 +1263,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                 onChange={(e) =>
                   updateStyle(
                     {letterSpacing: Number(e.target.value)},
-                    {skipUndo: true, skipSync: true}
+                    {skipUndo: true}
                   )
                 }
                 onPointerUp={(e) =>
@@ -1308,7 +1293,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                 suffix="x"
                 ariaLabel="Межстрочный интервал"
                 onChange={(v) =>
-                  updateStyle({lineHeight: v}, {skipUndo: true, skipSync: true})
+                  updateStyle({lineHeight: v}, {skipUndo: true})
                 }
                 onCommit={(v) => updateStyle({lineHeight: v})}
               />
@@ -1321,7 +1306,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                 onChange={(e) =>
                   updateStyle(
                     {lineHeight: Number(e.target.value)},
-                    {skipUndo: true, skipSync: true}
+                    {skipUndo: true}
                   )
                 }
                 onPointerUp={(e) =>
@@ -1351,7 +1336,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                 suffix="x"
                 ariaLabel="Ширина пробела"
                 onChange={(v) =>
-                  updateStyle({spaceWidth: v}, {skipUndo: true, skipSync: true})
+                  updateStyle({spaceWidth: v}, {skipUndo: true})
                 }
                 onCommit={(v) => updateStyle({spaceWidth: v})}
               />
@@ -1364,7 +1349,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                 onChange={(e) =>
                   updateStyle(
                     {spaceWidth: Number(e.target.value)},
-                    {skipUndo: true, skipSync: true}
+                    {skipUndo: true}
                   )
                 }
                 onPointerUp={(e) =>
@@ -1635,7 +1620,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                         );
                         updateStyle(
                           {curvePoints: nextPts},
-                          commit ? undefined : {skipUndo: true, skipSync: true}
+                          commit ? undefined : {skipUndo: true}
                         );
                       };
                       return (
@@ -1693,10 +1678,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     suffix="%"
                     ariaLabel="Сглаживание линии"
                     onChange={(v) =>
-                      updateStyle(
-                        {curveSmoothness: v},
-                        {skipUndo: true, skipSync: true}
-                      )
+                      updateStyle({curveSmoothness: v}, {skipUndo: true})
                     }
                     onCommit={(v) => updateStyle({curveSmoothness: v})}
                   />
@@ -1709,7 +1691,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     onChange={(e) =>
                       updateStyle(
                         {curveSmoothness: Number(e.target.value)},
-                        {skipUndo: true, skipSync: true}
+                        {skipUndo: true}
                       )
                     }
                     onPointerUp={(e) =>
@@ -1746,10 +1728,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     suffix="%"
                     ariaLabel="Сила изгиба / Амплитуда"
                     onChange={(v) =>
-                      updateStyle(
-                        {curveAmplitude: v},
-                        {skipUndo: true, skipSync: true}
-                      )
+                      updateStyle({curveAmplitude: v}, {skipUndo: true})
                     }
                     onCommit={(v) => updateStyle({curveAmplitude: v})}
                   />
@@ -1763,7 +1742,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     onChange={(e) =>
                       updateStyle(
                         {curveAmplitude: Number(e.target.value)},
-                        {skipUndo: true, skipSync: true}
+                        {skipUndo: true}
                       )
                     }
                     onPointerUp={(e) =>
@@ -1806,10 +1785,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     suffix="x"
                     ariaLabel="Частота кривой"
                     onChange={(v) =>
-                      updateStyle(
-                        {curveFrequency: v},
-                        {skipUndo: true, skipSync: true}
-                      )
+                      updateStyle({curveFrequency: v}, {skipUndo: true})
                     }
                     onCommit={(v) => updateStyle({curveFrequency: v})}
                   />
@@ -1825,7 +1801,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                     onChange={(e) =>
                       updateStyle(
                         {curveFrequency: Number(e.target.value)},
-                        {skipUndo: true, skipSync: true}
+                        {skipUndo: true}
                       )
                     }
                     onPointerUp={(e) =>
@@ -1895,7 +1871,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
 
           const setPhaseDuration = (
             nextDur: number,
-            opts?: {skipUndo?: boolean; skipSync?: boolean}
+            opts?: {skipUndo?: boolean}
           ) => {
             const clamped = Math.max(
               0.1,
@@ -1965,7 +1941,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                       : 'Длительность анимации вывода'
                   }
                   onChange={(v) =>
-                    setPhaseDuration(v, {skipUndo: true, skipSync: true})
+                    setPhaseDuration(v, {skipUndo: true})
                   }
                   onCommit={(v) => setPhaseDuration(v)}
                 />
@@ -1979,7 +1955,6 @@ export const TextPanel: React.FC<TextPanelProps> = ({
                   onChange={(e) =>
                     setPhaseDuration(Number(e.target.value), {
                       skipUndo: true,
-                      skipSync: true,
                     })
                   }
                   onPointerUp={(e) =>

@@ -235,7 +235,6 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
 
     onUpdateClip(audioEditableClip.id, patch, {
       skipUndo: !commit,
-      skipSync: !commit,
     });
   };
 
@@ -248,7 +247,7 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
     onUpdateClip(
       audioEditableClip.id,
       {pitch: nextPitch},
-      {skipUndo: !commit, skipSync: !commit}
+      {skipUndo: !commit}
     );
   };
 
@@ -373,7 +372,7 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
                     onUpdateClip(
                       audioEditableClip.id,
                       {volume: pct / 100},
-                      {skipUndo: true, skipSync: true}
+                      {skipUndo: true}
                     )
                   }
                   onCommit={(pct) =>
@@ -391,7 +390,7 @@ export const AudioPanel: React.FC<AudioPanelProps> = ({
                   onUpdateClip(
                     audioEditableClip.id,
                     {volume: Number(e.target.value)},
-                    {skipUndo: true, skipSync: true}
+                    {skipUndo: true}
                   )
                 }
                 onPointerUp={(e) =>

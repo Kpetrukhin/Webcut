@@ -297,7 +297,7 @@ class KtorLanEngine(private val context: Context) {
         put("hostName", "Хост")
         put("fps", 30)
         put("isPublicLan", true)
-        put("revision", 1)
+        put("revision", 0)
         put("tracks", JSONArray())
         put("clips", JSONArray())
         put("chat", JSONArray())
@@ -704,9 +704,12 @@ class KtorLanEngine(private val context: Context) {
                         val sessionEntry = RoomPeerSession(connId, ws, userObj)
                         wsSessions[connId] = sessionEntry
 
+                        val currentRev = hostRoomState.optInt("revision", 0)
                         val initMsg = JSONObject().apply {
                             put("type", "room:init")
                             put("project", hostRoomState)
+                            put("revision", currentRev)
+                            put("prevRevision", currentRev)
                             put("collaborators", buildCollaboratorsArray())
                             put("rooms", JSONArray().apply {
                                 if (isHostingRoom) put(buildRoomSummaryJson())
@@ -779,10 +782,13 @@ class KtorLanEngine(private val context: Context) {
                         ws.send(Frame.Text(pongMsg.toString()))
                     }
 
-                    "SYNC_FULL_STATE" -> {
+                    "REQUEST_SYNC", "SYNC_FULL_STATE" -> {
+                        val currentRev = hostRoomState.optInt("revision", 0)
                         val syncMsg = JSONObject().apply {
                             put("type", "SYNC_FULL_STATE")
                             put("project", hostRoomState)
+                            put("revision", currentRev)
+                            put("prevRevision", currentRev)
                             put("collaborators", buildCollaboratorsArray())
                             put("rooms", JSONArray().apply {
                                 if (isHostingRoom) put(buildRoomSummaryJson())
@@ -830,11 +836,23 @@ class KtorLanEngine(private val context: Context) {
                         layerLocks[layerId]?.let { it.lastActivityMs = System.currentTimeMillis() }
                         val senderId = wsSessions[connId]?.userJson?.optString("id") ?: msg.optString("senderId", "")
                         msg.put("senderId", senderId)
-                        val rev = hostRoomState.optInt("revision", 1) + 1
+                        val prevRev = hostRoomState.optInt("revision", 0)
+                        val rev = prevRev + 1
                         hostRoomState.put("revision", rev)
+                        msg.put("prevRevision", prevRev)
                         msg.put("revision", rev)
                         applyMediaUpdateToHostState(msg)
                         broadcastAll(msg.toString(), excludeConnId = connId)
+                        ws.send(
+                            Frame.Text(
+                                JSONObject().apply {
+                                    put("type", "sync:ack")
+                                    put("revision", rev)
+                                    put("prevRevision", prevRev)
+                                    put("opType", "LAYER_MEDIA_UPDATED")
+                                }.toString()
+                            )
+                        )
                     }
 
                     else -> {
@@ -847,13 +865,34 @@ class KtorLanEngine(private val context: Context) {
                                         lock.lastActivityMs = System.currentTimeMillis()
                                     }
                                 }
+                                if (msg.optBoolean("ephemeral", false)) {
+                                    val currentRev = hostRoomState.optInt("revision", 0)
+                                    msg.put("ephemeral", true)
+                                    msg.put("prevRevision", currentRev)
+                                    msg.put("revision", currentRev)
+                                    msg.put("senderId", senderId)
+                                    broadcastAll(msg.toString(), excludeConnId = connId)
+                                    continue
+                                }
                             }
-                            val rev = hostRoomState.optInt("revision", 1) + 1
+                            val prevRev = hostRoomState.optInt("revision", 0)
+                            val rev = prevRev + 1
                             hostRoomState.put("revision", rev)
+                            msg.put("prevRevision", prevRev)
                             msg.put("revision", rev)
                             msg.put("senderId", senderId)
                             applyOpToHostState(type, msg)
                             broadcastAll(msg.toString(), excludeConnId = connId)
+                            ws.send(
+                                Frame.Text(
+                                    JSONObject().apply {
+                                        put("type", "sync:ack")
+                                        put("revision", rev)
+                                        put("prevRevision", prevRev)
+                                        put("opType", type)
+                                    }.toString()
+                                )
+                            )
                         }
                     }
                 }

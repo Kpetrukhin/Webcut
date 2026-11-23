@@ -8,6 +8,8 @@ import {
   createStarterClips,
   createTrackOfType,
   encodePatchForSync,
+  evaluateDeltaRevision,
+  evaluateEphemeralRevision,
   insertTrackAt,
   normalizeProjectTracks,
   resolveTrackPlacement,
@@ -46,6 +48,10 @@ import {
   syncHostLanSnapshot,
 } from '../lib/lanSyncBridge.ts';
 import type {KtorServerStatus} from '../lib/lanSyncBridge.ts';
+
+export type SyncStatus = 'synced' | 'syncing' | 'offline';
+
+export const DRAG_THROTTLE_MS = 40;
 
 export interface DownloadQueueItem {
   layerId: string;
@@ -152,6 +158,8 @@ export function useCollaborativeRoom() {
   const [status, setStatus] = useState<
     'connecting' | 'connected' | 'reconnecting' | 'offline'
   >('connecting');
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>('syncing');
+  const [localRevision, setLocalRevision] = useState<number>(0);
   const [project, setProject] = useState<ProjectState>(() => ({
     roomId: getRoomIdFromUrl(),
     title: 'Ночной ролик',
@@ -164,7 +172,7 @@ export function useCollaborativeRoom() {
     trackers: [],
     tracks: createDefaultTracks(),
     clips: createStarterClips(),
-    revision: 1,
+    revision: 0,
     updatedAt: Date.now(),
     chat: [],
   }));
@@ -180,8 +188,24 @@ export function useCollaborativeRoom() {
   projectRef.current = project;
   const activeDownloadsRef = useRef<Set<string>>(new Set());
 
+  const localRevisionRef = useRef<number>(0);
+  const resyncInFlightRef = useRef<boolean>(false);
+  const resyncTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingAckCountRef = useRef<number>(0);
+  const triggerReconnectRef = useRef<(() => void) | null>(null);
+
   const pendingClipPatchesRef = useRef<
-    Map<string, {patch: Record<string, unknown>; timer: ReturnType<typeof setTimeout> | null}>
+    Map<
+      string,
+      {
+        patch: Record<string, unknown>;
+        timer: ReturnType<typeof setTimeout> | null;
+        lastSentAt: number;
+      }
+    >
+  >(new Map());
+  const uncommittedClipPatchesRef = useRef<
+    Map<string, Record<string, unknown>>
   >(new Map());
   const heldLocksRef = useRef<Map<string, number>>(new Map());
   const lastLockKeepaliveSentRef = useRef<Map<string, number>>(new Map());
@@ -351,32 +375,81 @@ export function useCollaborativeRoom() {
     []
   );
 
+  const refreshSyncStatusIfIdle = useCallback(() => {
+    if (
+      pendingAckCountRef.current === 0 &&
+      !resyncInFlightRef.current &&
+      uncommittedClipPatchesRef.current.size === 0
+    ) {
+      setSyncStatus('synced');
+    }
+  }, []);
+
   const sendRaw = useCallback((msg: ClientWsMessage) => {
     const ws = wsRef.current;
     if (ws && ws.readyState === WebSocket.OPEN) {
+      const isCommittedMutation =
+        (msg.type.startsWith('op:') &&
+          !(msg.type === 'op:clip_update' && msg.ephemeral)) ||
+        msg.type === 'LAYER_MEDIA_UPDATED';
+      if (isCommittedMutation) {
+        pendingAckCountRef.current += 1;
+        setSyncStatus('syncing');
+      }
       ws.send(JSON.stringify(msg));
+    }
+  }, []);
+
+  const requestSync = useCallback((opts?: {force?: boolean}) => {
+    if (!opts?.force && resyncInFlightRef.current) return;
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      resyncInFlightRef.current = true;
+      setSyncStatus('syncing');
+      if (resyncTimeoutRef.current) clearTimeout(resyncTimeoutRef.current);
+      resyncTimeoutRef.current = setTimeout(() => {
+        resyncTimeoutRef.current = null;
+        resyncInFlightRef.current = false;
+      }, 2500);
+      ws.send(
+        JSON.stringify({
+          type: 'REQUEST_SYNC',
+          clientRevision: localRevisionRef.current,
+        } satisfies ClientWsMessage)
+      );
+    } else {
+      triggerReconnectRef.current?.();
     }
   }, []);
 
   const flushClipPatch = useCallback(
     (clipId: string) => {
       const pending = pendingClipPatchesRef.current.get(clipId);
-      if (!pending) return;
-      if (pending.timer) clearTimeout(pending.timer);
+      if (pending?.timer) clearTimeout(pending.timer);
       pendingClipPatchesRef.current.delete(clipId);
-      if (Object.keys(pending.patch).length > 0) {
+
+      const uncommitted = uncommittedClipPatchesRef.current.get(clipId);
+      uncommittedClipPatchesRef.current.delete(clipId);
+
+      const commitPatch = uncommitted ?? pending?.patch;
+      if (commitPatch && Object.keys(commitPatch).length > 0) {
         sendRaw({
           type: 'op:clip_update',
           clipId,
-          patch: pending.patch as Partial<Clip>,
+          patch: commitPatch as Partial<Clip>,
         });
+      } else {
+        refreshSyncStatusIfIdle();
       }
     },
-    [sendRaw]
+    [refreshSyncStatusIfIdle, sendRaw]
   );
 
   const flushAllClipPatches = useCallback(() => {
-    const ids = Array.from(pendingClipPatchesRef.current.keys());
+    const ids = new Set([
+      ...pendingClipPatchesRef.current.keys(),
+      ...uncommittedClipPatchesRef.current.keys(),
+    ]);
     for (const id of ids) {
       flushClipPatch(id);
     }
@@ -474,23 +547,42 @@ export function useCollaborativeRoom() {
   useEffect(() => {
     let closedByEffect = false;
     let attempt = 0;
+    let hasConnectedOnce = false;
+
+    localRevisionRef.current = 0;
+    setLocalRevision(0);
+    resyncInFlightRef.current = false;
+    pendingAckCountRef.current = 0;
+    uncommittedClipPatchesRef.current.clear();
 
     const wsEndpoint = getWebSocketUrl(serverUrl || undefined);
     if (!wsEndpoint) {
       setStatus('offline');
+      setSyncStatus('offline');
       setPingMs(null);
+      triggerReconnectRef.current = null;
       return;
     }
 
     const connect = () => {
       if (closedByEffect) return;
+      const existing = wsRef.current;
+      if (
+        existing &&
+        (existing.readyState === WebSocket.CONNECTING ||
+          existing.readyState === WebSocket.OPEN)
+      ) {
+        return;
+      }
       setStatus(attempt === 0 ? 'connecting' : 'reconnecting');
+      setSyncStatus('syncing');
       const ws = new WebSocket(wsEndpoint);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        const wasReconnect = attempt > 0;
+        const wasReconnect = attempt > 0 || hasConnectedOnce;
         attempt = 0;
+        hasConnectedOnce = true;
         setStatus('connected');
         ws.send(
           JSON.stringify({
@@ -500,9 +592,7 @@ export function useCollaborativeRoom() {
           } satisfies ClientWsMessage)
         );
         if (wasReconnect) {
-          ws.send(
-            JSON.stringify({type: 'SYNC_FULL_STATE'} satisfies ClientWsMessage)
-          );
+          requestSync({force: true});
         }
         if (pingIntervalRef.current) clearInterval(pingIntervalRef.current);
         ws.send(
@@ -535,7 +625,50 @@ export function useCollaborativeRoom() {
 
           case 'room:init':
           case 'SYNC_FULL_STATE': {
-            applyRemoteFullState(msg.project, msg.collaborators, msg.rooms);
+            if (resyncTimeoutRef.current) {
+              clearTimeout(resyncTimeoutRef.current);
+              resyncTimeoutRef.current = null;
+            }
+            resyncInFlightRef.current = false;
+            pendingAckCountRef.current = 0;
+            const serverRev =
+              typeof msg.revision === 'number'
+                ? msg.revision
+                : (msg.project?.revision ?? 0);
+            localRevisionRef.current = serverRev;
+            setLocalRevision(serverRev);
+            applyRemoteFullState(
+              {...msg.project, revision: serverRev},
+              msg.collaborators,
+              msg.rooms
+            );
+            refreshSyncStatusIfIdle();
+            break;
+          }
+
+          case 'sync:ack': {
+            pendingAckCountRef.current = Math.max(
+              0,
+              pendingAckCountRef.current - 1
+            );
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'apply') {
+              localRevisionRef.current = decision.nextRevision;
+              setLocalRevision(decision.nextRevision);
+              setProject((prev) =>
+                prev.revision === decision.nextRevision
+                  ? prev
+                  : {...prev, revision: decision.nextRevision}
+              );
+              refreshSyncStatusIfIdle();
+            } else if (decision.action === 'resync') {
+              requestSync();
+            } else {
+              refreshSyncStatusIfIdle();
+            }
             break;
           }
 
@@ -543,47 +676,114 @@ export function useCollaborativeRoom() {
             setAvailableRooms(msg.rooms);
             break;
 
-          case 'op:track_add':
+          case 'op:track_add': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => {
-              if (prev.tracks.some((t) => t.id === msg.track.id)) return prev;
+              if (prev.tracks.some((t) => t.id === msg.track.id)) {
+                return {...prev, revision: decision.nextRevision};
+              }
               return {
                 ...prev,
                 tracks: insertTrackAt(prev.tracks, msg.track, msg.insertAt),
-                revision: msg.revision,
+                revision: decision.nextRevision,
               };
             });
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:track_update':
+          case 'op:track_update': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
-              revision: msg.revision,
+              revision: decision.nextRevision,
               tracks: prev.tracks.map((t) =>
                 t.id === msg.trackId ? {...t, ...msg.patch, id: t.id} : t
               ),
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:track_delete':
+          case 'op:track_delete': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
-              revision: msg.revision,
+              revision: decision.nextRevision,
               tracks: prev.tracks.filter((t) => t.id !== msg.trackId),
               clips: prev.clips.filter((c) => c.trackId !== msg.trackId),
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:track_reorder':
+          case 'op:track_reorder': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
-              revision: msg.revision,
+              revision: decision.nextRevision,
               tracks: applyTrackReorder(prev.tracks, msg.trackIds),
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:clip_add':
+          case 'op:clip_add': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => {
-              if (prev.clips.some((c) => c.id === msg.clip.id)) return prev;
+              if (prev.clips.some((c) => c.id === msg.clip.id)) {
+                return {...prev, revision: decision.nextRevision};
+              }
               const nextTracks = msg.newTrack
                 ? insertTrackAt(prev.tracks, msg.newTrack, msg.insertAt)
                 : prev.tracks;
@@ -591,43 +791,105 @@ export function useCollaborativeRoom() {
                 ...prev,
                 tracks: nextTracks,
                 clips: [...prev.clips, msg.clip],
-                revision: msg.revision,
+                revision: decision.nextRevision,
               };
             });
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:clip_update':
+          case 'op:clip_update': {
+            if (msg.ephemeral) {
+              const ephDecision = evaluateEphemeralRevision(
+                localRevisionRef.current,
+                msg.revision
+              );
+              if (ephDecision.action === 'resync') {
+                requestSync();
+                break;
+              }
+              if (ephDecision.action === 'ignore_stale') break;
+              if (msg.senderId === userRef.current.id) break;
+              setProject((prev) => ({
+                ...prev,
+                clips: prev.clips.map((c) =>
+                  c.id === msg.clipId
+                    ? applyClipPatch(c, msg.patch as Record<string, unknown>)
+                    : c
+                ),
+              }));
+              break;
+            }
+
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             if (msg.senderId === userRef.current.id) {
               setProject((prev) =>
-                prev.revision === msg.revision
+                prev.revision === decision.nextRevision
                   ? prev
-                  : {...prev, revision: msg.revision}
+                  : {...prev, revision: decision.nextRevision}
               );
+              refreshSyncStatusIfIdle();
               break;
             }
             setProject((prev) => ({
               ...prev,
-              revision: msg.revision,
+              revision: decision.nextRevision,
               clips: prev.clips.map((c) =>
                 c.id === msg.clipId
                   ? applyClipPatch(c, msg.patch as Record<string, unknown>)
                   : c
               ),
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:clip_delete':
+          case 'op:clip_delete': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
-              revision: msg.revision,
+              revision: decision.nextRevision,
               clips: prev.clips.filter((c) => c.id !== msg.clipId),
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:clip_split':
+          case 'op:clip_split': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
-              revision: msg.revision,
+              revision: decision.nextRevision,
               clips: applyClipSplit(
                 prev.clips,
                 msg.clipId,
@@ -635,29 +897,68 @@ export function useCollaborativeRoom() {
                 msg.newClipId
               ),
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:clip_duplicate':
+          case 'op:clip_duplicate': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
-              revision: msg.revision,
+              revision: decision.nextRevision,
               clips: applyClipDuplicate(
                 prev.clips,
                 msg.clipId,
                 msg.newClipId
               ),
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:project_meta':
+          case 'op:project_meta': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
               ...msg.patch,
-              revision: msg.revision,
+              revision: decision.nextRevision,
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
-          case 'op:project_replace':
+          case 'op:project_replace': {
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              msg.revision
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
             setProject((prev) => ({
               ...prev,
               clips: msg.clips,
@@ -669,11 +970,29 @@ export function useCollaborativeRoom() {
                 msg.canvasBackground ?? prev.canvasBackground,
               customFonts: msg.customFonts || prev.customFonts,
               trackers: msg.trackers || prev.trackers,
-              revision: msg.revision,
+              revision: decision.nextRevision,
             }));
+            refreshSyncStatusIfIdle();
             break;
+          }
 
           case 'LAYER_MEDIA_UPDATED': {
+            const incomingRev =
+              typeof msg.revision === 'number'
+                ? msg.revision
+                : localRevisionRef.current + 1;
+            const decision = evaluateDeltaRevision(
+              localRevisionRef.current,
+              incomingRev
+            );
+            if (decision.action === 'resync') {
+              requestSync();
+              break;
+            }
+            if (decision.action === 'ignore_stale') break;
+            localRevisionRef.current = decision.nextRevision;
+            setLocalRevision(decision.nextRevision);
+
             const isFromSelf = msg.senderId === userRef.current.id;
             setProject((prev) => {
               const nextTracks = msg.newTrack
@@ -684,7 +1003,7 @@ export function useCollaborativeRoom() {
                 return {
                   ...prev,
                   tracks: nextTracks,
-                  revision: msg.revision ?? prev.revision + 1,
+                  revision: decision.nextRevision,
                   clips: prev.clips.map((c) =>
                     c.id === msg.layerId
                       ? {
@@ -709,7 +1028,7 @@ export function useCollaborativeRoom() {
                   ),
                 };
               }
-              if (!msg.clip) return prev;
+              if (!msg.clip) return {...prev, revision: decision.nextRevision};
               const stubClip: Clip = {
                 ...msg.clip,
                 id: msg.layerId,
@@ -726,7 +1045,7 @@ export function useCollaborativeRoom() {
                 ...prev,
                 tracks: nextTracks,
                 clips: [...prev.clips, stubClip],
-                revision: msg.revision ?? prev.revision + 1,
+                revision: decision.nextRevision,
               };
             });
 
@@ -739,6 +1058,7 @@ export function useCollaborativeRoom() {
                 msg.fileHash
               );
             }
+            refreshSyncStatusIfIdle();
             break;
           }
 
@@ -784,9 +1104,11 @@ export function useCollaborativeRoom() {
           clearInterval(pingIntervalRef.current);
           pingIntervalRef.current = null;
         }
+        resyncInFlightRef.current = false;
         setPingMs(null);
         if (closedByEffect) return;
         setStatus('reconnecting');
+        setSyncStatus('syncing');
         attempt += 1;
         const delay = Math.min(2500, 350 * Math.pow(1.4, attempt));
         reconnectTimerRef.current = setTimeout(connect, delay);
@@ -797,24 +1119,40 @@ export function useCollaborativeRoom() {
       };
     };
 
+    triggerReconnectRef.current = () => {
+      if (closedByEffect) return;
+      const cur = wsRef.current;
+      if (cur && (cur.readyState === WebSocket.OPEN || cur.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      connect();
+    };
+
     connect();
 
     return () => {
       closedByEffect = true;
+      triggerReconnectRef.current = null;
       if (pingIntervalRef.current) {
         clearInterval(pingIntervalRef.current);
         pingIntervalRef.current = null;
       }
       if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+      if (resyncTimeoutRef.current) clearTimeout(resyncTimeoutRef.current);
       if (pendingPresenceTimerRef.current)
         clearTimeout(pendingPresenceTimerRef.current);
       for (const entry of pendingClipPatchesRef.current.values()) {
         if (entry.timer) clearTimeout(entry.timer);
       }
       pendingClipPatchesRef.current.clear();
+      uncommittedClipPatchesRef.current.clear();
       wsRef.current?.close();
     };
-  }, [roomId, serverUrl, triggerBackgroundDownload, applyRemoteFullState]);
+  }, [roomId, serverUrl, triggerBackgroundDownload, applyRemoteFullState, requestSync, refreshSyncStatusIfIdle]);
 
   const showLockWarning = useCallback((ownerName: string) => {
     setLockWarning(`Слой редактирует ${ownerName}`);
@@ -1122,21 +1460,37 @@ export function useCollaborativeRoom() {
     const onVisibilityChange = () => {
       if (document.visibilityState === 'hidden') {
         releaseAllHeldLocks();
+      } else if (document.visibilityState === 'visible') {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          requestSync({force: true});
+        } else {
+          triggerReconnectRef.current?.();
+        }
+      }
+    };
+
+    const onNetworkOnline = () => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        requestSync({force: true});
+      } else {
+        triggerReconnectRef.current?.();
       }
     };
 
     window.addEventListener('blur', releaseAllHeldLocks);
     window.addEventListener('pagehide', releaseAllHeldLocks);
+    window.addEventListener('online', onNetworkOnline);
     document.addEventListener('visibilitychange', onVisibilityChange);
 
     return () => {
       clearInterval(sweepTimer);
       window.removeEventListener('blur', releaseAllHeldLocks);
       window.removeEventListener('pagehide', releaseAllHeldLocks);
+      window.removeEventListener('online', onNetworkOnline);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       releaseAllHeldLocks();
     };
-  }, [sendLayerLock]);
+  }, [requestSync, sendLayerLock]);
 
   const updateClip = useCallback(
     (
@@ -1181,19 +1535,59 @@ export function useCollaborativeRoom() {
       }));
 
       if (!opts?.skipSync) {
+        let fullUncommitted = uncommittedClipPatchesRef.current.get(clipId);
+        if (!fullUncommitted) {
+          fullUncommitted = {};
+          uncommittedClipPatchesRef.current.set(clipId, fullUncommitted);
+        }
+        Object.assign(fullUncommitted, encodedPatch);
+
+        if (!opts?.skipUndo) {
+          flushClipPatch(clipId);
+          return;
+        }
+
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          setSyncStatus('syncing');
+        }
+
         let entry = pendingClipPatchesRef.current.get(clipId);
         if (!entry) {
-          entry = {patch: {}, timer: null};
+          entry = {patch: {}, timer: null, lastSentAt: 0};
           pendingClipPatchesRef.current.set(clipId, entry);
         }
         Object.assign(entry.patch, encodedPatch);
 
-        if (!opts?.skipUndo) {
-          flushClipPatch(clipId);
+        const now = Date.now();
+        const elapsed = now - entry.lastSentAt;
+        if (elapsed >= DRAG_THROTTLE_MS && !entry.timer) {
+          const toSend = entry.patch;
+          entry.patch = {};
+          entry.lastSentAt = now;
+          sendRaw({
+            type: 'op:clip_update',
+            clipId,
+            patch: toSend as Partial<Clip>,
+            ephemeral: true,
+          });
         } else if (!entry.timer) {
+          const waitMs = Math.max(10, DRAG_THROTTLE_MS - elapsed);
           entry.timer = setTimeout(() => {
-            flushClipPatch(clipId);
-          }, 45);
+            const cur = pendingClipPatchesRef.current.get(clipId);
+            if (!cur) return;
+            cur.timer = null;
+            if (Object.keys(cur.patch).length > 0) {
+              const toSend = cur.patch;
+              cur.patch = {};
+              cur.lastSentAt = Date.now();
+              sendRaw({
+                type: 'op:clip_update',
+                clipId,
+                patch: toSend as Partial<Clip>,
+                ephemeral: true,
+              });
+            }
+          }, waitMs);
         }
       }
     },
@@ -1627,8 +2021,8 @@ export function useCollaborativeRoom() {
 
   const forceSyncProject = useCallback(() => {
     flushAllClipPatches();
-    sendRaw({type: 'SYNC_FULL_STATE'});
-  }, [flushAllClipPatches, sendRaw]);
+    requestSync({force: true});
+  }, [flushAllClipPatches, requestSync]);
 
   const retryMediaDownload = useCallback(
     (clipId: string) => {
@@ -1665,6 +2059,8 @@ export function useCollaborativeRoom() {
     ktorStatus,
     downloadQueue,
     status,
+    syncStatus,
+    localRevision,
     project,
     collaborators: collaborators.filter((c) => c.id !== user.id),
     allCollaborators: collaborators,
