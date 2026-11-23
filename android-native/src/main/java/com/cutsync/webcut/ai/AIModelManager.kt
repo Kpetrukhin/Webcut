@@ -68,6 +68,15 @@ class AIModelManager private constructor(private val appContext: Context) {
     @Volatile
     private var activeCascadeLog: List<String> = emptyList()
 
+    @Volatile
+    private var companionDecoderSession: OrtSession? = null
+
+    @Volatile
+    private var companionDecoderOptions: OrtSession.SessionOptions? = null
+
+    private val whisperEngine = WhisperSubtitleEngine(appContext, modelsDir)
+    private val vitTrackEngine = VitTrackEngine(appContext)
+
     private val downloadJobs = ConcurrentHashMap<String, Job>()
     private val downloadProgress = ConcurrentHashMap<String, Int>()
     private val modelErrors = ConcurrentHashMap<String, String>()
@@ -308,8 +317,137 @@ class AIModelManager private constructor(private val appContext: Context) {
         }
     }
 
+    /**
+     * Runs the full offline Whisper ASR subtitle pipeline on [sourceUrl]/[fileName].
+     * Ensures `whisper_tiny_asr` encoder is prepared via Hardware Cascade and lazily
+     * loads `decoder_model_merged_quantized.onnx` as a companion session in RAM.
+     */
+    suspend fun transcribeAudioWithWhisper(
+        sourceUrl: String,
+        fileName: String?,
+        language: String = "auto",
+        trimStartMs: Long = 0L,
+        durationMs: Long = -1L,
+        onProgress: (progress: Int, stage: String) -> Unit
+    ): JSONObject {
+        val decoderFile = File(modelsDir, WhisperSubtitleEngine.DECODER_FILE)
+        val tokenizerFile = File(modelsDir, WhisperSubtitleEngine.TOKENIZER_FILE)
+        val encoderFile = File(modelsDir, WhisperSubtitleEngine.ENCODER_FILE)
+
+        if (!encoderFile.exists() || encoderFile.length() <= 16L) {
+            throw IllegalStateException("Файл ${WhisperSubtitleEngine.ENCODER_FILE} не найден в ai_models/")
+        }
+        if (!decoderFile.exists() || decoderFile.length() <= 16L) {
+            throw IllegalStateException("Файл ${WhisperSubtitleEngine.DECODER_FILE} не найден в ai_models/")
+        }
+        if (!tokenizerFile.exists() || tokenizerFile.length() <= 16L) {
+            throw IllegalStateException("Файл ${WhisperSubtitleEngine.TOKENIZER_FILE} не найден в ai_models/")
+        }
+
+        onProgress(0, "Подготовка Whisper Tiny...")
+        prepareModel("whisper_tiny_asr")
+
+        return sessionMutex.withLock {
+            val env = ortEnv ?: OrtEnvironment.getEnvironment().also { ortEnv = it }
+            val encoderSession = activeSession
+                ?: throw IllegalStateException("Сессия encoder_model_quantized.onnx не инициализирована")
+
+            val decoderSession = companionDecoderSession ?: run {
+                val (decSess, decOpts) = HardwareCascadeSelector.createCpuSession(
+                    context = appContext,
+                    env = env,
+                    modelFile = decoderFile
+                )
+                companionDecoderSession = decSess
+                companionDecoderOptions = decOpts
+                decSess
+            }
+
+            val result = whisperEngine.transcribe(
+                env = env,
+                encoderSession = encoderSession,
+                decoderSession = decoderSession,
+                sourceUrl = sourceUrl,
+                fileName = fileName,
+                language = language,
+                trimStartMs = trimStartMs,
+                durationMs = durationMs,
+                onProgress = onProgress,
+                createCpuFallbackEncoder = {
+                    HardwareCascadeSelector.createCpuSession(
+                        context = appContext,
+                        env = env,
+                        modelFile = encoderFile
+                    )
+                }
+            )
+            result.toJson()
+        }
+    }
+
+    fun cancelWhisperTranscription() {
+        whisperEngine.cancel()
+    }
+
+    /**
+     * Runs offline object tracking (`motion_tracker_nano` / object_tracking_vittrack_2023sep.onnx)
+     * across [startMs]..[endMs] starting from normalized bbox `(x, y, w, h)`.
+     */
+    suspend fun trackObjectWithVitTrack(
+        sourceUrl: String,
+        fileName: String?,
+        startMs: Long,
+        endMs: Long,
+        bboxX: Float,
+        bboxY: Float,
+        bboxW: Float,
+        bboxH: Float,
+        sampleFps: Int = 24,
+        onProgress: (progress: Int, timeMs: Long, point: VitTrackEngine.TrackPoint?) -> Unit
+    ): JSONObject {
+        prepareModel("motion_tracker_nano")
+
+        return sessionMutex.withLock {
+            val env = ortEnv ?: OrtEnvironment.getEnvironment().also { ortEnv = it }
+            val session = activeSession
+                ?: throw IllegalStateException("Сессия motion_tracker_nano не инициализирована")
+
+            val result = vitTrackEngine.track(
+                env = env,
+                session = session,
+                sourceUrl = sourceUrl,
+                fileName = fileName,
+                startMs = startMs,
+                endMs = endMs,
+                initX = bboxX,
+                initY = bboxY,
+                initW = bboxW,
+                initH = bboxH,
+                sampleFps = sampleFps,
+                onProgress = onProgress
+            )
+            result.toJson()
+        }
+    }
+
+    fun cancelObjectTracking() {
+        vitTrackEngine.cancel()
+    }
+
     private fun releaseActiveModelLocked() {
         val prevId = activeModelId
+        try {
+            companionDecoderSession?.close()
+        } catch (err: Throwable) {
+            Log.w(TAG, "Error closing companion decoder session: ${err.message}")
+        }
+        try {
+            companionDecoderOptions?.close()
+        } catch (_: Throwable) {
+        }
+        companionDecoderSession = null
+        companionDecoderOptions = null
+
         try {
             activeSession?.close()
         } catch (err: Throwable) {

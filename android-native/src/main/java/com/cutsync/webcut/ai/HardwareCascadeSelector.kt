@@ -242,6 +242,28 @@ object HardwareCascadeSelector {
         )
     }
 
+    fun createCpuSession(
+        context: Context,
+        env: OrtEnvironment,
+        modelFile: File
+    ): Pair<OrtSession, OrtSession.SessionOptions> {
+        val caps = probeDeviceCapabilities(context)
+        val cpuOpts = buildBaseOptions(caps.optimalCpuThreads)
+        if (caps.availableProviders.contains(OrtProvider.XNNPACK)) {
+            try {
+                cpuOpts.addXnnpack(mapOf("intra_op_num_threads" to caps.optimalCpuThreads.toString()))
+            } catch (_: Throwable) {
+            }
+        }
+        val session = try {
+            env.createSession(modelFile.absolutePath, cpuOpts)
+        } catch (err: Throwable) {
+            safeClose(cpuOpts)
+            throw err
+        }
+        return session to cpuOpts
+    }
+
     private fun safeClose(options: OrtSession.SessionOptions) {
         try {
             options.close()

@@ -65,6 +65,13 @@ export const SHAPE_CATALOG: ShapeCatalogItem[] = [
     defaultCornerRadius: 999,
     defaultStrokeWidth: 0,
   },
+  {
+    id: 'points',
+    label: 'По точкам',
+    aspect: 1,
+    defaultCornerRadius: 0,
+    defaultStrokeWidth: 6,
+  },
 ];
 
 export function getShapeCatalogItem(shapeType: ShapeType): ShapeCatalogItem {
@@ -79,9 +86,21 @@ export function getDefaultShapeStyle(shapeType: ShapeType): ShapeStyle {
     shapeType,
     fillColor: '#22d3ee',
     fillOpacity: 1,
+    fillGradient:
+      shapeType === 'points'
+        ? {enabled: false, color2: '#a855f7', angle: 135}
+        : undefined,
     strokeColor: '#ffffff',
     strokeWidth: meta.defaultStrokeWidth,
     cornerRadius: meta.defaultCornerRadius,
+    points:
+      shapeType === 'points'
+        ? [
+            {id: 'pt-1', x: 0.5, y: 0.34},
+            {id: 'pt-2', x: 0.68, y: 0.64},
+            {id: 'pt-3', x: 0.32, y: 0.64},
+          ]
+        : undefined,
   };
 }
 
@@ -95,6 +114,13 @@ export function normalizeShapeStyle(raw?: Partial<ShapeStyle>): ShapeStyle {
       raw?.fillOpacity !== undefined
         ? Math.max(0, Math.min(1, raw.fillOpacity))
         : 1,
+    fillGradient: raw?.fillGradient
+      ? {
+          enabled: Boolean(raw.fillGradient.enabled),
+          color2: raw.fillGradient.color2 || '#a855f7',
+          angle: raw.fillGradient.angle ?? 135,
+        }
+      : undefined,
     strokeColor: raw?.strokeColor || '#ffffff',
     strokeWidth:
       raw?.strokeWidth !== undefined
@@ -104,6 +130,7 @@ export function normalizeShapeStyle(raw?: Partial<ShapeStyle>): ShapeStyle {
       raw?.cornerRadius !== undefined
         ? Math.max(0, raw.cornerRadius)
         : meta.defaultCornerRadius,
+    points: raw?.points?.map((p) => ({...p})),
   };
 }
 
@@ -246,6 +273,34 @@ export function traceShapePath(
   }
 }
 
+function resolveFillStyle(
+  ctx: CanvasRenderingContext2D,
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  style: ShapeStyle
+): string | CanvasGradient {
+  if (style.fillGradient?.enabled) {
+    const angleDeg = style.fillGradient.angle ?? 135;
+    const rad = ((angleDeg - 90) * Math.PI) / 180;
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const w = Math.max(4, maxX - minX);
+    const h = Math.max(4, maxY - minY);
+    const halfSpan = (Math.abs(w * Math.cos(rad)) + Math.abs(h * Math.sin(rad))) / 2;
+    const x0 = cx - Math.cos(rad) * halfSpan;
+    const y0 = cy - Math.sin(rad) * halfSpan;
+    const x1 = cx + Math.cos(rad) * halfSpan;
+    const y1 = cy + Math.sin(rad) * halfSpan;
+    const grad = ctx.createLinearGradient(x0, y0, x1, y1);
+    grad.addColorStop(0, style.fillColor);
+    grad.addColorStop(1, style.fillGradient.color2 || '#a855f7');
+    return grad;
+  }
+  return style.fillColor;
+}
+
 /**
  * Draws the shape centered at (0, 0) in targetCtx.
  * If maskOnly is true, draws opaque white inside the shape silhouette (for Adjustment Masks).
@@ -276,7 +331,85 @@ export function drawShapeGeometry(
   if (style.fillOpacity > 0.004) {
     ctx.save();
     ctx.globalAlpha = ctx.globalAlpha * style.fillOpacity;
-    ctx.fillStyle = style.fillColor;
+    ctx.fillStyle = resolveFillStyle(ctx, -w / 2, -h / 2, w / 2, h / 2, style);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  if (style.strokeWidth > 0.1) {
+    ctx.save();
+    ctx.strokeStyle = style.strokeColor;
+    ctx.lineWidth = style.strokeWidth * sf;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/**
+ * Renders a 2..N vertex polygon/segment shape in targetCtx using already-projected canvas pixel points.
+ * - 2 vertices: open line segment rendered with strokeColor & strokeWidth
+ * - 3+ vertices: closed polygon with solid/gradient fill, corner rounding, and optional stroke
+ */
+export function drawPolygonPointsGeometry(
+  ctx: CanvasRenderingContext2D,
+  pts: Array<{x: number; y: number}>,
+  rawStyle: ShapeStyle | undefined,
+  sf: number,
+  maskOnly = false
+) {
+  if (pts.length < 2) return;
+  const style = normalizeShapeStyle(rawStyle);
+
+  if (pts.length === 2) {
+    const strokePx = Math.max(
+      maskOnly ? 8 * sf : 2 * sf,
+      (style.strokeWidth > 0 ? style.strokeWidth : 6) * sf
+    );
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    ctx.lineTo(pts[1].x, pts[1].y);
+    ctx.strokeStyle = maskOnly ? '#ffffff' : style.strokeColor || style.fillColor;
+    ctx.lineWidth = strokePx;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+    ctx.restore();
+    return;
+  }
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+
+  traceRoundedPolygon(ctx, pts, (style.cornerRadius ?? 0) * sf);
+
+  if (maskOnly) {
+    ctx.fillStyle = '#ffffff';
+    ctx.fill();
+    if (style.strokeWidth > 0) {
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = style.strokeWidth * sf;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+    }
+    return;
+  }
+
+  if (style.fillOpacity > 0.004) {
+    ctx.save();
+    ctx.globalAlpha = ctx.globalAlpha * style.fillOpacity;
+    ctx.fillStyle = resolveFillStyle(ctx, minX, minY, maxX, maxY, style);
     ctx.fill();
     ctx.restore();
   }

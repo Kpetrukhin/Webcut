@@ -2,6 +2,7 @@ import type {
   AspectRatio,
   CanvasBackground,
   Clip,
+  MotionTrackerBeacon,
   ProjectFont,
   Track,
 } from '../shared/types.ts';
@@ -19,6 +20,7 @@ export interface LocalProjectRecord {
     tracks: Track[];
     clips: Clip[];
     customFonts?: ProjectFont[];
+    trackers?: MotionTrackerBeacon[];
   };
 }
 

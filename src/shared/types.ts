@@ -68,15 +68,31 @@ export type ShapeType =
   | 'triangle'
   | 'star'
   | 'arrow'
-  | 'line';
+  | 'line'
+  | 'points';
+
+export interface PolygonPoint {
+  id: string;
+  x: number; // normalized 0..1 canvas coords (or shape space)
+  y: number; // normalized 0..1 canvas coords
+  trackerId?: string;
+}
+
+export interface ShapeGradientFill {
+  enabled: boolean;
+  color2: string;
+  angle?: number; // degrees 0..360
+}
 
 export interface ShapeStyle {
   shapeType: ShapeType;
   fillColor: string;
   fillOpacity: number; // 0..1
+  fillGradient?: ShapeGradientFill;
   strokeColor: string;
   strokeWidth: number; // 0..32 px at 720w reference
   cornerRadius?: number; // px at 720w reference
+  points?: PolygonPoint[];
 }
 
 export type WarpMode = 'none' | 'perspective' | 'mesh';
@@ -206,7 +222,27 @@ export interface ClipKeyframe {
   rotation: number; // degrees -180..180
   opacity: number; // 0..1
   warp?: ClipWarp;
+  shapePoints?: PolygonPoint[];
   easing: KeyframeEasing;
+}
+
+export interface TrackerKeyframe {
+  time: number; // global timeline seconds
+  x: number; // normalized 0..1 on canvas
+  y: number; // normalized 0..1 on canvas
+  scale?: number;
+  w?: number;
+  h?: number;
+  score?: number;
+}
+
+export interface MotionTrackerBeacon {
+  id: string;
+  name: string;
+  color: string;
+  sourceClipId?: string;
+  createdAt: number;
+  points: TrackerKeyframe[];
 }
 
 export interface ProjectFont {
@@ -404,6 +440,7 @@ export interface ProjectState {
   fps: number;
   isPublicLan: boolean;
   customFonts?: ProjectFont[];
+  trackers?: MotionTrackerBeacon[];
   tracks: Track[];
   clips: Clip[];
   revision: number;
@@ -469,6 +506,7 @@ export type ClientWsMessage =
           | 'canvasBackground'
           | 'hostName'
           | 'customFonts'
+          | 'trackers'
         >
       >;
     }
@@ -481,6 +519,7 @@ export type ClientWsMessage =
       backgroundColor?: string;
       canvasBackground?: CanvasBackground;
       customFonts?: ProjectFont[];
+      trackers?: MotionTrackerBeacon[];
     }
   | {
       type: 'presence:cursor';
@@ -584,6 +623,7 @@ export type ServerWsMessage =
           | 'canvasBackground'
           | 'hostName'
           | 'customFonts'
+          | 'trackers'
         >
       >;
       revision: number;
@@ -598,6 +638,7 @@ export type ServerWsMessage =
       backgroundColor?: string;
       canvasBackground?: CanvasBackground;
       customFonts?: ProjectFont[];
+      trackers?: MotionTrackerBeacon[];
       revision: number;
       senderId: string;
     }
@@ -863,6 +904,7 @@ export function normalizeProjectTracks(project: ProjectState): ProjectState {
       color: project.backgroundColor || '#09090b',
     },
     customFonts: Array.isArray(project.customFonts) ? project.customFonts : [],
+    trackers: Array.isArray(project.trackers) ? project.trackers : [],
     isPublicLan: project.isPublicLan ?? true,
     tracks,
     clips,
@@ -1114,9 +1156,13 @@ function cloneColorAdjustments(
   };
 }
 
-function cloneShapeStyle(style?: ShapeStyle): ShapeStyle | undefined {
+export function cloneShapeStyle(style?: ShapeStyle): ShapeStyle | undefined {
   if (!style) return undefined;
-  return {...style};
+  return {
+    ...style,
+    fillGradient: style.fillGradient ? {...style.fillGradient} : undefined,
+    points: style.points?.map((p) => ({...p})),
+  };
 }
 
 function cloneWarp(warp?: ClipWarp): ClipWarp | undefined {
@@ -1163,6 +1209,7 @@ export function applyClipSplit(
       .map((k) => ({
         ...k,
         warp: cloneWarp(k.warp),
+        shapePoints: k.shapePoints?.map((p) => ({...p})),
       })),
   };
 
@@ -1191,6 +1238,7 @@ export function applyClipSplit(
       .map((k) => ({
         ...k,
         warp: cloneWarp(k.warp),
+        shapePoints: k.shapePoints?.map((p) => ({...p})),
         id: `kf-${Math.random().toString(36).slice(2, 8)}`,
         timeOffset: Math.round((k.timeOffset - relOffset) * 100) / 100,
       })),
@@ -1238,6 +1286,7 @@ export function applyClipDuplicate(
   const clonedKeyframes = target.keyframes?.map((kf) => ({
     ...kf,
     warp: cloneWarp(kf.warp),
+    shapePoints: kf.shapePoints?.map((p) => ({...p})),
     id: `kf-${Math.random().toString(36).slice(2, 8)}`,
   }));
 

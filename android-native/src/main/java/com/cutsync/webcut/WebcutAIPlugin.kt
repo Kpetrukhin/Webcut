@@ -211,6 +211,108 @@ class WebcutAIPlugin : Plugin() {
         }
     }
 
+    @PluginMethod
+    fun transcribeAudio(call: PluginCall) {
+        val sourceUrl = call.getString("sourceUrl") ?: ""
+        val fileName = call.getString("fileName")
+        val clipId = call.getString("clipId") ?: ""
+        if (sourceUrl.isBlank() && fileName.isNullOrBlank()) {
+            call.reject("Missing sourceUrl or fileName")
+            return
+        }
+        val language = call.getString("language") ?: "auto"
+        val trimStartMs = call.getDouble("trimStartMs", 0.0)?.toLong() ?: 0L
+        val durationMs = call.getDouble("durationMs", -1.0)?.toLong() ?: -1L
+
+        pluginScope.launch {
+            try {
+                val res = aiManager.transcribeAudioWithWhisper(
+                    sourceUrl = sourceUrl,
+                    fileName = fileName,
+                    language = language,
+                    trimStartMs = trimStartMs,
+                    durationMs = durationMs
+                ) { progress, stage ->
+                    notifyListeners(
+                        "aiTranscribeProgress",
+                        JSObject().apply {
+                            put("progress", progress)
+                            put("stage", stage)
+                            if (clipId.isNotEmpty()) put("clipId", clipId)
+                        }
+                    )
+                }
+                call.resolve(jsonObjectToJsObject(res))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Ошибка распознавания речи (Whisper)")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun cancelTranscribe(call: PluginCall) {
+        aiManager.cancelWhisperTranscription()
+        call.resolve(JSObject().apply { put("ok", true) })
+    }
+
+    @PluginMethod
+    fun trackObject(call: PluginCall) {
+        val sourceUrl = call.getString("sourceUrl") ?: ""
+        val fileName = call.getString("fileName")
+        val clipId = call.getString("clipId") ?: ""
+        if (sourceUrl.isBlank() && fileName.isNullOrBlank()) {
+            call.reject("Missing sourceUrl or fileName")
+            return
+        }
+
+        val startMs = call.getDouble("startMs", 0.0)?.toLong() ?: 0L
+        val endMs = call.getDouble("endMs", -1.0)?.toLong() ?: -1L
+        val sampleFps = call.getInt("sampleFps", 24) ?: 24
+
+        val bboxObj = call.getObject("bbox")
+        val bboxX = (bboxObj?.optDouble("x", 0.35) ?: call.getDouble("x", 0.35) ?: 0.35).toFloat()
+        val bboxY = (bboxObj?.optDouble("y", 0.35) ?: call.getDouble("y", 0.35) ?: 0.35).toFloat()
+        val bboxW = (bboxObj?.optDouble("w", 0.25) ?: call.getDouble("w", 0.25) ?: 0.25).toFloat()
+        val bboxH = (bboxObj?.optDouble("h", 0.25) ?: call.getDouble("h", 0.25) ?: 0.25).toFloat()
+
+        pluginScope.launch {
+            try {
+                val res = aiManager.trackObjectWithVitTrack(
+                    sourceUrl = sourceUrl,
+                    fileName = fileName,
+                    startMs = startMs,
+                    endMs = endMs,
+                    bboxX = bboxX,
+                    bboxY = bboxY,
+                    bboxW = bboxW,
+                    bboxH = bboxH,
+                    sampleFps = sampleFps
+                ) { progress, timeMs, point ->
+                    notifyListeners(
+                        "aiTrackProgress",
+                        JSObject().apply {
+                            put("progress", progress)
+                            put("timeMs", timeMs)
+                            if (clipId.isNotEmpty()) put("clipId", clipId)
+                            if (point != null) {
+                                put("point", jsonObjectToJsObject(point.toJson()))
+                            }
+                        }
+                    )
+                }
+                call.resolve(jsonObjectToJsObject(res))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Ошибка трекинга объекта (VitTrack)")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun cancelTracking(call: PluginCall) {
+        aiManager.cancelObjectTracking()
+        call.resolve(JSObject().apply { put("ok", true) })
+    }
+
     private fun jsonObjectToJsObject(obj: JSONObject): JSObject {
         val out = JSObject()
         val keys = obj.keys()

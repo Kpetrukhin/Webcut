@@ -49,6 +49,8 @@ import type {
   ClipMask,
   ClipWarp,
   ColorFilterPreset,
+  MotionTrackerBeacon,
+  PolygonPoint,
   ShapeType,
   TextCurvePoint,
 } from './shared/types.ts';
@@ -85,15 +87,29 @@ import type {
   ExportQuality,
   ExportResolution,
 } from './lib/exportEngine.ts';
-import {MediaPool} from './lib/renderEngine.ts';
-import {getApiUrl, isNativeCapacitorApp} from './lib/serverConfig.ts';
+import {getCanvasDimensions, MediaPool} from './lib/renderEngine.ts';
+import {
+  getApiUrl,
+  isNativeCapacitorApp,
+  resolveMediaSrc,
+} from './lib/serverConfig.ts';
 import {
   colorToHex,
   createDefaultCurvePoints,
   measureBaseTextHalfWidth,
   normalizeTextStyle,
 } from './lib/textRenderer.ts';
-import {getDefaultShapeStyle, getShapeCatalogItem} from './lib/shapeEngine.ts';
+import {
+  getDefaultShapeStyle,
+  getShapeCatalogItem,
+  normalizeShapeStyle,
+} from './lib/shapeEngine.ts';
+import {
+  buildClipKeyframesFromTracker,
+  buildTrackerBeaconFromVitTrack,
+  mapCanvasBboxToVideoSource,
+  mapVideoPointToCanvas,
+} from './lib/trackerEngine.ts';
 import {
   createDefaultWarp,
   isIdentityWarp,
@@ -106,7 +122,8 @@ import {
 import {AudioPanel} from './components/AudioPanel.tsx';
 import {AppSettingsModal} from './components/AppSettingsModal.tsx';
 import {AIModelManagerModal} from './components/AIModelManagerModal.tsx';
-import './lib/webcutAi.ts';
+import {requestAIFeature, webcutAI} from './lib/webcutAi.ts';
+import type {TrackBbox} from './lib/webcutAi.ts';
 import {ChromaKeyPanel} from './components/ChromaKeyPanel.tsx';
 import {ColorAdjustPanel} from './components/ColorAdjustPanel.tsx';
 import {CropEditorModal} from './components/CropEditorModal.tsx';
@@ -181,6 +198,8 @@ export default function App() {
     moveClipTrackType,
     updateProjectMeta,
     addCustomFont,
+    addTrackerBeacon,
+    deleteTrackerBeacon,
     replaceClips,
     undo,
     redo,
@@ -255,6 +274,16 @@ export default function App() {
   const [selectedCurvePointId, setSelectedCurvePointId] = useState<string | null>(
     null
   );
+  const [objectTrackSession, setObjectTrackSession] = useState<{
+    sourceClipId: string;
+    targetClipId: string;
+    saveMode: 'beacon' | 'keyframes';
+    beaconName: string;
+    bbox: TrackBbox;
+    isRunning: boolean;
+    progress: number;
+    livePoint: {x: number; y: number} | null;
+  } | null>(null);
   const [showCropModal, setShowCropModal] = useState(false);
   const [customColorPresets, setCustomColorPresets] = useState<
     ColorFilterPreset[]
@@ -650,6 +679,7 @@ export default function App() {
           tracks: p.tracks,
           clips: p.clips,
           customFonts: p.customFonts,
+          trackers: p.trackers,
         },
       });
     };
@@ -1281,6 +1311,111 @@ export default function App() {
     [currentTime, addClip]
   );
 
+  const handleAddSubtitleSegments = useCallback(
+    (segments: Array<{start: number; duration: number; text: string}>) => {
+      if (!segments.length) return;
+      const sorted = [...segments]
+        .filter((s) => s.text.trim().length > 0 && s.duration > 0.05)
+        .sort((a, b) => a.start - b.start);
+      if (!sorted.length) return;
+
+      const normalized: Array<{start: number; duration: number; text: string}> = [];
+      for (const seg of sorted) {
+        const cleanStart = Math.max(0, Math.round(seg.start * 100) / 100);
+        const cleanDur = Math.max(0.25, Math.round(seg.duration * 100) / 100);
+        const prev = normalized[normalized.length - 1];
+        if (prev && cleanStart < prev.start + prev.duration) {
+          const adjustedPrevDur = Math.round((cleanStart - prev.start) * 100) / 100;
+          if (adjustedPrevDur >= 0.2) {
+            prev.duration = adjustedPrevDur;
+          }
+        }
+        normalized.push({
+          start: cleanStart,
+          duration: cleanDur,
+          text: seg.text.trim(),
+        });
+      }
+
+      let sharedTrackId: string | undefined;
+      let firstCreatedClip: {id: string; start: number} | null = null;
+
+      for (let i = 0; i < normalized.length; i++) {
+        const seg = normalized[i];
+        const res = addClip(
+          {
+            id: `clip-${Math.random().toString(36).slice(2, 9)}`,
+            ...(sharedTrackId ? {trackId: sharedTrackId} : {}),
+            track: 'text',
+            kind: 'text',
+            name: seg.text.replace(/\s+/g, ' ').slice(0, 18),
+            start: seg.start,
+            duration: seg.duration,
+            trimStart: 0,
+            sourceDuration: 60,
+            speed: 1,
+            volume: 1,
+            opacity: 1,
+            filter: 'none',
+            brightness: 1,
+            contrast: 1,
+            saturate: 1,
+            transitionIn: 'none',
+            motionEffect: 'none',
+            text: seg.text,
+            textStyle: {
+              fontSize: 38,
+              color: '#ffffff',
+              bgColor: '#09090b',
+              bgMode: 'block',
+              bgOpacity: 0.68,
+              fontWeight: 'bold',
+              fontStyle: 'normal',
+              underline: false,
+              fontFamily: 'Plus Jakarta Sans',
+              shadow: true,
+              shadowColor: '#000000',
+              shadowOffsetX: 0,
+              shadowOffsetY: 3,
+              shadowBlur: 8,
+              outline: true,
+              strokeColor: '#000000',
+              strokeWidth: 3,
+              letterSpacing: 0,
+              lineHeight: 1.25,
+              spaceWidth: 1,
+              curveMode: 'none',
+              curveAmplitude: 0,
+              curveFrequency: 2,
+              x: 0.5,
+              y: 0.84,
+              align: 'center',
+            },
+          },
+          i === 0 ? {forceNewTrack: true} : {forceNewTrack: false}
+        );
+        if (!sharedTrackId) {
+          sharedTrackId = res.clip.trackId;
+        }
+        if (!firstCreatedClip) {
+          firstCreatedClip = {id: res.clip.id, start: res.clip.start};
+        }
+      }
+
+      if (firstCreatedClip) {
+        setSelectedClipId(firstCreatedClip.id);
+        setMobileSheet(null);
+        setDesktopTab('text');
+        setShowTrackpad(false);
+        setShowOpacitySlider(false);
+        setShowChromaKeyPanel(false);
+        setMobileEditTool('text');
+        handleSeek(firstCreatedClip.start);
+      }
+    },
+    [addClip, handleSeek]
+  );
+
   const handleDoubleClickTextClip = useCallback((clipId: string) => {
     setSelectedClipId(clipId);
     setDesktopTab('text');
@@ -1595,6 +1730,220 @@ export default function App() {
     [updateClip]
   );
 
+  const handleUpdatePolygonPoints = useCallback(
+    (clipId: string, points: PolygonPoint[], commit: boolean) => {
+      const target = projectRef.current.clips.find((c) => c.id === clipId);
+      if (!target) return;
+      const baseStyle = normalizeShapeStyle(target.shapeStyle);
+      if (target.keyframes && target.keyframes.length > 0) {
+        const {keyframes} = upsertKeyframeAtTime(target, currentTime, {
+          shapePoints: points,
+        });
+        updateClip(
+          clipId,
+          {
+            keyframes,
+            shapeStyle: {
+              ...baseStyle,
+              points:
+                baseStyle.points && baseStyle.points.length === points.length
+                  ? baseStyle.points
+                  : points,
+            },
+          },
+          {skipUndo: !commit, skipSync: !commit}
+        );
+        return;
+      }
+      updateClip(
+        clipId,
+        {shapeStyle: {...baseStyle, points}},
+        {skipUndo: !commit, skipSync: !commit}
+      );
+    },
+    [currentTime, updateClip]
+  );
+
+  const handleStartObjectTracking = useCallback(
+    async (requestedClip?: Clip) => {
+      const p = projectRef.current;
+      const sourceClip =
+        (requestedClip?.kind === 'video' ? requestedClip : null) ??
+        p.clips.find(
+          (c) =>
+            c.kind === 'video' &&
+            currentTime >= c.start &&
+            currentTime < c.start + c.duration
+        ) ??
+        p.clips.find((c) => c.kind === 'video') ??
+        null;
+
+      if (!sourceClip || !sourceClip.src) {
+        showTransientNotice('Добавьте видеоклип на таймлайн для трекинга');
+        return;
+      }
+
+      try {
+        const prep = await webcutAI.prepareModel('motion_tracker_nano');
+        if (!prep.ok || !prep.ready) {
+          requestAIFeature('motion_tracker_nano', 'AI Авто-трекинг (Ключи)');
+          return;
+        }
+      } catch {
+        requestAIFeature('motion_tracker_nano', 'AI Авто-трекинг (Ключи)');
+        return;
+      }
+
+      setIsPlaying(false);
+      setMobileSheet(null);
+      setShowOpacitySlider(false);
+      setShowChromaKeyPanel(false);
+      const preferKeyframes =
+        Boolean(requestedClip) &&
+        !(
+          requestedClip?.kind === 'shape' &&
+          requestedClip.shapeStyle?.shapeType === 'points'
+        );
+      setObjectTrackSession({
+        sourceClipId: sourceClip.id,
+        targetClipId: requestedClip?.id ?? sourceClip.id,
+        saveMode: preferKeyframes ? 'keyframes' : 'beacon',
+        beaconName: `Маяк ${(p.trackers?.length ?? 0) + 1}`,
+        bbox: {x: 0.375, y: 0.375, w: 0.25, h: 0.25},
+        isRunning: false,
+        progress: 0,
+        livePoint: null,
+      });
+    },
+    [currentTime, showTransientNotice]
+  );
+
+  const handleRunObjectTracking = useCallback(async () => {
+    const session = objectTrackSession;
+    if (!session || session.isRunning) return;
+    const p = projectRef.current;
+    const sourceClip = p.clips.find((c) => c.id === session.sourceClipId);
+    if (!sourceClip || !sourceClip.src) {
+      setObjectTrackSession(null);
+      return;
+    }
+
+    const {width: cw, height: ch} = getCanvasDimensions(p.aspectRatio);
+    const clipSrc = sourceClip.src;
+    const vidEl = mediaPoolRef.current?.getVideo(clipSrc);
+    const vidW =
+      vidEl && vidEl.videoWidth > 0 ? vidEl.videoWidth : cw;
+    const vidH =
+      vidEl && vidEl.videoHeight > 0 ? vidEl.videoHeight : ch;
+
+    const srcBbox = mapCanvasBboxToVideoSource(
+      sourceClip,
+      session.bbox,
+      currentTime,
+      cw,
+      ch,
+      vidW,
+      vidH
+    );
+
+    const speed = Math.max(0.1, sourceClip.speed || 1);
+    const offsetSec = Math.max(
+      0,
+      Math.min(Math.max(0, sourceClip.duration - 0.04), currentTime - sourceClip.start)
+    );
+    const startMs = Math.max(
+      0,
+      Math.round((sourceClip.trimStart + offsetSec * speed) * 1000)
+    );
+    const endMs = Math.max(
+      startMs + 80,
+      Math.round((sourceClip.trimStart + sourceClip.duration * speed) * 1000)
+    );
+
+    setObjectTrackSession((cur) =>
+      cur ? {...cur, isRunning: true, progress: 0, livePoint: null} : null
+    );
+
+    try {
+      const result = await webcutAI.trackObject({
+        sourceUrl: resolveMediaSrc(clipSrc) || clipSrc,
+        fileName: sourceClip.mediaFileName || sourceClip.name,
+        clipId: sourceClip.id,
+        startMs,
+        endMs,
+        bbox: srcBbox,
+        sampleFps: 24,
+        onProgress: (ev) => {
+          const mapped = ev.point
+            ? mapVideoPointToCanvas(sourceClip, ev.point, cw, ch, vidW, vidH)
+            : null;
+          setObjectTrackSession((cur) =>
+            cur
+              ? {
+                  ...cur,
+                  progress: ev.progress,
+                  livePoint: mapped ? {x: mapped.x, y: mapped.y} : cur.livePoint,
+                }
+              : null
+          );
+        },
+      });
+
+      if (!result.ok || result.points.length === 0) {
+        showTransientNotice('Трекинг отменён или объект не найден');
+        setObjectTrackSession(null);
+        return;
+      }
+
+      const beacon: MotionTrackerBeacon = buildTrackerBeaconFromVitTrack(
+        session.beaconName,
+        sourceClip,
+        result.points,
+        cw,
+        ch,
+        vidW,
+        vidH,
+        p.trackers?.length ?? 0
+      );
+
+      if (session.saveMode === 'beacon') {
+        addTrackerBeacon(beacon);
+        showTransientNotice(
+          `Трекер «${beacon.name}» сохранён (${beacon.points.length} точек)`
+        );
+      } else {
+        const targetClip =
+          p.clips.find((c) => c.id === session.targetClipId) ?? sourceClip;
+        const kfs = buildClipKeyframesFromTracker(targetClip, beacon.points, true);
+        updateClip(targetClip.id, {keyframes: kfs});
+        showTransientNotice(
+          `Создано ${kfs.length} ключевых кадров для «${targetClip.name}»`
+        );
+      }
+      setObjectTrackSession(null);
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Ошибка трекинга объекта';
+      showTransientNotice(msg);
+      setObjectTrackSession((cur) =>
+        cur ? {...cur, isRunning: false, livePoint: null} : null
+      );
+    }
+  }, [
+    objectTrackSession,
+    currentTime,
+    addTrackerBeacon,
+    updateClip,
+    showTransientNotice,
+  ]);
+
+  const handleCancelObjectTracking = useCallback(() => {
+    if (objectTrackSession?.isRunning) {
+      void webcutAI.cancelTracking();
+    }
+    setObjectTrackSession(null);
+  }, [objectTrackSession]);
+
   const handleCreateRoom = async (opts: {
     title: string;
     aspectRatio: AspectRatio;
@@ -1690,6 +2039,7 @@ export default function App() {
         backgroundColor: record.backgroundColor,
         canvasBackground: record.canvasBackground,
         customFonts: record.snapshot.customFonts,
+        trackers: record.snapshot.trackers,
         tracks: record.snapshot.tracks,
       });
     }
@@ -1722,6 +2072,7 @@ export default function App() {
         backgroundColor: project.backgroundColor,
         canvasBackground: project.canvasBackground,
         customFonts: project.customFonts,
+        trackers: project.trackers,
         duration,
         currentTime,
         format: exportFormat,
@@ -2583,8 +2934,14 @@ export default function App() {
                               selectedClip.kind === 'shape' && (
                                 <ShapesPanel
                                   selectedClip={selectedClip}
+                                  currentTime={currentTime}
+                                  trackers={project.trackers}
                                   onAddShape={handleAddShapeClip}
                                   onUpdateClip={updateClip}
+                                  onUpdatePolygonPoints={handleUpdatePolygonPoints}
+                                  onCreateTracker={() =>
+                                    void handleStartObjectTracking(selectedClip)
+                                  }
                                   onOpenAdjust={() => setEditSubMode('adjust')}
                                 />
                               )}
@@ -2718,6 +3075,9 @@ export default function App() {
                                 currentTime={currentTime}
                                 onSeek={handleSeek}
                                 onUpdateClip={(id, patch) => updateClip(id, patch)}
+                                onStartObjectTracking={(c) =>
+                                  void handleStartObjectTracking(c)
+                                }
                               />
                             )}
                           </div>
@@ -2773,8 +3133,14 @@ export default function App() {
                 {desktopOverlayView === 'shapes' ? (
                   <ShapesPanel
                     selectedClip={selectedClip}
+                    currentTime={currentTime}
+                    trackers={project.trackers}
                     onAddShape={handleAddShapeClip}
                     onUpdateClip={updateClip}
+                    onUpdatePolygonPoints={handleUpdatePolygonPoints}
+                    onCreateTracker={() =>
+                      void handleStartObjectTracking(selectedClip ?? undefined)
+                    }
                     onOpenAdjust={() => {
                       setDesktopTab('edit');
                       setEditSubMode('adjust');
@@ -2821,6 +3187,8 @@ export default function App() {
                   setTextFocusTrigger((n) => n + 1);
                 }}
                 onAddText={handleAddText}
+                onAddSubtitleSegments={handleAddSubtitleSegments}
+                onNotify={showTransientNotice}
                 onUpdateClip={updateClip}
                 onAddCustomFont={addCustomFont}
                 onOpenTrackpad={() => setShowTrackpad((v) => !v)}
@@ -3065,6 +3433,96 @@ export default function App() {
                 </button>
               </div>
             )}
+          {objectTrackSession && (
+            <div className="absolute top-3 left-1/2 z-30 flex w-[calc(100%-24px)] max-w-lg -translate-x-1/2 flex-wrap items-center justify-between gap-2 rounded-2xl border border-cyan-400/50 bg-zinc-950/92 px-3 py-2 shadow-2xl backdrop-blur-md">
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <Sparkles className="h-4 w-4 shrink-0 text-cyan-300" />
+                {objectTrackSession.isRunning ? (
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex items-center justify-between text-[11px] font-semibold text-cyan-200">
+                      <span>Трекинг VitTrack...</span>
+                      <span className="font-mono tabular-nums">
+                        {objectTrackSession.progress}%
+                      </span>
+                    </div>
+                    <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-800">
+                      <div
+                        className="h-full bg-gradient-to-r from-cyan-400 to-violet-400 transition-[width]"
+                        style={{width: `${objectTrackSession.progress}%`}}
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+                    <div className="flex rounded-lg border border-white/10 bg-zinc-900 p-0.5 text-[10px] font-semibold">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setObjectTrackSession((cur) =>
+                            cur ? {...cur, saveMode: 'beacon'} : null
+                          )
+                        }
+                        className={`rounded-md px-2 py-0.5 transition ${
+                          objectTrackSession.saveMode === 'beacon'
+                            ? 'bg-cyan-500 text-zinc-950'
+                            : 'text-zinc-300 hover:text-white'
+                        }`}
+                      >
+                        Трекер-маяк
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setObjectTrackSession((cur) =>
+                            cur ? {...cur, saveMode: 'keyframes'} : null
+                          )
+                        }
+                        className={`rounded-md px-2 py-0.5 transition ${
+                          objectTrackSession.saveMode === 'keyframes'
+                            ? 'bg-amber-400 text-zinc-950'
+                            : 'text-zinc-300 hover:text-white'
+                        }`}
+                      >
+                        Ключи слоя
+                      </button>
+                    </div>
+                    {objectTrackSession.saveMode === 'beacon' && (
+                      <input
+                        type="text"
+                        value={objectTrackSession.beaconName}
+                        onChange={(e) =>
+                          setObjectTrackSession((cur) =>
+                            cur ? {...cur, beaconName: e.target.value} : null
+                          )
+                        }
+                        placeholder="Имя маяка"
+                        className="h-7 w-24 rounded-md border border-white/15 bg-zinc-900 px-2 text-[11px] text-white outline-none focus:border-cyan-400"
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex shrink-0 items-center gap-1.5">
+                {!objectTrackSession.isRunning && (
+                  <button
+                    type="button"
+                    onClick={() => void handleRunObjectTracking()}
+                    className="h-7 rounded-lg bg-cyan-500 px-3 text-[11px] font-bold text-zinc-950 hover:bg-cyan-400 active:scale-95"
+                  >
+                    Старт
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleCancelObjectTracking}
+                  className="h-7 rounded-lg border border-white/15 bg-zinc-900 px-2.5 text-[11px] font-medium text-zinc-200 hover:bg-zinc-800 active:scale-95"
+                >
+                  Отмена
+                </button>
+              </div>
+            </div>
+          )}
           <div ref={previewBoxRef} className="flex-1 min-h-0">
             <PreviewCanvas
               tracks={project.tracks}
@@ -3109,6 +3567,21 @@ export default function App() {
               onUpdateCurvePoints={handleUpdateCurvePoints}
               warpEditActive={isWarpEditActive}
               onUpdateWarp={handleUpdateClipWarp}
+              trackers={project.trackers}
+              onUpdatePolygonPoints={handleUpdatePolygonPoints}
+              objectTrackPicker={
+                objectTrackSession
+                  ? {
+                      bbox: objectTrackSession.bbox,
+                      isRunning: objectTrackSession.isRunning,
+                      progress: objectTrackSession.progress,
+                      livePoint: objectTrackSession.livePoint,
+                    }
+                  : null
+              }
+              onChangeObjectTrackBbox={(bbox) =>
+                setObjectTrackSession((cur) => (cur ? {...cur, bbox} : null))
+              }
               onLockLayer={sendLayerLock}
               onSelectClip={setSelectedClipId}
               onDoubleClickTextClip={handleDoubleClickTextClip}
@@ -3444,6 +3917,9 @@ export default function App() {
                   currentTime={currentTime}
                   onSeek={handleSeek}
                   onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  onStartObjectTracking={(c) =>
+                    void handleStartObjectTracking(c)
+                  }
                 />
               )}
 
@@ -3638,8 +4114,14 @@ export default function App() {
               <div className="studio-scrollbar min-h-0 flex-1 overflow-y-auto p-3">
                 <ShapesPanel
                   selectedClip={selectedClip}
+                  currentTime={currentTime}
+                  trackers={project.trackers}
                   onAddShape={handleAddShapeClip}
                   onUpdateClip={updateClip}
+                  onUpdatePolygonPoints={handleUpdatePolygonPoints}
+                  onCreateTracker={() =>
+                    void handleStartObjectTracking(selectedClip)
+                  }
                   onOpenAdjust={() => setMobileEditTool('adjust')}
                 />
               </div>
@@ -3767,6 +4249,8 @@ export default function App() {
                     setTextFocusTrigger((n) => n + 1);
                   }}
                   onAddText={handleAddText}
+                  onAddSubtitleSegments={handleAddSubtitleSegments}
+                  onNotify={showTransientNotice}
                   onUpdateClip={updateClip}
                   onAddCustomFont={addCustomFont}
                   onOpenTrackpad={() => {
@@ -3867,6 +4351,9 @@ export default function App() {
                   currentTime={currentTime}
                   onSeek={handleSeek}
                   onUpdateClip={(id, patch) => updateClip(id, patch)}
+                  onStartObjectTracking={(c) =>
+                    void handleStartObjectTracking(c)
+                  }
                 />
               </div>
             </div>
@@ -4528,8 +5015,14 @@ export default function App() {
         >
           <ShapesPanel
             selectedClip={selectedClip}
+            currentTime={currentTime}
+            trackers={project.trackers}
             onAddShape={handleAddShapeClip}
             onUpdateClip={updateClip}
+            onUpdatePolygonPoints={handleUpdatePolygonPoints}
+            onCreateTracker={() =>
+              void handleStartObjectTracking(selectedClip ?? undefined)
+            }
             onOpenAdjust={() => {
               setMobileSheet(null);
               setMobileEditTool('adjust');
@@ -4587,6 +5080,8 @@ export default function App() {
               setTextFocusTrigger((n) => n + 1);
             }}
             onAddText={handleAddText}
+            onAddSubtitleSegments={handleAddSubtitleSegments}
+            onNotify={showTransientNotice}
             onUpdateClip={updateClip}
             onAddCustomFont={addCustomFont}
             onOpenTrackpad={() => {

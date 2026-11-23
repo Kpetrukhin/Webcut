@@ -20,6 +20,7 @@ import type {
   Clip,
   Collaborator,
   DiscoveredUdpRoom,
+  MotionTrackerBeacon,
   NetworkInterfaceInfo,
   ProjectFont,
   ProjectState,
@@ -160,6 +161,7 @@ export function useCollaborativeRoom() {
     fps: 30,
     isPublicLan: true,
     customFonts: [],
+    trackers: [],
     tracks: createDefaultTracks(),
     clips: createStarterClips(),
     revision: 1,
@@ -666,6 +668,7 @@ export function useCollaborativeRoom() {
               canvasBackground:
                 msg.canvasBackground ?? prev.canvasBackground,
               customFonts: msg.customFonts || prev.customFonts,
+              trackers: msg.trackers || prev.trackers,
               revision: msg.revision,
             }));
             break;
@@ -1361,6 +1364,7 @@ export function useCollaborativeRoom() {
           | 'canvasBackground'
           | 'hostName'
           | 'customFonts'
+          | 'trackers'
         >
       >,
       options?: {skipSync?: boolean}
@@ -1382,6 +1386,27 @@ export function useCollaborativeRoom() {
     [sendRaw]
   );
 
+  const addTrackerBeacon = useCallback(
+    (tracker: MotionTrackerBeacon) => {
+      const current = projectRef.current.trackers ?? [];
+      const nextTrackers = [...current.filter((t) => t.id !== tracker.id), tracker];
+      setProject((prev) => ({...prev, trackers: nextTrackers}));
+      sendRaw({type: 'op:project_meta', patch: {trackers: nextTrackers}});
+    },
+    [sendRaw]
+  );
+
+  const deleteTrackerBeacon = useCallback(
+    (trackerId: string) => {
+      const nextTrackers = (projectRef.current.trackers ?? []).filter(
+        (t) => t.id !== trackerId
+      );
+      setProject((prev) => ({...prev, trackers: nextTrackers}));
+      sendRaw({type: 'op:project_meta', patch: {trackers: nextTrackers}});
+    },
+    [sendRaw]
+  );
+
   const replaceClips = useCallback(
     (
       clips: Clip[],
@@ -1391,6 +1416,7 @@ export function useCollaborativeRoom() {
         backgroundColor?: string;
         canvasBackground?: CanvasBackground;
         customFonts?: ProjectFont[];
+        trackers?: MotionTrackerBeacon[];
         tracks?: Track[];
       }
     ) => {
@@ -1409,6 +1435,7 @@ export function useCollaborativeRoom() {
           ? {canvasBackground: meta.canvasBackground}
           : {}),
         ...(meta?.customFonts ? {customFonts: meta.customFonts} : {}),
+        ...(meta?.trackers ? {trackers: meta.trackers} : {}),
       }));
       sendRaw({
         type: 'op:project_replace',
@@ -1419,6 +1446,7 @@ export function useCollaborativeRoom() {
         backgroundColor: meta?.backgroundColor,
         canvasBackground: meta?.canvasBackground,
         customFonts: meta?.customFonts,
+        trackers: meta?.trackers,
       });
     },
     [pushUndo, sendRaw]
@@ -1655,6 +1683,8 @@ export function useCollaborativeRoom() {
     moveClipTrackType,
     updateProjectMeta,
     addCustomFont,
+    addTrackerBeacon,
+    deleteTrackerBeacon,
     replaceClips,
     undo,
     redo,

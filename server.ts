@@ -259,6 +259,7 @@ function createDefaultProject(
     fps: 30,
     isPublicLan: opts?.isPublicLan ?? true,
     customFonts: [],
+    trackers: [],
     tracks: createDefaultTracks(),
     clips: opts?.blank ? [] : createStarterClips(),
     revision: 1,
@@ -1261,6 +1262,9 @@ targetWss.on('connection', (ws) => {
         if (Array.isArray(msg.patch.customFonts)) {
           project.customFonts = msg.patch.customFonts;
         }
+        if (Array.isArray(msg.patch.trackers)) {
+          project.trackers = msg.patch.trackers;
+        }
         if (typeof msg.patch.isPublicLan === 'boolean') {
           project.isPublicLan = msg.patch.isPublicLan;
         }
@@ -1295,6 +1299,9 @@ targetWss.on('connection', (ws) => {
         if (Array.isArray(msg.customFonts)) {
           project.customFonts = msg.customFonts;
         }
+        if (Array.isArray(msg.trackers)) {
+          project.trackers = msg.trackers;
+        }
         project.revision += 1;
         project.updatedAt = Date.now();
         scheduleSaveRooms();
@@ -1309,6 +1316,7 @@ targetWss.on('connection', (ws) => {
             backgroundColor: project.backgroundColor,
             canvasBackground: project.canvasBackground,
             customFonts: project.customFonts,
+            trackers: project.trackers,
             revision: project.revision,
             senderId: session.user.id,
           },

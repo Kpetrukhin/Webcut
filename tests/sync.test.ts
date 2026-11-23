@@ -16,11 +16,23 @@ import {
   encodePatchForSync,
   normalizeProjectTracks,
 } from '../src/shared/types.ts';
-import type {Clip, ProjectState, ServerWsMessage} from '../src/shared/types.ts';
+import type {
+  Clip,
+  MotionTrackerBeacon,
+  ProjectState,
+  ServerWsMessage,
+} from '../src/shared/types.ts';
 import {
   evaluateClipTransform,
   upsertKeyframeAtTime,
 } from '../src/lib/keyframeEngine.ts';
+import {
+  buildClipKeyframesFromTracker,
+  buildTrackerBeaconFromVitTrack,
+  evaluateShapePoints,
+  evaluateTrackerAtTime,
+  mapCanvasBboxToVideoSource,
+} from '../src/lib/trackerEngine.ts';
 import {createDefaultWarp} from '../src/lib/warpEngine.ts';
 import {sha256Hex, sha256SyncHex} from '../src/lib/sha256.ts';
 import {downloadMediaInBackground} from '../src/lib/lanSyncBridge.ts';
@@ -237,6 +249,16 @@ test('JSON Sync: полная сериализация всех слоёв, ма
       type: 'solid',
       color: '#121826',
     },
+    trackers: [
+      {
+        id: 'trk-audit-1',
+        name: 'Маяк 1',
+        color: '#22d3ee',
+        sourceClipId: 'clip-video-full',
+        createdAt: 1700000000000,
+        points: [{time: 1.5, x: 0.42, y: 0.58, scale: 1, w: 0.2, h: 0.2, score: 0.94}],
+      },
+    ],
   };
 
   const roundTripped = normalizeProjectTracks(
@@ -1625,3 +1647,158 @@ test('Трансформация по ключам: интерполяция sca
   assert.equal(split[1].keyframes?.[0].scaleX, 2.0);
   assert.equal(split[1].keyframes?.[0].flipHorizontal, true);
 });
+
+test('Трекинг объектов (VitTrack) и полигон «По точкам» с привязкой вершин к трекеру-маяку', () => {
+  const videoClip: Clip = {
+    id: 'vid-track-1',
+    track: 'video',
+    trackId: 'track-video-1',
+    kind: 'video',
+    name: 'TrackClip.mp4',
+    start: 1.0,
+    duration: 4.0,
+    trimStart: 0.5,
+    sourceDuration: 10,
+    speed: 1,
+    volume: 1,
+    opacity: 1,
+    filter: 'none',
+    brightness: 1,
+    contrast: 1,
+    saturate: 1,
+    transitionIn: 'none',
+    motionEffect: 'none',
+  };
+
+  // Source mapping round-trip
+  const srcBox = mapCanvasBboxToVideoSource(
+    videoClip,
+    {x: 0.25, y: 0.25, w: 0.5, h: 0.5},
+    1.0,
+    1280,
+    720,
+    1280,
+    720
+  );
+  assert.ok(Math.abs(srcBox.x - 0.25) < 0.001);
+  assert.ok(Math.abs(srcBox.w - 0.5) < 0.001);
+
+  const beacon: MotionTrackerBeacon = buildTrackerBeaconFromVitTrack(
+    'Мяч',
+    videoClip,
+    [
+      {timeMs: 500, x: 0.2, y: 0.3, scale: 1.0, w: 0.15, h: 0.15, score: 0.98},
+      {timeMs: 2500, x: 0.8, y: 0.7, scale: 1.5, w: 0.225, h: 0.225, score: 0.91},
+    ],
+    1280,
+    720,
+    1280,
+    720,
+    0
+  );
+
+  assert.equal(beacon.name, 'Мяч');
+  assert.equal(beacon.points.length, 2);
+  // trimStart=0.5s -> 500ms maps to clip.start=1.0s; 2500ms maps to 3.0s
+  assert.ok(Math.abs(beacon.points[0].time - 1.0) < 0.01);
+  assert.ok(Math.abs(beacon.points[1].time - 3.0) < 0.01);
+
+  const midEval = evaluateTrackerAtTime(beacon, 2.0);
+  assert.ok(midEval);
+  assert.ok(Math.abs(midEval.x - 0.5) < 0.01);
+  assert.ok(Math.abs(midEval.y - 0.5) < 0.01);
+  assert.ok(Math.abs(midEval.scale - 1.25) < 0.01);
+
+  // Keyframe generation on target layer
+  const overlayLayer: Clip = {
+    ...videoClip,
+    id: 'ov-target',
+    track: 'overlay',
+    kind: 'image',
+    mediaScale: 0.4,
+    mediaX: 0.5,
+    mediaY: 0.5,
+  };
+  const kfs = buildClipKeyframesFromTracker(overlayLayer, beacon.points, true);
+  assert.equal(kfs.length, 2);
+  assert.ok(Math.abs(kfs[1].x - 0.8) < 0.01);
+  assert.ok(Math.abs(kfs[1].scale - 0.6) < 0.01);
+
+  // Polygon 'points' clip with 1 manual keyframed vertex + 1 tracker-bound vertex
+  const polyClip: Clip = {
+    id: 'poly-1',
+    track: 'overlay',
+    trackId: 'track-overlay-1',
+    kind: 'shape',
+    name: 'По точкам',
+    start: 1.0,
+    duration: 4.0,
+    trimStart: 0,
+    sourceDuration: 3600,
+    speed: 1,
+    volume: 0,
+    opacity: 1,
+    filter: 'none',
+    brightness: 1,
+    contrast: 1,
+    saturate: 1,
+    transitionIn: 'none',
+    motionEffect: 'none',
+    shapeStyle: {
+      shapeType: 'points',
+      fillColor: '#22d3ee',
+      fillOpacity: 0.8,
+      fillGradient: {enabled: true, color2: '#a855f7', angle: 90},
+      strokeColor: '#ffffff',
+      strokeWidth: 6,
+      cornerRadius: 0,
+      points: [
+        {id: 'v1', x: 0.1, y: 0.1, trackerId: beacon.id},
+        {id: 'v2', x: 0.2, y: 0.8},
+        {id: 'v3', x: 0.8, y: 0.8},
+      ],
+    },
+    keyframes: [
+      {
+        id: 'pkf-1',
+        timeOffset: 0,
+        x: 0.5,
+        y: 0.5,
+        scale: 1,
+        rotation: 0,
+        opacity: 1,
+        shapePoints: [
+          {id: 'v1', x: 0.1, y: 0.1, trackerId: beacon.id},
+          {id: 'v2', x: 0.2, y: 0.8},
+          {id: 'v3', x: 0.8, y: 0.8},
+        ],
+        easing: 'linear',
+      },
+      {
+        id: 'pkf-2',
+        timeOffset: 2.0,
+        x: 0.5,
+        y: 0.5,
+        scale: 1,
+        rotation: 0,
+        opacity: 1,
+        shapePoints: [
+          {id: 'v1', x: 0.1, y: 0.1, trackerId: beacon.id},
+          {id: 'v2', x: 0.4, y: 0.6},
+          {id: 'v3', x: 0.8, y: 0.8},
+        ],
+        easing: 'linear',
+      },
+    ],
+  };
+
+  // At global t=2.0 (offset 1.0): v1 follows beacon (0.5, 0.5), v2 interpolates manually to (0.3, 0.7)
+  const resolved = evaluateShapePoints(polyClip, 2.0, [beacon]);
+  assert.equal(resolved.length, 3);
+  assert.ok(Math.abs(resolved[0].x - 0.5) < 0.01);
+  assert.ok(Math.abs(resolved[0].y - 0.5) < 0.01);
+  assert.ok(Math.abs(resolved[1].x - 0.3) < 0.01);
+  assert.ok(Math.abs(resolved[1].y - 0.7) < 0.01);
+  assert.ok(Math.abs(resolved[2].x - 0.8) < 0.01);
+});
+

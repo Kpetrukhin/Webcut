@@ -74,6 +74,81 @@ export interface DownloadModelOptions {
   onProgress?: (pct: number) => void;
 }
 
+export type SubtitleLanguage = 'auto' | 'ru' | 'en';
+
+export interface SubtitleSegment {
+  startMs: number;
+  endMs: number;
+  text: string;
+}
+
+export interface TranscribeProgressEvent {
+  progress: number;
+  stage: string;
+  clipId?: string;
+}
+
+export interface TranscribeAudioOptions {
+  sourceUrl: string;
+  fileName?: string;
+  clipId?: string;
+  language?: SubtitleLanguage;
+  trimStartMs?: number;
+  durationMs?: number;
+  onProgress?: (ev: TranscribeProgressEvent) => void;
+}
+
+export interface TranscribeAudioResult {
+  ok: boolean;
+  language: string;
+  durationMs: number;
+  segments: SubtitleSegment[];
+}
+
+export interface TrackBbox {
+  x: number; // normalized top-left X [0..1]
+  y: number; // normalized top-left Y [0..1]
+  w: number; // normalized width [0..1]
+  h: number; // normalized height [0..1]
+}
+
+export interface TrackPointResult {
+  timeMs: number;
+  x: number; // normalized center X [0..1]
+  y: number; // normalized center Y [0..1]
+  scale: number;
+  w: number;
+  h: number;
+  score: number;
+}
+
+export interface TrackProgressEvent {
+  progress: number;
+  timeMs: number;
+  clipId?: string;
+  point?: TrackPointResult;
+}
+
+export interface TrackObjectOptions {
+  sourceUrl: string;
+  fileName?: string;
+  clipId?: string;
+  startMs: number;
+  endMs: number;
+  bbox: TrackBbox;
+  sampleFps?: number;
+  onProgress?: (ev: TrackProgressEvent) => void;
+}
+
+export interface TrackObjectResult {
+  ok: boolean;
+  frameCount: number;
+  durationMs: number;
+  videoWidth: number;
+  videoHeight: number;
+  points: TrackPointResult[];
+}
+
 interface WebcutAINativePlugin {
   getAvailableModelsStatus(): Promise<AIModelsStatusSnapshot>;
   downloadModel(options: {
@@ -89,6 +164,25 @@ interface WebcutAINativePlugin {
   deleteModel(options: {
     modelId: string;
   }): Promise<{ok: boolean; modelId: string; deleted: boolean}>;
+  transcribeAudio(options: {
+    sourceUrl: string;
+    fileName?: string;
+    clipId?: string;
+    language?: SubtitleLanguage;
+    trimStartMs?: number;
+    durationMs?: number;
+  }): Promise<TranscribeAudioResult>;
+  cancelTranscribe(): Promise<{ok: boolean}>;
+  trackObject(options: {
+    sourceUrl: string;
+    fileName?: string;
+    clipId?: string;
+    startMs: number;
+    endMs: number;
+    bbox: TrackBbox;
+    sampleFps?: number;
+  }): Promise<TrackObjectResult>;
+  cancelTracking(): Promise<{ok: boolean}>;
   addListener(
     eventName: 'aiModelDownloadProgress',
     listenerFunc: (data: {modelId: string; progress: number}) => void
@@ -104,6 +198,14 @@ interface WebcutAINativePlugin {
   addListener(
     eventName: 'aiModelDownloadError',
     listenerFunc: (data: {modelId: string; message: string}) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'aiTranscribeProgress',
+    listenerFunc: (data: TranscribeProgressEvent) => void
+  ): Promise<PluginListenerHandle>;
+  addListener(
+    eventName: 'aiTrackProgress',
+    listenerFunc: (data: TrackProgressEvent) => void
   ): Promise<PluginListenerHandle>;
 }
 
@@ -134,10 +236,10 @@ export const BUILTIN_AI_MODEL_CATALOG: AIModelInfo[] = [
     title: 'AI Авто-трекинг (Ключи)',
     category: 'keyframe',
     categoryLabel: 'Анимация и трекинг',
-    fileName: 'motion_tracker_nano.onnx',
+    fileName: 'object_tracking_vittrack_2023sep.onnx',
     format: 'onnx',
     downloadUrl:
-      'https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/motion_tracker_nano.onnx',
+      'https://github.com/opencv/opencv_zoo/raw/main/models/object_tracking_vittrack/object_tracking_vittrack_2023sep.onnx',
     expectedSizeBytes: 0,
     installedBytes: 0,
     sha256: '',
@@ -153,10 +255,10 @@ export const BUILTIN_AI_MODEL_CATALOG: AIModelInfo[] = [
     title: 'AI Авто-субтитры (Речь -> Текст)',
     category: 'text',
     categoryLabel: 'Текст и субтитры',
-    fileName: 'whisper_tiny_encoder_int8.onnx',
+    fileName: 'encoder_model_quantized.onnx',
     format: 'onnx',
     downloadUrl:
-      'https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/whisper_tiny_encoder_int8.onnx',
+      'https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/encoder_model_quantized.onnx',
     expectedSizeBytes: 0,
     installedBytes: 0,
     sha256: '',
@@ -204,6 +306,14 @@ export interface WebcutAIBridge {
   onDownloadError(
     listener: (ev: {modelId: string; message: string}) => void
   ): () => void;
+  transcribeAudio(options: TranscribeAudioOptions): Promise<TranscribeAudioResult>;
+  cancelTranscribe(): Promise<void>;
+  onTranscribeProgress(
+    listener: (ev: TranscribeProgressEvent) => void
+  ): () => void;
+  trackObject(options: TrackObjectOptions): Promise<TrackObjectResult>;
+  cancelTracking(): Promise<void>;
+  onTrackProgress(listener: (ev: TrackProgressEvent) => void): () => void;
 }
 
 const progressListeners = new Set<
@@ -215,6 +325,10 @@ const completeListeners = new Set<
 const errorListeners = new Set<
   (ev: {modelId: string; message: string}) => void
 >();
+const transcribeProgressListeners = new Set<
+  (ev: TranscribeProgressEvent) => void
+>();
+const trackProgressListeners = new Set<(ev: TrackProgressEvent) => void>();
 
 let nativeListenersBound = false;
 
@@ -232,6 +346,14 @@ function ensureNativeEventListeners(): void {
 
   void WebcutAINative.addListener('aiModelDownloadError', (ev) => {
     for (const cb of errorListeners) cb(ev);
+  }).catch(() => {});
+
+  void WebcutAINative.addListener('aiTranscribeProgress', (ev) => {
+    for (const cb of transcribeProgressListeners) cb(ev);
+  }).catch(() => {});
+
+  void WebcutAINative.addListener('aiTrackProgress', (ev) => {
+    for (const cb of trackProgressListeners) cb(ev);
   }).catch(() => {});
 }
 
@@ -374,6 +496,93 @@ export const webcutAI: WebcutAIBridge = {
     errorListeners.add(listener);
     return () => {
       errorListeners.delete(listener);
+    };
+  },
+
+  async transcribeAudio(
+    options: TranscribeAudioOptions
+  ): Promise<TranscribeAudioResult> {
+    if (!hasNativeWebcutAI()) {
+      throw new Error(NATIVE_REQUIRED_ERROR);
+    }
+    ensureNativeEventListeners();
+
+    const offProg = options.onProgress
+      ? webcutAI.onTranscribeProgress((ev) => {
+          if (!options.clipId || !ev.clipId || ev.clipId === options.clipId) {
+            options.onProgress?.(ev);
+          }
+        })
+      : null;
+
+    try {
+      return await WebcutAINative.transcribeAudio({
+        sourceUrl: options.sourceUrl,
+        fileName: options.fileName,
+        clipId: options.clipId,
+        language: options.language ?? 'auto',
+        trimStartMs: options.trimStartMs,
+        durationMs: options.durationMs,
+      });
+    } finally {
+      offProg?.();
+    }
+  },
+
+  async cancelTranscribe(): Promise<void> {
+    if (!hasNativeWebcutAI()) return;
+    await WebcutAINative.cancelTranscribe();
+  },
+
+  onTranscribeProgress(
+    listener: (ev: TranscribeProgressEvent) => void
+  ): () => void {
+    ensureNativeEventListeners();
+    transcribeProgressListeners.add(listener);
+    return () => {
+      transcribeProgressListeners.delete(listener);
+    };
+  },
+
+  async trackObject(options: TrackObjectOptions): Promise<TrackObjectResult> {
+    if (!hasNativeWebcutAI()) {
+      throw new Error(NATIVE_REQUIRED_ERROR);
+    }
+    ensureNativeEventListeners();
+
+    const offProg = options.onProgress
+      ? webcutAI.onTrackProgress((ev) => {
+          if (!options.clipId || !ev.clipId || ev.clipId === options.clipId) {
+            options.onProgress?.(ev);
+          }
+        })
+      : null;
+
+    try {
+      return await WebcutAINative.trackObject({
+        sourceUrl: options.sourceUrl,
+        fileName: options.fileName,
+        clipId: options.clipId,
+        startMs: options.startMs,
+        endMs: options.endMs,
+        bbox: options.bbox,
+        sampleFps: options.sampleFps ?? 24,
+      });
+    } finally {
+      offProg?.();
+    }
+  },
+
+  async cancelTracking(): Promise<void> {
+    if (!hasNativeWebcutAI()) return;
+    await WebcutAINative.cancelTracking();
+  },
+
+  onTrackProgress(listener: (ev: TrackProgressEvent) => void): () => void {
+    ensureNativeEventListeners();
+    trackProgressListeners.add(listener);
+    return () => {
+      trackProgressListeners.delete(listener);
     };
   },
 };

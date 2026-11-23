@@ -1225,6 +1225,7 @@ class KtorLanEngine(private val context: Context) {
                 if (msg.has("backgroundColor")) hostRoomState.put("backgroundColor", msg.optString("backgroundColor"))
                 if (msg.has("canvasBackground")) hostRoomState.put("canvasBackground", msg.opt("canvasBackground"))
                 if (msg.has("customFonts")) hostRoomState.put("customFonts", msg.optJSONArray("customFonts"))
+                if (msg.has("trackers")) hostRoomState.put("trackers", msg.optJSONArray("trackers"))
             }
         }
     }

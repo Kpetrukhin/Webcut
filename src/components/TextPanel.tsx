@@ -8,6 +8,7 @@ import {
   Eye,
   EyeOff,
   Italic,
+  Loader2,
   Move,
   Pipette,
   Plus,
@@ -19,6 +20,7 @@ import {
   Type,
   Underline,
   Upload,
+  X,
 } from 'lucide-react';
 import {
   BUILTIN_FONTS,
@@ -26,7 +28,12 @@ import {
   sanitizeFontFamilyName,
 } from '../lib/fontLoader.ts';
 import {uploadFileForP2P} from '../lib/lanSyncBridge.ts';
-import {requestAIFeature} from '../lib/webcutAi.ts';
+import {
+  openAIModelManager,
+  requestAIFeature,
+  webcutAI,
+  type SubtitleLanguage,
+} from '../lib/webcutAi.ts';
 import {
   buildPresetCurvePoints,
   colorToHex,
@@ -62,6 +69,10 @@ interface TextPanelProps {
   onSelectCurvePoint?: (pointId: string | null) => void;
   onSelectClip?: (clipId: string) => void;
   onAddText: (text: string, forceNewTrack: boolean) => void;
+  onAddSubtitleSegments?: (
+    segments: Array<{start: number; duration: number; text: string}>
+  ) => void;
+  onNotify?: (msg: string) => void;
   onUpdateClip: (
     clipId: string,
     patch: Partial<Clip>,
@@ -215,6 +226,8 @@ export const TextPanel: React.FC<TextPanelProps> = ({
   onSelectCurvePoint,
   onSelectClip,
   onAddText,
+  onAddSubtitleSegments,
+  onNotify,
   onUpdateClip,
   onAddCustomFont,
   onOpenTrackpad,
@@ -228,6 +241,11 @@ export const TextPanel: React.FC<TextPanelProps> = ({
   const [forceNewTrack, setForceNewTrack] = useState(true);
   const [uploadingFont, setUploadingFont] = useState(false);
   const [fontError, setFontError] = useState<string | null>(null);
+  const [subLang, setSubLang] = useState<SubtitleLanguage>('auto');
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [transcribePct, setTranscribePct] = useState(0);
+  const [transcribeStage, setTranscribeStage] = useState('');
+  const [subError, setSubError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const isTextSelected = selectedClip?.track === 'text';
@@ -304,6 +322,279 @@ export const TextPanel: React.FC<TextPanelProps> = ({
       currentTime <= c.start + c.duration + 0.02
   );
 
+  const resolveTargetMediaClip = (): Clip | null => {
+    if (
+      selectedClip &&
+      (selectedClip.kind === 'video' || selectedClip.kind === 'audio')
+    ) {
+      return selectedClip;
+    }
+    const videoAtPlayhead = clips.find(
+      (c) =>
+        c.kind === 'video' &&
+        currentTime >= c.start - 0.05 &&
+        currentTime <= c.start + c.duration + 0.05
+    );
+    if (videoAtPlayhead) return videoAtPlayhead;
+    const audioAtPlayhead = clips.find(
+      (c) =>
+        c.kind === 'audio' &&
+        currentTime >= c.start - 0.05 &&
+        currentTime <= c.start + c.duration + 0.05
+    );
+    if (audioAtPlayhead) return audioAtPlayhead;
+    return (
+      clips.find((c) => c.kind === 'video') ??
+      clips.find((c) => c.kind === 'audio') ??
+      null
+    );
+  };
+
+  const targetMediaClip = resolveTargetMediaClip();
+
+  const handleGenerateSubtitles = async () => {
+    if (isTranscribing) return;
+    setSubError(null);
+
+    if (!webcutAI.isNativeAvailable()) {
+      requestAIFeature(
+        'whisper_tiny_asr',
+        'AI Авто-субтитры (Речь → Текст)'
+      );
+      return;
+    }
+
+    const targetClip = resolveTargetMediaClip();
+    if (!targetClip) {
+      setSubError('Добавьте видео или аудиоклип на таймлайн.');
+      return;
+    }
+
+    setIsTranscribing(true);
+    setTranscribePct(0);
+    setTranscribeStage('Подготовка Whisper Tiny...');
+
+    try {
+      await webcutAI.prepareModel('whisper_tiny_asr');
+
+      let sourceUrl = targetClip.mediaRemoteUrl || targetClip.src || '';
+      let fileName = targetClip.mediaFileName;
+
+      if (
+        (!sourceUrl || sourceUrl.startsWith('blob:')) &&
+        !fileName &&
+        sourceUrl
+      ) {
+        setTranscribeStage('Подготовка медиафайла...');
+        const resp = await fetch(sourceUrl);
+        const blob = await resp.blob();
+        const ext = targetClip.kind === 'audio' ? 'm4a' : 'mp4';
+        const safeName = `${(targetClip.name || 'clip').replace(/[^a-zA-Z0-9._-]/g, '_')}.${ext}`;
+        const file = new File([blob], safeName, {
+          type:
+            blob.type ||
+            (targetClip.kind === 'audio' ? 'audio/mp4' : 'video/mp4'),
+        });
+        const uploaded = await uploadFileForP2P(
+          file,
+          targetClip.kind === 'audio' ? 'audio' : 'video'
+        );
+        sourceUrl = uploaded.shareUrl || uploaded.localSrc;
+        fileName = uploaded.fileName;
+      }
+
+      if (!sourceUrl && !fileName) {
+        throw new Error('Источник медиаклипа недоступен.');
+      }
+
+      const clipSpeed = Math.max(0.1, targetClip.speed || 1);
+      const trimStartMs = Math.max(
+        0,
+        Math.round((targetClip.trimStart || 0) * 1000)
+      );
+      const durationMs = Math.max(
+        200,
+        Math.round(targetClip.duration * clipSpeed * 1000)
+      );
+
+      const res = await webcutAI.transcribeAudio({
+        sourceUrl,
+        fileName,
+        clipId: targetClip.id,
+        language: subLang,
+        trimStartMs,
+        durationMs,
+        onProgress: (ev) => {
+          setTranscribePct(
+            Math.max(0, Math.min(100, Math.round(ev.progress)))
+          );
+          if (ev.stage) setTranscribeStage(ev.stage);
+        },
+      });
+
+      const clipEnd = targetClip.start + targetClip.duration;
+      const timelineSegments = (res.segments ?? [])
+        .map((seg) => {
+          const startSec = targetClip.start + seg.startMs / 1000 / clipSpeed;
+          const rawEndSec = targetClip.start + seg.endMs / 1000 / clipSpeed;
+          const clampedEnd = Math.min(
+            clipEnd,
+            Math.max(startSec + 0.25, rawEndSec)
+          );
+          return {
+            start: Math.round(startSec * 100) / 100,
+            duration: Math.max(
+              0.25,
+              Math.round((clampedEnd - startSec) * 100) / 100
+            ),
+            text: seg.text.trim(),
+          };
+        })
+        .filter((seg) => seg.text.length > 0 && seg.start < clipEnd);
+
+      if (timelineSegments.length === 0) {
+        onNotify?.('Речь в выбранном клипе не обнаружена');
+        setSubError('Речь в выбранном клипе не обнаружена.');
+        return;
+      }
+
+      if (onAddSubtitleSegments) {
+        onAddSubtitleSegments(timelineSegments);
+      } else {
+        for (const seg of timelineSegments) {
+          onAddText(seg.text, false);
+        }
+      }
+      onNotify?.(`Создано субтитров: ${timelineSegments.length}`);
+    } catch (err) {
+      const msg =
+        err instanceof Error ? err.message : 'Ошибка генерации субтитров';
+      const lower = msg.toLowerCase();
+      if (
+        lower.includes('не установлен') ||
+        lower.includes('не найден') ||
+        lower.includes('not_installed')
+      ) {
+        openAIModelManager({
+          focusModelId: 'whisper_tiny_asr',
+          featureTitle: 'AI Авто-субтитры (Речь → Текст)',
+        });
+      }
+      if (!lower.includes('отменен')) {
+        setSubError(msg);
+      }
+    } finally {
+      setIsTranscribing(false);
+    }
+  };
+
+  const renderAutoSubtitlesBox = (compact: boolean) => {
+    const langOptions: Array<{id: SubtitleLanguage; label: string}> = [
+      {id: 'auto', label: 'Авто'},
+      {id: 'ru', label: 'Русский'},
+      {id: 'en', label: 'English'},
+    ];
+
+    return (
+      <div
+        className={`space-y-2 rounded-xl border border-violet-400/35 bg-violet-500/10 ${
+          compact ? 'p-2' : 'p-2.5'
+        }`}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <div className="flex min-w-0 items-center gap-1.5">
+            <Sparkles className="h-3.5 w-3.5 shrink-0 text-violet-300" />
+            <span className="truncate text-[11px] font-semibold text-violet-100">
+              {targetMediaClip
+                ? `Клип: ${targetMediaClip.name}`
+                : 'Видео/аудио не выбрано'}
+            </span>
+          </div>
+          <div className="flex shrink-0 items-center gap-1 rounded-lg bg-zinc-950/70 p-0.5">
+            {langOptions.map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                disabled={isTranscribing}
+                onClick={() => setSubLang(opt.id)}
+                className={`rounded-md px-1.5 py-0.5 text-[10px] font-semibold transition ${
+                  subLang === opt.id
+                    ? 'bg-violet-500 text-white'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            disabled={isTranscribing}
+            onClick={() => void handleGenerateSubtitles()}
+            className={`flex flex-1 items-center justify-between gap-2 rounded-lg border border-violet-400/45 bg-violet-500/20 px-3 font-semibold text-violet-50 transition hover:bg-violet-500/30 disabled:opacity-65 active:scale-[0.99] ${
+              compact ? 'h-8 text-[11px]' : 'h-9 text-xs'
+            }`}
+          >
+            <span className="flex items-center gap-1.5">
+              {isTranscribing ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-violet-200" />
+              ) : (
+                <Sparkles className="h-3.5 w-3.5 text-violet-300" />
+              )}
+              <span>
+                {isTranscribing
+                  ? `Распознавание ${transcribePct}%...`
+                  : '✨ Автосубтитры'}
+              </span>
+            </span>
+            <span className="rounded bg-violet-500/35 px-1.5 py-0.5 font-mono text-[9px] text-violet-100">
+              ONNX
+            </span>
+          </button>
+
+          {isTranscribing && (
+            <button
+              type="button"
+              onClick={() => void webcutAI.cancelTranscribe()}
+              title="Отменить распознавание"
+              aria-label="Отменить распознавание"
+              className={`flex shrink-0 items-center justify-center rounded-lg border border-rose-400/40 bg-rose-500/15 text-rose-200 hover:bg-rose-500/25 ${
+                compact ? 'h-8 w-8' : 'h-9 w-9'
+              }`}
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+
+        {isTranscribing && (
+          <div className="space-y-1">
+            <div className="h-1.5 w-full overflow-hidden rounded-full bg-zinc-900">
+              <div
+                className="h-full rounded-full bg-violet-400 transition-all duration-200"
+                style={{width: `${Math.max(4, transcribePct)}%`}}
+              />
+            </div>
+            {transcribeStage && (
+              <p className="truncate text-[10px] text-violet-200/80">
+                {transcribeStage}
+              </p>
+            )}
+          </div>
+        )}
+
+        {subError && (
+          <p className="rounded-lg border border-rose-500/30 bg-rose-500/10 px-2 py-1 text-[10px] text-rose-300">
+            {subError}
+          </p>
+        )}
+      </div>
+    );
+  };
+
   if (!isTextSelected || !selectedClip) {
     return (
       <div className="space-y-4">
@@ -329,21 +620,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
           )}
         </div>
 
-        <button
-          type="button"
-          onClick={() =>
-            requestAIFeature('whisper_tiny_asr', 'AI Авто-субтитры (Речь → Текст)')
-          }
-          className="flex h-10 w-full items-center justify-between gap-2 rounded-xl border border-violet-400/40 bg-violet-500/15 px-3 text-xs font-semibold text-violet-100 transition hover:bg-violet-500/25 active:scale-[0.99]"
-        >
-          <span className="flex items-center gap-1.5">
-            <Sparkles className="h-3.5 w-3.5 text-violet-300" />
-            <span>✨ AI Авто-субтитры</span>
-          </span>
-          <span className="rounded bg-violet-500/30 px-1.5 py-0.5 font-mono text-[9px] text-violet-200">
-            ONNX
-          </span>
-        </button>
+        {renderAutoSubtitlesBox(false)}
 
         <label className="flex cursor-pointer items-center justify-between rounded-xl border border-white/10 bg-zinc-900/60 px-3 py-2 text-xs text-zinc-300">
           <span>Создавать новую дорожку текста</span>
@@ -467,21 +744,7 @@ export const TextPanel: React.FC<TextPanelProps> = ({
             </div>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={() =>
-            requestAIFeature('whisper_tiny_asr', 'AI Авто-субтитры (Речь → Текст)')
-          }
-          className="flex h-8 w-full items-center justify-between gap-2 rounded-lg border border-violet-400/35 bg-violet-500/15 px-2.5 text-[11px] font-semibold text-violet-100 transition hover:bg-violet-500/25 active:scale-[0.99]"
-        >
-          <span className="flex items-center gap-1.5">
-            <Sparkles className="h-3 w-3 text-violet-300" />
-            <span>✨ AI Авто-субтитры</span>
-          </span>
-          <span className="rounded bg-violet-500/30 px-1.5 py-0.5 font-mono text-[9px] text-violet-200">
-            ONNX
-          </span>
-        </button>
+        {renderAutoSubtitlesBox(true)}
       </div>
 
       {/* Scrollable Sub-Tab Content */}

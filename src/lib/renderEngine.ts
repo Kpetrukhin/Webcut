@@ -4,6 +4,7 @@ import type {
   Clip,
   Collaborator,
   FilterPreset,
+  MotionTrackerBeacon,
   Track,
 } from '../shared/types.ts';
 import type {StudioAudioEngine} from './audioEngine.ts';
@@ -17,10 +18,12 @@ import {evaluateClipTransform} from './keyframeEngine.ts';
 import {applyMaskToCanvas, drawMaskInteractiveGuide} from './maskEngine.ts';
 import {resolveMediaSrc} from './serverConfig.ts';
 import {
+  drawPolygonPointsGeometry,
   drawShapeGeometry,
   getShapeCatalogItem,
   normalizeShapeStyle,
 } from './shapeEngine.ts';
+import {evaluateShapePoints, getPolygonBoundsNorm} from './trackerEngine.ts';
 import {
   drawTextClipCanvas,
   getTextClipUnwarpedBox,
@@ -1037,17 +1040,12 @@ function drawShapeClip(
   time: number,
   selectedClipId: string | null,
   collaborators: Collaborator[],
-  currentUserId?: string
+  currentUserId?: string,
+  trackers?: MotionTrackerBeacon[]
 ) {
   const style = normalizeShapeStyle(clip.shapeStyle);
   const meta = getShapeCatalogItem(style.shapeType);
   const kf = evaluateClipTransform(clip, time);
-  const sxFactor = kf.scaleX;
-  const syFactor = kf.scaleY;
-  const layerW = Math.max(12, cw * kf.scale * sxFactor);
-  const layerH = Math.max(12, (cw * kf.scale / meta.aspect) * syFactor);
-  const cx = cw * kf.x;
-  const cy = ch * kf.y;
   const sf = cw / 720;
 
   const elapsed = time - clip.start;
@@ -1069,12 +1067,119 @@ function drawShapeClip(
     if (clip.transitionOut === 'fade') alpha *= t;
   }
 
+  const grade = getClipEffectiveAdjustments(clip);
+  const hasGrade = !isNeutralColorGrade(grade);
+
+  if (style.shapeType === 'points') {
+    const evalPts = evaluateShapePoints(clip, time, trackers);
+    const bounds = getPolygonBoundsNorm(evalPts);
+    const polyCx = bounds.centerX * cw;
+    const polyCy = bounds.centerY * ch;
+    const polyW = Math.max(24, bounds.width * cw);
+    const polyH = Math.max(24, bounds.height * ch);
+    const ptsPx = evalPts.map((pt) => {
+      const px = pt.x * cw;
+      const py = pt.y * ch;
+      if (animScale === 1) return {x: px, y: py};
+      return {
+        x: polyCx + (px - polyCx) * animScale,
+        y: polyCy + (py - polyCy) * animScale,
+      };
+    });
+
+    const renderPolygonIntoTarget = (
+      targetCtx: CanvasRenderingContext2D,
+      layerAlpha: number,
+      composite: GlobalCompositeOperation,
+      maskOnly: boolean
+    ) => {
+      if (!maskOnly && hasGrade) {
+        const off = getLayerOffscreenCtx(cw, ch);
+        if (off) {
+          drawPolygonPointsGeometry(off.ctx, ptsPx, style, sf, false);
+          let srcCanvas: HTMLCanvasElement = off.canvas;
+          const graded = applyColorGradeShader(srcCanvas, cw, ch, grade, time);
+          if (graded instanceof HTMLCanvasElement) srcCanvas = graded;
+          targetCtx.save();
+          targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
+          targetCtx.globalCompositeOperation = composite;
+          if (clip.blur && clip.blur > 0) {
+            targetCtx.filter = `blur(${clip.blur}px)`;
+          }
+          targetCtx.drawImage(srcCanvas, 0, 0, cw, ch);
+          targetCtx.restore();
+          return;
+        }
+      }
+
+      targetCtx.save();
+      targetCtx.globalAlpha = Math.max(0, Math.min(1, layerAlpha));
+      targetCtx.globalCompositeOperation = composite;
+      if (!maskOnly && clip.blur && clip.blur > 0) {
+        targetCtx.filter = `blur(${clip.blur}px)`;
+      }
+      drawPolygonPointsGeometry(targetCtx, ptsPx, style, sf, maskOnly);
+      targetCtx.restore();
+    };
+
+    if (clip.adjustmentMask) {
+      const maskBuf = getAdjMaskAlphaCtx(cw, ch);
+      if (maskBuf) {
+        renderPolygonIntoTarget(maskBuf.ctx, 1, 'source-over', true);
+        if (clip.mask) {
+          applyMaskToCanvas(maskBuf.canvas, cw, ch, clip.mask);
+        }
+        applyObjectAdjustmentMask(ctx, cw, ch, clip, time, maskBuf.canvas, alpha);
+      }
+    } else if (clip.mask) {
+      const scratch = getClipScratchCtx(cw, ch);
+      if (scratch) {
+        renderPolygonIntoTarget(scratch.ctx, 1, 'source-over', false);
+        applyMaskToCanvas(scratch.canvas, cw, ch, clip.mask);
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, Math.min(1, alpha));
+        ctx.globalCompositeOperation = clip.blendMode ?? 'source-over';
+        ctx.drawImage(scratch.canvas, 0, 0);
+        ctx.restore();
+      } else {
+        renderPolygonIntoTarget(ctx, alpha, clip.blendMode ?? 'source-over', false);
+      }
+    } else {
+      renderPolygonIntoTarget(ctx, alpha, clip.blendMode ?? 'source-over', false);
+    }
+
+    const peerLock = getClipPeerLock(clip, collaborators, currentUserId);
+    if (clip.id === selectedClipId || peerLock) {
+      drawLayerSelectionOutline(
+        ctx,
+        polyCx,
+        polyCy,
+        polyW,
+        polyH,
+        0,
+        undefined,
+        0,
+        clip.adjustmentMask ? '#c084fc' : '#22d3ee',
+        peerLock,
+        sf,
+        Boolean(clip.adjustmentMask),
+        true
+      );
+    }
+    return;
+  }
+
+  const sxFactor = kf.scaleX;
+  const syFactor = kf.scaleY;
+  const layerW = Math.max(12, cw * kf.scale * sxFactor);
+  const layerH = Math.max(12, (cw * kf.scale / meta.aspect) * syFactor);
+  const cx = cw * kf.x;
+  const cy = ch * kf.y;
+
   const drawW = layerW * animScale;
   const drawH = layerH * animScale;
   const rotRad = (kf.rotation * Math.PI) / 180;
   const hasWarp = !isIdentityWarp(kf.warp);
-  const grade = getClipEffectiveAdjustments(clip);
-  const hasGrade = !isNeutralColorGrade(grade);
 
   const renderShapeIntoTarget = (
     targetCtx: CanvasRenderingContext2D,
@@ -1222,7 +1327,8 @@ function drawOverlayClip(
   pool: MediaPool,
   selectedClipId: string | null,
   collaborators: Collaborator[],
-  currentUserId?: string
+  currentUserId?: string,
+  trackers?: MotionTrackerBeacon[]
 ) {
   if (clip.kind === 'shape') {
     drawShapeClip(
@@ -1233,7 +1339,8 @@ function drawOverlayClip(
       time,
       selectedClipId,
       collaborators,
-      currentUserId
+      currentUserId,
+      trackers
     );
     return;
   }
@@ -1729,7 +1836,8 @@ export function getClipLayerBox(
   cw: number,
   ch: number,
   time: number,
-  pool: MediaPool
+  pool: MediaPool,
+  trackers?: MotionTrackerBeacon[]
 ): ClipLayerBox | null {
   if (clip.track === 'audio' || clip.track === 'adjustment' || clip.kind === 'adjustment') {
     return null;
@@ -1744,6 +1852,17 @@ export function getClipLayerBox(
 
   if (clip.kind === 'shape') {
     const style = normalizeShapeStyle(clip.shapeStyle);
+    if (style.shapeType === 'points') {
+      const pts = evaluateShapePoints(clip, time, trackers);
+      const b = getPolygonBoundsNorm(pts);
+      return {
+        centerX: b.centerX * cw,
+        centerY: b.centerY * ch,
+        layerW: Math.max(24, b.width * cw),
+        layerH: Math.max(24, b.height * ch),
+        rotationDeg: 0,
+      };
+    }
     const meta = getShapeCatalogItem(style.shapeType);
     return {
       centerX: cw * kf.x,
@@ -2043,7 +2162,8 @@ export function renderCompositeFrame(
   snapGuides?: {x: boolean; y: boolean},
   currentUserId?: string,
   maskEditClipId?: string | null,
-  canvasBackground?: CanvasBackground
+  canvasBackground?: CanvasBackground,
+  trackers?: MotionTrackerBeacon[]
 ) {
 
   const trackList = tracks ?? [];
@@ -2157,7 +2277,8 @@ export function renderCompositeFrame(
         pool,
         selectedClipId,
         collaborators,
-        currentUserId
+        currentUserId,
+        trackers
       );
     } else if (clip.track === 'text') {
       drawTextClip(

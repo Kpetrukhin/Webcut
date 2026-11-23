@@ -12,11 +12,19 @@ import type {
   ClipMask,
   ClipWarp,
   Collaborator,
+  MotionTrackerBeacon,
+  PolygonPoint,
   ProjectFont,
   TextCurvePoint,
   Track,
   WarpPoint,
 } from '../shared/types.ts';
+import type {TrackBbox} from '../lib/webcutAi.ts';
+import {
+  evaluateShapePoints,
+  evaluateTrackerAtTime,
+  getDefaultPolygonPoints,
+} from '../lib/trackerEngine.ts';
 import {preloadProjectFonts, subscribeFontLoads} from '../lib/fontLoader.ts';
 import {evaluateClipTransform} from '../lib/keyframeEngine.ts';
 import type {StudioAudioEngine} from '../lib/audioEngine.ts';
@@ -95,6 +103,19 @@ interface PreviewCanvasProps {
   ) => void;
   warpEditActive?: boolean;
   onUpdateWarp?: (clipId: string, warp: ClipWarp, commit: boolean) => void;
+  trackers?: MotionTrackerBeacon[];
+  onUpdatePolygonPoints?: (
+    clipId: string,
+    points: PolygonPoint[],
+    commit: boolean
+  ) => void;
+  objectTrackPicker?: {
+    bbox: TrackBbox;
+    isRunning: boolean;
+    progress: number;
+    livePoint?: {x: number; y: number} | null;
+  } | null;
+  onChangeObjectTrackBbox?: (bbox: TrackBbox) => void;
   onLockLayer?: (layerId: string, locked: boolean) => boolean;
   onSelectClip: (clipId: string | null) => void;
   onDoubleClickTextClip?: (clipId: string) => void;
@@ -161,6 +182,10 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   onUpdateCurvePoints,
   warpEditActive = false,
   onUpdateWarp,
+  trackers = [],
+  onUpdatePolygonPoints,
+  objectTrackPicker = null,
+  onChangeObjectTrackBbox,
   onLockLayer,
   onSelectClip,
   onDoubleClickTextClip,
@@ -267,6 +292,32 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
   const lastCurvePointTapRef = useRef<{pointId: string; ts: number} | null>(
     null
   );
+  const polyDragRef = useRef<
+    | {
+        clipId: string;
+        kind: 'vertex';
+        pointId: string;
+        points: PolygonPoint[];
+      }
+    | {
+        clipId: string;
+        kind: 'body';
+        startNx: number;
+        startNy: number;
+        origPoints: PolygonPoint[];
+        points: PolygonPoint[];
+      }
+    | null
+  >(null);
+  const lastPolyPointTapRef = useRef<{pointId: string; ts: number} | null>(
+    null
+  );
+  const trackBboxDragRef = useRef<{
+    mode: 'move' | 'nw' | 'ne' | 'sw' | 'se';
+    startNx: number;
+    startNy: number;
+    origBbox: TrackBbox;
+  } | null>(null);
 
   const stageRef = useRef<HTMLDivElement | null>(null);
   const [stageSize, setStageSize] = useState<{w: number; h: number}>({w: 0, h: 0});
@@ -356,6 +407,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     currentUserId,
     maskEditClipId,
     canvasBackground,
+    trackers,
   });
   renderStateRef.current = {
     width,
@@ -371,6 +423,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     currentUserId,
     maskEditClipId,
     canvasBackground,
+    trackers,
   };
 
   useEffect(() => {
@@ -409,7 +462,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         s.effectiveSnapGuides,
         s.currentUserId,
         s.maskEditClipId,
-        s.canvasBackground
+        s.canvasBackground,
+        s.trackers
       );
     });
     return () => {
@@ -425,6 +479,7 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     aspectRatio,
     backgroundColor,
     canvasBackground,
+    trackers,
     currentTime,
     renderedSelectedId,
     collaborators,
@@ -460,7 +515,8 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
           s.effectiveSnapGuides,
           s.currentUserId,
           s.maskEditClipId,
-          s.canvasBackground
+          s.canvasBackground,
+          s.trackers
         );
       }
       raf = requestAnimationFrame(loop);
@@ -497,8 +553,33 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
         if (hitTestTextClip(c, nx, ny, width, height, currentTime)) {
           return c;
         }
+      } else if (c.kind === 'shape' && c.shapeStyle?.shapeType === 'points') {
+        const pts = evaluateShapePoints(c, currentTime, trackers);
+        const px = nx * width;
+        const py = ny * height;
+        const ptsPx = pts.map((p) => ({x: p.x * width, y: p.y * height}));
+        const segCount = ptsPx.length >= 3 ? ptsPx.length : Math.max(0, ptsPx.length - 1);
+        const hitThresh = Math.max(24, (c.shapeStyle?.strokeWidth ?? 6) + 16);
+        let hitPoly = false;
+        for (let s = 0; s < segCount; s++) {
+          const a = ptsPx[s];
+          const b = ptsPx[(s + 1) % ptsPx.length];
+          const abx = b.x - a.x;
+          const aby = b.y - a.y;
+          const lenSq = abx * abx + aby * aby;
+          const t = lenSq > 1e-6 ? Math.max(0, Math.min(1, ((px - a.x) * abx + (py - a.y) * aby) / lenSq)) : 0;
+          const d = Math.hypot(px - (a.x + abx * t), py - (a.y + aby * t));
+          if (d <= hitThresh) {
+            hitPoly = true;
+            break;
+          }
+        }
+        if (!hitPoly && ptsPx.length >= 3 && pointInPolygon(px, py, ptsPx)) {
+          hitPoly = true;
+        }
+        if (hitPoly) return c;
       } else if (c.track === 'overlay') {
-        const box = getClipLayerBox(c, width, height, currentTime, mediaPool);
+        const box = getClipLayerBox(c, width, height, currentTime, mediaPool, trackers);
         if (box) {
           const px = nx * width;
           const py = ny * height;
@@ -818,6 +899,101 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     };
   })();
 
+  const activePolygonClip = selectedClipId
+    ? clips.find(
+        (c) =>
+          c.id === selectedClipId &&
+          c.kind === 'shape' &&
+          c.shapeStyle?.shapeType === 'points' &&
+          currentTime >= c.start &&
+          currentTime < c.start + c.duration
+      ) ?? null
+    : null;
+
+  const polygonOverlay = (() => {
+    if (
+      !activePolygonClip ||
+      isPlaying ||
+      !showSelectionOutline ||
+      chromaKeyPickerActive ||
+      colorPickerActive ||
+      maskEditActive ||
+      warpEditActive ||
+      Boolean(objectTrackPicker)
+    ) {
+      return null;
+    }
+    const evaluatedPts = evaluateShapePoints(
+      activePolygonClip,
+      currentTime,
+      trackers
+    );
+    const localPts = evaluateShapePoints(
+      activePolygonClip,
+      currentTime,
+      undefined
+    );
+    const ptsPx = evaluatedPts.map((pt) => ({
+      ...pt,
+      cx: pt.x * width,
+      cy: pt.y * height,
+    }));
+    const segCount =
+      ptsPx.length >= 3 ? ptsPx.length : Math.max(0, ptsPx.length - 1);
+    const edgeMidpoints = Array.from({length: segCount}, (_, idx) => {
+      const a = ptsPx[idx];
+      const b = ptsPx[(idx + 1) % ptsPx.length];
+      return {
+        segIdx: idx,
+        cx: (a.cx + b.cx) / 2,
+        cy: (a.cy + b.cy) / 2,
+        nx: (a.x + b.x) / 2,
+        ny: (a.y + b.y) / 2,
+      };
+    });
+    const pathD =
+      ptsPx.length >= 2
+        ? ptsPx
+            .map(
+              (p, i) =>
+                `${i === 0 ? 'M' : 'L'} ${p.cx.toFixed(1)} ${p.cy.toFixed(1)}`
+            )
+            .join(' ') + (ptsPx.length >= 3 ? ' Z' : '')
+        : '';
+    return {
+      clip: activePolygonClip,
+      evaluatedPts,
+      localPts: localPts.length >= 2 ? localPts : getDefaultPolygonPoints(),
+      ptsPx,
+      edgeMidpoints,
+      pathD,
+    };
+  })();
+
+  const activeTrackerMarkers = (() => {
+    if (isPlaying || trackers.length === 0) return [];
+    if (!polygonOverlay && !objectTrackPicker) return [];
+    return trackers
+      .map((t) => {
+        const pos = evaluateTrackerAtTime(t, currentTime);
+        if (!pos) return null;
+        return {
+          id: t.id,
+          name: t.name,
+          color: t.color,
+          cx: pos.x * width,
+          cy: pos.y * height,
+        };
+      })
+      .filter(Boolean) as Array<{
+      id: string;
+      name: string;
+      color: string;
+      cx: number;
+      cy: number;
+    }>;
+  })();
+
   const handlePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -843,10 +1019,134 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
     if (activePointersRef.current.size >= 2) {
       curveDragRef.current = null;
       warpDragRef.current = null;
+      polyDragRef.current = null;
       if (existingSelected) {
         beginGestureForClip(existingSelected, maskEditActive && existingSelected.mask ? 'mask' : 'clip');
       }
       return;
+    }
+
+    if (polygonOverlay && onUpdatePolygonPoints) {
+      const pxPerCss = width / Math.max(1, rect.width);
+      const canvasX = nx * width;
+      const canvasY = ny * height;
+      const ptHitR = 24 * pxPerCss;
+      const edgeHitR = 14 * pxPerCss;
+
+      let bestVertex: (typeof polygonOverlay.ptsPx)[number] | null = null;
+      let bestVertexDist = Infinity;
+      for (const pt of polygonOverlay.ptsPx) {
+        const d = Math.hypot(canvasX - pt.cx, canvasY - pt.cy);
+        if (d <= ptHitR && d < bestVertexDist) {
+          bestVertexDist = d;
+          bestVertex = pt;
+        }
+      }
+
+      const rawPoints = polygonOverlay.localPts;
+
+      if (bestVertex) {
+        const now = Date.now();
+        if (
+          lastPolyPointTapRef.current &&
+          lastPolyPointTapRef.current.pointId === bestVertex.id &&
+          now - lastPolyPointTapRef.current.ts < 320 &&
+          rawPoints.length > 2
+        ) {
+          lastPolyPointTapRef.current = null;
+          const nextPts = rawPoints.filter((p) => p.id !== bestVertex!.id);
+          onUpdatePolygonPoints(polygonOverlay.clip.id, nextPts, true);
+          return;
+        }
+        lastPolyPointTapRef.current = {pointId: bestVertex.id, ts: now};
+        if (bestVertex.trackerId) {
+          // Bound vertex follows tracker beacon dynamically
+          return;
+        }
+        if (
+          polygonOverlay.clip.lockedByUserId &&
+          polygonOverlay.clip.lockedByUserId !== currentUserId
+        ) {
+          onLockLayer?.(polygonOverlay.clip.id, true);
+          return;
+        }
+        onLockLayer?.(polygonOverlay.clip.id, true);
+        polyDragRef.current = {
+          clipId: polygonOverlay.clip.id,
+          kind: 'vertex',
+          pointId: bestVertex.id,
+          points: rawPoints,
+        };
+        return;
+      }
+
+      // Check click on edge midpoint '+' or close to edge segment to insert a vertex
+      let bestEdge: {segIdx: number; cx: number; cy: number; dist: number} | null =
+        null;
+      const segCount =
+        polygonOverlay.ptsPx.length >= 3
+          ? polygonOverlay.ptsPx.length
+          : Math.max(0, polygonOverlay.ptsPx.length - 1);
+      for (let idx = 0; idx < segCount; idx++) {
+        const a = polygonOverlay.ptsPx[idx];
+        const b = polygonOverlay.ptsPx[(idx + 1) % polygonOverlay.ptsPx.length];
+        const abx = b.cx - a.cx;
+        const aby = b.cy - a.cy;
+        const lenSq = abx * abx + aby * aby;
+        const t =
+          lenSq > 1e-6
+            ? Math.max(0, Math.min(1, ((canvasX - a.cx) * abx + (canvasY - a.cy) * aby) / lenSq))
+            : 0;
+        const px = a.cx + abx * t;
+        const py = a.cy + aby * t;
+        const d = Math.hypot(canvasX - px, canvasY - py);
+        if (d <= edgeHitR && (!bestEdge || d < bestEdge.dist)) {
+          bestEdge = {segIdx: idx, cx: px, cy: py, dist: d};
+        }
+      }
+
+      if (bestEdge) {
+        const newPt: PolygonPoint = {
+          id: `pt-${Math.random().toString(36).slice(2, 7)}`,
+          x: Math.round((bestEdge.cx / width) * 1000) / 1000,
+          y: Math.round((bestEdge.cy / height) * 1000) / 1000,
+        };
+        const insertAt = bestEdge.segIdx + 1;
+        const nextPts = [
+          ...rawPoints.slice(0, insertAt),
+          newPt,
+          ...rawPoints.slice(insertAt),
+        ];
+        onLockLayer?.(polygonOverlay.clip.id, true);
+        onUpdatePolygonPoints(polygonOverlay.clip.id, nextPts, false);
+        polyDragRef.current = {
+          clipId: polygonOverlay.clip.id,
+          kind: 'vertex',
+          pointId: newPt.id,
+          points: nextPts,
+        };
+        return;
+      }
+
+      if (
+        polygonOverlay.ptsPx.length >= 3 &&
+        pointInPolygon(
+          canvasX,
+          canvasY,
+          polygonOverlay.ptsPx.map((p) => ({x: p.cx, y: p.cy}))
+        )
+      ) {
+        onLockLayer?.(polygonOverlay.clip.id, true);
+        polyDragRef.current = {
+          clipId: polygonOverlay.clip.id,
+          kind: 'body',
+          startNx: nx,
+          startNy: ny,
+          origPoints: rawPoints.map((p) => ({...p})),
+          points: rawPoints.map((p) => ({...p})),
+        };
+        return;
+      }
     }
 
     if (warpOverlay && onUpdateWarp) {
@@ -1168,6 +1468,47 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       }
     }
 
+    if (polyDragRef.current && activePointersRef.current.has(e.pointerId)) {
+      activePointersRef.current.set(e.pointerId, {x: e.clientX, y: e.clientY});
+      const pointers = Array.from(activePointersRef.current.values());
+      if (pointers.length >= 2) {
+        polyDragRef.current = null;
+      } else if (onUpdatePolygonPoints) {
+        const drag = polyDragRef.current;
+        const nx = (e.clientX - rect.left) / rect.width;
+        const ny = (e.clientY - rect.top) / rect.height;
+        if (drag.kind === 'vertex') {
+          const snapped = applySnapToCoords(nx, ny, rect);
+          const nextPts = drag.points.map((pt) =>
+            pt.id === drag.pointId
+              ? {
+                  ...pt,
+                  x: Math.round(snapped.x * 1000) / 1000,
+                  y: Math.round(snapped.y * 1000) / 1000,
+                }
+              : pt
+          );
+          drag.points = nextPts;
+          onUpdatePolygonPoints(drag.clipId, nextPts, false);
+        } else {
+          const dx = nx - drag.startNx;
+          const dy = ny - drag.startNy;
+          const nextPts = drag.origPoints.map((pt) =>
+            pt.trackerId
+              ? pt
+              : {
+                  ...pt,
+                  x: Math.round((pt.x + dx) * 1000) / 1000,
+                  y: Math.round((pt.y + dy) * 1000) / 1000,
+                }
+          );
+          drag.points = nextPts;
+          onUpdatePolygonPoints(drag.clipId, nextPts, false);
+        }
+        return;
+      }
+    }
+
     if (curveDragRef.current && activePointersRef.current.has(e.pointerId)) {
       activePointersRef.current.set(e.pointerId, {x: e.clientX, y: e.clientY});
       const pointers = Array.from(activePointersRef.current.values());
@@ -1304,6 +1645,16 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
       const drag = warpDragRef.current;
       warpDragRef.current = null;
       onUpdateWarp?.(drag.clipId, drag.warp, true);
+      onLockLayer?.(drag.clipId, false);
+      return;
+    }
+
+    if (polyDragRef.current) {
+      const drag = polyDragRef.current;
+      polyDragRef.current = null;
+      snapStateRef.current = {x: false, y: false};
+      setSnapGuides({x: false, y: false});
+      onUpdatePolygonPoints?.(drag.clipId, drag.points, true);
       onLockLayer?.(drag.clipId, false);
       return;
     }
@@ -1807,6 +2158,348 @@ export const PreviewCanvas: React.FC<PreviewCanvasProps> = ({
               </g>
             )}
           </svg>
+        )}
+
+        {polygonOverlay && polygonOverlay.pathD && (
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            className="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible"
+          >
+            {/* Dark halo & dashed cyan polygon outline */}
+            <path
+              d={polygonOverlay.pathD}
+              fill="none"
+              stroke="rgba(9, 9, 11, 0.72)"
+              strokeWidth={Math.max(4, width * 0.0065)}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+            />
+            <path
+              d={polygonOverlay.pathD}
+              fill="none"
+              stroke="#22d3ee"
+              strokeWidth={Math.max(2, width * 0.0032)}
+              strokeLinejoin="round"
+              strokeLinecap="round"
+              strokeDasharray={`${Math.max(6, width * 0.009)} ${Math.max(4, width * 0.006)}`}
+            />
+
+            {/* Edge midpoint '+' hints */}
+            {polygonOverlay.edgeMidpoints.map((mid) => {
+              const r = Math.max(6.5, width * 0.01);
+              return (
+                <g key={`poly-mid-${mid.segIdx}`}>
+                  <circle
+                    cx={mid.cx}
+                    cy={mid.cy}
+                    r={r}
+                    fill="rgba(9, 9, 11, 0.75)"
+                    stroke="#22d3ee"
+                    strokeWidth={Math.max(1.5, width * 0.0024)}
+                  />
+                  <line
+                    x1={mid.cx - r * 0.45}
+                    y1={mid.cy}
+                    x2={mid.cx + r * 0.45}
+                    y2={mid.cy}
+                    stroke="#ffffff"
+                    strokeWidth={Math.max(1.5, width * 0.0022)}
+                    strokeLinecap="round"
+                  />
+                  <line
+                    x1={mid.cx}
+                    y1={mid.cy - r * 0.45}
+                    x2={mid.cx}
+                    y2={mid.cy + r * 0.45}
+                    stroke="#ffffff"
+                    strokeWidth={Math.max(1.5, width * 0.0022)}
+                    strokeLinecap="round"
+                  />
+                </g>
+              );
+            })}
+
+            {/* Vertex handles (bound to tracker vs manual) */}
+            {polygonOverlay.ptsPx.map((pt, idx) => {
+              const bound = pt.trackerId
+                ? trackers.find((t) => t.id === pt.trackerId)
+                : undefined;
+              const r = Math.max(9, width * 0.0145);
+              return (
+                <g key={pt.id}>
+                  <circle
+                    cx={pt.cx}
+                    cy={pt.cy}
+                    r={r + Math.max(3, width * 0.0045)}
+                    fill="rgba(9, 9, 11, 0.52)"
+                  />
+                  <circle
+                    cx={pt.cx}
+                    cy={pt.cy}
+                    r={r}
+                    fill={bound ? bound.color || '#a78bfa' : '#22d3ee'}
+                    stroke="#ffffff"
+                    strokeWidth={Math.max(2, width * 0.0034)}
+                  />
+                  {bound && (
+                    <circle
+                      cx={pt.cx}
+                      cy={pt.cy}
+                      r={r * 0.45}
+                      fill="#09090b"
+                    />
+                  )}
+                  <text
+                    x={pt.cx}
+                    y={pt.cy - r - Math.max(6, width * 0.009)}
+                    textAnchor="middle"
+                    fill="#ffffff"
+                    stroke="rgba(9,9,11,0.85)"
+                    strokeWidth={Math.max(2.5, width * 0.004)}
+                    paintOrder="stroke"
+                    fontSize={Math.max(11, Math.round(width * 0.02))}
+                    fontWeight="700"
+                  >
+                    {bound ? `${idx + 1}🎯` : `${idx + 1}`}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        )}
+
+        {/* Active Tracker Beacon Markers */}
+        {activeTrackerMarkers.length > 0 && (
+          <svg
+            viewBox={`0 0 ${width} ${height}`}
+            className="pointer-events-none absolute inset-0 z-10 h-full w-full overflow-visible"
+          >
+            {activeTrackerMarkers.map((m) => {
+              const r = Math.max(10, width * 0.015);
+              return (
+                <g key={m.id}>
+                  <circle
+                    cx={m.cx}
+                    cy={m.cy}
+                    r={r}
+                    fill="none"
+                    stroke={m.color}
+                    strokeWidth={Math.max(2, width * 0.003)}
+                    strokeDasharray={`${Math.max(4, width * 0.006)} ${Math.max(3, width * 0.004)}`}
+                  />
+                  <line
+                    x1={m.cx - r * 1.3}
+                    y1={m.cy}
+                    x2={m.cx + r * 1.3}
+                    y2={m.cy}
+                    stroke={m.color}
+                    strokeWidth={Math.max(1.4, width * 0.0022)}
+                  />
+                  <line
+                    x1={m.cx}
+                    y1={m.cy - r * 1.3}
+                    x2={m.cx}
+                    y2={m.cy + r * 1.3}
+                    stroke={m.color}
+                    strokeWidth={Math.max(1.4, width * 0.0022)}
+                  />
+                  <text
+                    x={m.cx}
+                    y={m.cy + r + Math.max(12, width * 0.019)}
+                    textAnchor="middle"
+                    fill={m.color}
+                    stroke="rgba(9,9,11,0.9)"
+                    strokeWidth={Math.max(2.5, width * 0.004)}
+                    paintOrder="stroke"
+                    fontSize={Math.max(10, Math.round(width * 0.017))}
+                    fontWeight="700"
+                  >
+                    {m.name}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        )}
+
+        {/* VitTrack Object Target BBox Selector Overlay */}
+        {objectTrackPicker && onChangeObjectTrackBbox && (
+          <div
+            onPointerDown={(e) => {
+              if (objectTrackPicker.isRunning) return;
+              const container = e.currentTarget;
+              const rect = container.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) return;
+              const nx = (e.clientX - rect.left) / rect.width;
+              const ny = (e.clientY - rect.top) / rect.height;
+              const b = objectTrackPicker.bbox;
+              const handleR = 22 / Math.max(1, rect.width);
+
+              let mode: 'move' | 'nw' | 'ne' | 'sw' | 'se' | null = null;
+              if (Math.hypot(nx - b.x, ny - b.y) <= handleR) mode = 'nw';
+              else if (Math.hypot(nx - (b.x + b.w), ny - b.y) <= handleR) mode = 'ne';
+              else if (Math.hypot(nx - b.x, ny - (b.y + b.h)) <= handleR) mode = 'sw';
+              else if (Math.hypot(nx - (b.x + b.w), ny - (b.y + b.h)) <= handleR)
+                mode = 'se';
+              else if (
+                nx >= b.x - 0.02 &&
+                nx <= b.x + b.w + 0.02 &&
+                ny >= b.y - 0.02 &&
+                ny <= b.y + b.h + 0.02
+              ) {
+                mode = 'move';
+              } else {
+                // Allow tapping anywhere to recenter bbox around cursor
+                const nextX = Math.max(0.01, Math.min(1 - b.w - 0.01, nx - b.w / 2));
+                const nextY = Math.max(0.01, Math.min(1 - b.h - 0.01, ny - b.h / 2));
+                const recentered: TrackBbox = {...b, x: nextX, y: nextY};
+                onChangeObjectTrackBbox(recentered);
+                mode = 'move';
+                container.setPointerCapture(e.pointerId);
+                trackBboxDragRef.current = {
+                  mode,
+                  startNx: nx,
+                  startNy: ny,
+                  origBbox: recentered,
+                };
+                return;
+              }
+              container.setPointerCapture(e.pointerId);
+              trackBboxDragRef.current = {
+                mode,
+                startNx: nx,
+                startNy: ny,
+                origBbox: {...b},
+              };
+            }}
+            onPointerMove={(e) => {
+              const drag = trackBboxDragRef.current;
+              if (!drag || objectTrackPicker.isRunning) return;
+              const rect = e.currentTarget.getBoundingClientRect();
+              if (rect.width <= 0 || rect.height <= 0) return;
+              const nx = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+              const ny = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+              const dx = nx - drag.startNx;
+              const dy = ny - drag.startNy;
+              const o = drag.origBbox;
+              const minSize = 0.05;
+
+              let x = o.x;
+              let y = o.y;
+              let w = o.w;
+              let h = o.h;
+
+              if (drag.mode === 'move') {
+                x = Math.max(0.01, Math.min(0.99 - o.w, o.x + dx));
+                y = Math.max(0.01, Math.min(0.99 - o.h, o.y + dy));
+              } else if (drag.mode === 'nw') {
+                const right = o.x + o.w;
+                const bottom = o.y + o.h;
+                x = Math.max(0.01, Math.min(right - minSize, o.x + dx));
+                y = Math.max(0.01, Math.min(bottom - minSize, o.y + dy));
+                w = right - x;
+                h = bottom - y;
+              } else if (drag.mode === 'ne') {
+                const bottom = o.y + o.h;
+                const right = Math.max(o.x + minSize, Math.min(0.99, o.x + o.w + dx));
+                y = Math.max(0.01, Math.min(bottom - minSize, o.y + dy));
+                w = right - o.x;
+                h = bottom - y;
+              } else if (drag.mode === 'sw') {
+                const right = o.x + o.w;
+                const bottom = Math.max(o.y + minSize, Math.min(0.99, o.y + o.h + dy));
+                x = Math.max(0.01, Math.min(right - minSize, o.x + dx));
+                w = right - x;
+                h = bottom - o.y;
+              } else if (drag.mode === 'se') {
+                w = Math.max(minSize, Math.min(0.99 - o.x, o.w + dx));
+                h = Math.max(minSize, Math.min(0.99 - o.y, o.h + dy));
+              }
+
+              onChangeObjectTrackBbox({
+                x: Math.round(x * 1000) / 1000,
+                y: Math.round(y * 1000) / 1000,
+                w: Math.round(w * 1000) / 1000,
+                h: Math.round(h * 1000) / 1000,
+              });
+            }}
+            onPointerUp={(e) => {
+              if (!trackBboxDragRef.current) return;
+              trackBboxDragRef.current = null;
+              try {
+                e.currentTarget.releasePointerCapture(e.pointerId);
+              } catch {
+                // ignore
+              }
+            }}
+            onPointerCancel={() => {
+              trackBboxDragRef.current = null;
+            }}
+            className="absolute inset-0 z-20 touch-none select-none cursor-crosshair"
+          >
+            {/* Outer dimming scrim */}
+            <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-full w-full">
+              <defs>
+                <mask id="vittrack-scrim-mask">
+                  <rect x="0" y="0" width="100" height="100" fill="white" />
+                  <rect
+                    x={objectTrackPicker.bbox.x * 100}
+                    y={objectTrackPicker.bbox.y * 100}
+                    width={objectTrackPicker.bbox.w * 100}
+                    height={objectTrackPicker.bbox.h * 100}
+                    fill="black"
+                  />
+                </mask>
+              </defs>
+              <rect
+                x="0"
+                y="0"
+                width="100"
+                height="100"
+                fill="rgba(9, 9, 11, 0.45)"
+                mask="url(#vittrack-scrim-mask)"
+              />
+            </svg>
+
+            {/* Target Bbox Frame */}
+            <div
+              className={`pointer-events-none absolute border-2 ${
+                objectTrackPicker.isRunning
+                  ? 'border-violet-400 shadow-[0_0_0_1px_rgba(0,0,0,0.6),0_0_16px_rgba(167,139,250,0.45)]'
+                  : 'border-dashed border-cyan-300 shadow-[0_0_0_1px_rgba(0,0,0,0.6),0_0_14px_rgba(34,211,238,0.35)]'
+              }`}
+              style={{
+                left: `${objectTrackPicker.bbox.x * 100}%`,
+                top: `${objectTrackPicker.bbox.y * 100}%`,
+                width: `${objectTrackPicker.bbox.w * 100}%`,
+                height: `${objectTrackPicker.bbox.h * 100}%`,
+              }}
+            >
+              {/* Center crosshair */}
+              <div className="absolute left-1/2 top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-cyan-400/75 shadow" />
+              {!objectTrackPicker.isRunning && (
+                <>
+                  <span className="absolute -left-2 -top-2 h-4 w-4 rounded-full border-2 border-white bg-cyan-400 shadow" />
+                  <span className="absolute -right-2 -top-2 h-4 w-4 rounded-full border-2 border-white bg-cyan-400 shadow" />
+                  <span className="absolute -left-2 -bottom-2 h-4 w-4 rounded-full border-2 border-white bg-cyan-400 shadow" />
+                  <span className="absolute -right-2 -bottom-2 h-4 w-4 rounded-full border-2 border-white bg-cyan-400 shadow" />
+                </>
+              )}
+            </div>
+
+            {/* Live tracked point during progress */}
+            {objectTrackPicker.isRunning && objectTrackPicker.livePoint && (
+              <div
+                className="pointer-events-none absolute -translate-x-1/2 -translate-y-1/2"
+                style={{
+                  left: `${objectTrackPicker.livePoint.x * 100}%`,
+                  top: `${objectTrackPicker.livePoint.y * 100}%`,
+                }}
+              >
+                <div className="h-4 w-4 rounded-full border-2 border-white bg-violet-400 shadow-lg" />
+              </div>
+            )}
+          </div>
         )}
 
         {((chromaKeyPickerActive &&

@@ -8,6 +8,7 @@ import type {
   AspectRatio,
   CanvasBackground,
   Clip,
+  MotionTrackerBeacon,
   ProjectFont,
   Track,
 } from '../shared/types.ts';
@@ -35,6 +36,7 @@ export interface ExportProjectOptions {
   backgroundColor?: string;
   canvasBackground?: CanvasBackground;
   customFonts?: ProjectFont[];
+  trackers?: MotionTrackerBeacon[];
   duration: number;
   currentTime?: number;
   format?: ExportFormat;
@@ -490,7 +492,8 @@ async function exportMp4WebCodecs(
         undefined,
         undefined,
         undefined,
-        opts.canvasBackground
+        opts.canvasBackground,
+        opts.trackers
       );
 
       const timestampUs = Math.round((i * 1_000_000) / fps);
@@ -608,7 +611,8 @@ async function exportViaMediaRecorder(
     undefined,
     undefined,
     undefined,
-    opts.canvasBackground
+    opts.canvasBackground,
+    opts.trackers
   );
 
   const mp4Candidates = [
@@ -726,7 +730,8 @@ async function exportViaMediaRecorder(
           undefined,
           undefined,
           undefined,
-          opts.canvasBackground
+          opts.canvasBackground,
+          opts.trackers
         );
         opts.onProgress(Math.min(98, Math.round((t / totalDuration) * 98)));
 
@@ -846,7 +851,8 @@ async function exportAnimatedWebp(
       undefined,
       undefined,
       undefined,
-      opts.canvasBackground
+      opts.canvasBackground,
+      opts.trackers
     );
 
     const frameBlob = await canvasToBlobAsync(canvas, 'image/webp', webpQuality);
@@ -927,7 +933,8 @@ async function exportAnimatedGif(
       undefined,
       undefined,
       undefined,
-      opts.canvasBackground
+      opts.canvasBackground,
+      opts.trackers
     );
 
     const imageData = ctx.getImageData(0, 0, width, height);
@@ -981,7 +988,8 @@ async function exportStillPng(
     undefined,
     undefined,
     undefined,
-    opts.canvasBackground
+    opts.canvasBackground,
+    opts.trackers
   );
   const blob = await canvasToBlobAsync(canvas, 'image/png');
   opts.onProgress(100);

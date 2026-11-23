@@ -3,6 +3,7 @@ import type {
   ClipKeyframe,
   ClipWarp,
   KeyframeEasing,
+  PolygonPoint,
 } from '../shared/types.ts';
 import {cloneWarp, interpolateWarp} from './warpEngine.ts';
 
@@ -17,6 +18,36 @@ export interface EvaluatedTransform {
   rotation: number;
   opacity: number;
   warp?: ClipWarp;
+  shapePoints?: PolygonPoint[];
+}
+
+function cloneShapePointsLocal(pts?: PolygonPoint[]): PolygonPoint[] | undefined {
+  if (!pts || pts.length === 0) return undefined;
+  return pts.map((p) => ({...p}));
+}
+
+function interpolateShapePointsLocal(
+  a?: PolygonPoint[],
+  b?: PolygonPoint[],
+  t = 0
+): PolygonPoint[] | undefined {
+  if (!a && !b) return undefined;
+  if (!a) return cloneShapePointsLocal(b);
+  if (!b) return cloneShapePointsLocal(a);
+  if (t <= 0) return cloneShapePointsLocal(a);
+  if (t >= 1) return cloneShapePointsLocal(b);
+
+  const bById = new Map(b.map((p) => [p.id, p]));
+  return a.map((pa, idx) => {
+    const pb = bById.get(pa.id) ?? (idx < b.length ? b[idx] : undefined);
+    if (!pb) return {...pa};
+    return {
+      id: pa.id,
+      x: pa.x + (pb.x - pa.x) * t,
+      y: pa.y + (pb.y - pa.y) * t,
+      trackerId: pa.trackerId ?? pb.trackerId,
+    };
+  });
 }
 
 export function applyEasing(t: number, easing: KeyframeEasing): number {
@@ -64,6 +95,7 @@ export function getBaseClipTransform(clip: Clip): EvaluatedTransform {
       rotation: clip.rotation ?? 0,
       opacity: clip.opacity ?? 1,
       warp: clip.warp,
+      shapePoints: cloneShapePointsLocal(clip.shapeStyle?.points),
     };
   }
   return {
@@ -77,6 +109,7 @@ export function getBaseClipTransform(clip: Clip): EvaluatedTransform {
     rotation: clip.rotation ?? 0,
     opacity: clip.opacity ?? 1,
     warp: clip.warp,
+    shapePoints: cloneShapePointsLocal(clip.shapeStyle?.points),
   };
 }
 
@@ -109,6 +142,7 @@ export function evaluateClipTransform(
       rotation: first.rotation,
       opacity: first.opacity,
       warp: first.warp ?? clip.warp,
+      shapePoints: cloneShapePointsLocal(first.shapePoints ?? clip.shapeStyle?.points),
     };
   }
 
@@ -125,6 +159,7 @@ export function evaluateClipTransform(
       rotation: last.rotation,
       opacity: last.opacity,
       warp: last.warp ?? clip.warp,
+      shapePoints: cloneShapePointsLocal(last.shapePoints ?? clip.shapeStyle?.points),
     };
   }
 
@@ -146,6 +181,8 @@ export function evaluateClipTransform(
       const atEndOfSegment = localTime >= b.timeOffset - 1e-6;
       const warpA = a.warp ?? clip.warp;
       const warpB = b.warp ?? clip.warp;
+      const ptsA = a.shapePoints ?? clip.shapeStyle?.points;
+      const ptsB = b.shapePoints ?? clip.shapeStyle?.points;
       return {
         x: a.x + (b.x - a.x) * easedT,
         y: a.y + (b.y - a.y) * easedT,
@@ -158,6 +195,10 @@ export function evaluateClipTransform(
         opacity: a.opacity + (b.opacity - a.opacity) * easedT,
         warp:
           warpA || warpB ? interpolateWarp(warpA, warpB, easedT) : undefined,
+        shapePoints:
+          ptsA || ptsB
+            ? interpolateShapePointsLocal(ptsA, ptsB, easedT)
+            : undefined,
       };
     }
   }
@@ -182,6 +223,11 @@ export function upsertKeyframeAtTime(
   if (nearIdx !== -1) {
     const resolvedWarp =
       override?.warp ?? existing[nearIdx].warp ?? current.warp ?? clip.warp;
+    const resolvedShapePts =
+      override?.shapePoints ??
+      existing[nearIdx].shapePoints ??
+      current.shapePoints ??
+      clip.shapeStyle?.points;
     const updated: ClipKeyframe = {
       ...existing[nearIdx],
       x: override?.x ?? current.x,
@@ -200,6 +246,7 @@ export function upsertKeyframeAtTime(
       rotation: override?.rotation ?? current.rotation,
       opacity: override?.opacity ?? current.opacity,
       warp: resolvedWarp ? cloneWarp(resolvedWarp) : undefined,
+      shapePoints: cloneShapePointsLocal(resolvedShapePts),
       easing: override?.easing ?? existing[nearIdx].easing,
     };
     existing[nearIdx] = updated;
@@ -210,6 +257,8 @@ export function upsertKeyframeAtTime(
   }
 
   const resolvedWarp = override?.warp ?? current.warp ?? clip.warp;
+  const resolvedShapePts =
+    override?.shapePoints ?? current.shapePoints ?? clip.shapeStyle?.points;
   const created: ClipKeyframe = {
     id: `kf-${Math.random().toString(36).slice(2, 8)}`,
     timeOffset: localOffset,
@@ -223,6 +272,7 @@ export function upsertKeyframeAtTime(
     rotation: override?.rotation ?? current.rotation,
     opacity: override?.opacity ?? current.opacity,
     warp: resolvedWarp ? cloneWarp(resolvedWarp) : undefined,
+    shapePoints: cloneShapePointsLocal(resolvedShapePts),
     easing: override?.easing ?? 'ease-in-out',
   };
   existing.push(created);
