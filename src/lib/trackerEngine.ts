@@ -337,12 +337,14 @@ export function buildTrackerBeaconFromVitTrack(
   ch: number,
   videoWidth: number,
   videoHeight: number,
-  colorIndex = 0
+  colorIndex = 0,
+  trackScale = true
 ): MotionTrackerBeacon {
   const canvasPoints = rawPoints
-    .map((pt) =>
-      mapVideoPointToCanvas(sourceClip, pt, cw, ch, videoWidth, videoHeight)
-    )
+    .map((pt) => {
+      const mapped = mapVideoPointToCanvas(sourceClip, pt, cw, ch, videoWidth, videoHeight);
+      return trackScale ? mapped : {...mapped, scale: 1};
+    })
     .sort((a, b) => a.time - b.time);
 
   return {
@@ -350,6 +352,7 @@ export function buildTrackerBeaconFromVitTrack(
     name: name.trim() || 'Маяк',
     color: TRACKER_BEACON_COLORS[colorIndex % TRACKER_BEACON_COLORS.length],
     sourceClipId: sourceClip.id,
+    trackScale,
     createdAt: Date.now(),
     points: canvasPoints,
   };
@@ -357,7 +360,8 @@ export function buildTrackerBeaconFromVitTrack(
 
 /**
  * Generates ClipKeyframe[] on [targetClip] from canvas-space tracked points,
- * preserving targetClip's current base scale/rotation/opacity while animating (x, y, scale).
+ * preserving targetClip's current base scale/rotation/opacity while animating (x, y)
+ * and optionally scale when [applyScale] is true.
  */
 export function buildClipKeyframesFromTracker(
   targetClip: Clip,
@@ -407,6 +411,7 @@ export function buildClipKeyframesFromTracker(
         rotation: evalAt.rotation,
         opacity: evalAt.opacity,
         ...(evalAt.warp ? {warp: evalAt.warp} : {}),
+        ...(evalAt.shapePoints ? {shapePoints: evalAt.shapePoints} : {}),
         easing: 'linear' as const,
       };
     });

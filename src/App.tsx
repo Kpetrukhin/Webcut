@@ -278,6 +278,7 @@ export default function App() {
     sourceClipId: string;
     targetClipId: string;
     saveMode: 'beacon' | 'keyframes';
+    trackScale: boolean;
     beaconName: string;
     bbox: TrackBbox;
     isRunning: boolean;
@@ -1808,6 +1809,7 @@ export default function App() {
         sourceClipId: sourceClip.id,
         targetClipId: requestedClip?.id ?? sourceClip.id,
         saveMode: preferKeyframes ? 'keyframes' : 'beacon',
+        trackScale: true,
         beaconName: `Маяк ${(p.trackers?.length ?? 0) + 1}`,
         bbox: {x: 0.375, y: 0.375, w: 0.25, h: 0.25},
         isRunning: false,
@@ -1903,7 +1905,8 @@ export default function App() {
         ch,
         vidW,
         vidH,
-        p.trackers?.length ?? 0
+        p.trackers?.length ?? 0,
+        session.trackScale
       );
 
       if (session.saveMode === 'beacon') {
@@ -1914,7 +1917,11 @@ export default function App() {
       } else {
         const targetClip =
           p.clips.find((c) => c.id === session.targetClipId) ?? sourceClip;
-        const kfs = buildClipKeyframesFromTracker(targetClip, beacon.points, true);
+        const kfs = buildClipKeyframesFromTracker(
+          targetClip,
+          beacon.points,
+          session.trackScale
+        );
         updateClip(targetClip.id, {keyframes: kfs});
         showTransientNotice(
           `Создано ${kfs.length} ключевых кадров для «${targetClip.name}»`
@@ -3484,6 +3491,42 @@ export default function App() {
                         }`}
                       >
                         Ключи слоя
+                      </button>
+                    </div>
+                    <div className="flex rounded-lg border border-white/10 bg-zinc-900 p-0.5 text-[10px] font-semibold">
+                      <button
+                        type="button"
+                        data-testid="track_mode_pos_only"
+                        onClick={() =>
+                          setObjectTrackSession((cur) =>
+                            cur ? {...cur, trackScale: false} : null
+                          )
+                        }
+                        title="Двигать только по координатам X/Y без изменения масштаба"
+                        className={`rounded-md px-2 py-0.5 transition ${
+                          !objectTrackSession.trackScale
+                            ? 'bg-emerald-400 text-zinc-950'
+                            : 'text-zinc-300 hover:text-white'
+                        }`}
+                      >
+                        Только X/Y
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="track_mode_full"
+                        onClick={() =>
+                          setObjectTrackSession((cur) =>
+                            cur ? {...cur, trackScale: true} : null
+                          )
+                        }
+                        title="Трекинг координат X/Y и масштаба объекта (Фулл)"
+                        className={`rounded-md px-2 py-0.5 transition ${
+                          objectTrackSession.trackScale
+                            ? 'bg-violet-400 text-zinc-950'
+                            : 'text-zinc-300 hover:text-white'
+                        }`}
+                      >
+                        Фулл (X/Y + Масштаб)
                       </button>
                     </div>
                     {objectTrackSession.saveMode === 'beacon' && (

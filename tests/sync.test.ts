@@ -1724,6 +1724,28 @@ test('Трекинг объектов (VitTrack) и полигон «По точ
   assert.ok(Math.abs(kfs[1].x - 0.8) < 0.01);
   assert.ok(Math.abs(kfs[1].scale - 0.6) < 0.01);
 
+  const kfsPosOnly = buildClipKeyframesFromTracker(overlayLayer, beacon.points, false);
+  assert.equal(kfsPosOnly.length, 2);
+  assert.ok(Math.abs(kfsPosOnly[1].x - 0.8) < 0.01);
+  assert.ok(Math.abs(kfsPosOnly[1].scale - 0.4) < 0.01);
+
+  const beaconPosOnly = buildTrackerBeaconFromVitTrack(
+    'Только XY',
+    videoClip,
+    [
+      {timeMs: 500, x: 0.2, y: 0.3, scale: 1.0, w: 0.15, h: 0.15, score: 0.98},
+      {timeMs: 2500, x: 0.8, y: 0.7, scale: 1.5, w: 0.225, h: 0.225, score: 0.91},
+    ],
+    1280,
+    720,
+    1280,
+    720,
+    1,
+    false
+  );
+  assert.equal(beaconPosOnly.trackScale, false);
+  assert.equal(beaconPosOnly.points[1].scale, 1);
+
   // Polygon 'points' clip with 1 manual keyframed vertex + 1 tracker-bound vertex
   const polyClip: Clip = {
     id: 'poly-1',

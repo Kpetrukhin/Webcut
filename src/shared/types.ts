@@ -241,6 +241,7 @@ export interface MotionTrackerBeacon {
   name: string;
   color: string;
   sourceClipId?: string;
+  trackScale?: boolean;
   createdAt: number;
   points: TrackerKeyframe[];
 }
