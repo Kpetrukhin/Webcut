@@ -84,39 +84,39 @@ object AIModelRegistry {
      * Built-in modular catalog. No model weights are bundled in the APK (~17 MB limit).
      * Models are downloaded on demand from GitHub Releases or imported via a .zip AI pack.
      */
-    private val builtInModels: List<AIModelSpec> = listOf(
+        private val builtInModels: List<AIModelSpec> = listOf(
         AIModelSpec(
             id = "sam2_tiny_seg",
             title = "AI Авто-маска (Сегментация)",
             category = ModelCategory.MASK,
-            fileName = "sam2_tiny_image_encoder.onnx",
-            format = "onnx",
-            downloadUrl = "https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/sam2_tiny_image_encoder.onnx",
+            fileName = "mobile_sam_image_encoder.onnx",
+            format = "zip",
+            downloadUrl = "https://github.com",
             expectedSizeBytes = 0L,
             sha256 = "",
-            description = "Выделение объекта и автоматическое построение маски на кадре (ONNX FP16)."
+            description = "Волшебная палочка: выделение объекта и построение маски (MobileSAM)."
         ),
         AIModelSpec(
             id = "motion_tracker_nano",
             title = "AI Авто-трекинг (Ключи)",
             category = ModelCategory.KEYFRAME,
-            fileName = "motion_tracker_nano.onnx",
-            format = "onnx",
-            downloadUrl = "https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/motion_tracker_nano.onnx",
+            fileName = "object_tracking_vittrack_2023sep.onnx",
+            format = "zip",
+            downloadUrl = "https://github.com",
             expectedSizeBytes = 0L,
             sha256 = "",
-            description = "Отслеживание точки на видео и автогенерация ключевых кадров движения."
+            description = "Отслеживание объекта на видео и автогенерация ключевых кадров (VitTrack)."
         ),
         AIModelSpec(
             id = "whisper_tiny_asr",
             title = "AI Авто-субтитры (Речь -> Текст)",
             category = ModelCategory.TEXT,
-            fileName = "whisper_tiny_encoder_int8.onnx",
-            format = "onnx",
-            downloadUrl = "https://github.com/cutsync/webcut-ai-models/releases/download/v1.0.0/whisper_tiny_encoder_int8.onnx",
+            fileName = "encoder_model_quantized.onnx",
+            format = "zip",
+            downloadUrl = "https://github.com",
             expectedSizeBytes = 0L,
             sha256 = "",
-            description = "Офлайн-распознавание речи (RU/EN) и создание анимированных титров."
+            description = "Офлайн-распознавание речи (RU/EN) и создание титров (Whisper Tiny)."
         )
     )
 
