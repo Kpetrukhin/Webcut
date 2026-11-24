@@ -22,9 +22,11 @@ import {
   checkMediaInLocalFolder,
   cleanupUnusedMediaInLocalFolder,
   deleteProjectJsonFromLocalFolder,
+  ensureExportFolderInLocalStorage,
   listProjectsJsonFromLocalFolder,
   loadProjectJsonFromLocalFolder,
   readMediaFromLocalFolder,
+  saveExportToLocalFolder,
   saveMediaToLocalFolder,
   saveProjectJsonToLocalFolder,
 } from './mediaStorage.ts';
@@ -163,6 +165,44 @@ interface LanSyncPluginInterface {
     projectId: string;
   }) => Promise<{deleted: boolean}>;
   cleanupUnusedMedia?: () => Promise<CleanupMediaResult & {ok?: boolean}>;
+  prepareExportDir?: (options?: {
+    ext?: string;
+    fileName?: string;
+  }) => Promise<{
+    ok: boolean;
+    exportDir: string;
+    relativePath: string;
+    fileName: string;
+    localUploadUrl: string;
+    mode: string;
+  }>;
+  saveExportedFile?: (options: {
+    base64Data: string;
+    fileName?: string;
+    ext?: string;
+    mimeType?: string;
+  }) => Promise<{
+    ok: boolean;
+    fileName: string;
+    relativePath: string;
+    savedPath: string;
+    contentUri?: string;
+    mimeType: string;
+    fileSize: number;
+    localUrl?: string;
+  }>;
+  shareExportedFile?: (options: {
+    contentUri?: string;
+    savedPath?: string;
+    fileName?: string;
+    mimeType?: string;
+  }) => Promise<{shared: boolean}>;
+  openExportFolder?: (options?: {
+    contentUri?: string;
+    savedPath?: string;
+    fileName?: string;
+    mimeType?: string;
+  }) => Promise<{opened: boolean; exportDir?: string}>;
   addListener(
     eventName: 'udpRoomsUpdate',
     listenerFunc: (data: {rooms: DiscoveredUdpRoom[]}) => void
@@ -1605,3 +1645,292 @@ export async function compressClipMedia(opts: {
     URL.revokeObjectURL(srcBlobUrl);
   }
 }
+
+export interface PreparedExportTarget {
+  ok: boolean;
+  exportDir: string;
+  relativePath: string;
+  fileName: string;
+  localUploadUrl?: string;
+}
+
+export interface SavedExportResult {
+  ok: boolean;
+  fileName: string;
+  relativePath: string;
+  savedPath: string;
+  contentUri?: string;
+  mimeType: string;
+  fileSize: number;
+  storageKind: 'native' | 'server' | 'local-folder';
+}
+
+export function getExportMimeType(ext: string): string {
+  switch (ext.toLowerCase().replace(/^\./, '')) {
+    case 'mp4':
+    case 'm4v':
+      return 'video/mp4';
+    case 'webm':
+      return 'video/webm';
+    case 'webp':
+      return 'image/webp';
+    case 'gif':
+      return 'image/gif';
+    case 'png':
+      return 'image/png';
+    default:
+      return 'application/octet-stream';
+  }
+}
+
+export function buildWebcutExportFileName(ext = 'mp4'): string {
+  const cleanExt = ext.toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  return `Webcut_${stamp}.${cleanExt}`;
+}
+
+export async function prepareExportTarget(
+  ext = 'mp4',
+  desiredFileName?: string
+): Promise<PreparedExportTarget> {
+  const fallbackName = desiredFileName || buildWebcutExportFileName(ext);
+  if (hasNativeLanPlugin() && typeof LanSync.prepareExportDir === 'function') {
+    try {
+      const res = await LanSync.prepareExportDir({
+        ext,
+        fileName: fallbackName,
+      });
+      return {
+        ok: Boolean(res.ok),
+        exportDir: res.exportDir,
+        relativePath: res.relativePath || `export/${res.fileName || fallbackName}`,
+        fileName: res.fileName || fallbackName,
+        localUploadUrl: res.localUploadUrl,
+      };
+    } catch {
+      // fall through
+    }
+  }
+
+  const endpoint = getApiUrl('/api/export/prepare');
+  if (endpoint) {
+    try {
+      const res = await fetch(endpoint, {method: 'POST'});
+      if (res.ok) {
+        const data = (await res.json()) as {
+          ok?: boolean;
+          exportDir?: string;
+        };
+        return {
+          ok: Boolean(data.ok),
+          exportDir: data.exportDir || 'export/',
+          relativePath: `export/${fallbackName}`,
+          fileName: fallbackName,
+        };
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  const localRes = await ensureExportFolderInLocalStorage().catch(() => ({
+    ok: false,
+    folderName: 'Корень приложения',
+  }));
+  return {
+    ok: localRes.ok,
+    exportDir: `${localRes.folderName}/export`,
+    relativePath: `export/${fallbackName}`,
+    fileName: fallbackName,
+  };
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  const buf = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+export async function saveExportedMediaToRoot(opts: {
+  blob: Blob;
+  ext: string;
+  fileName?: string;
+}): Promise<SavedExportResult> {
+  const fileName = opts.fileName || buildWebcutExportFileName(opts.ext);
+  const mimeType = getExportMimeType(opts.ext);
+
+  if (hasNativeLanPlugin()) {
+    // 1. Primary native path: stream binary directly to local Ktor server -> writes to root/export/ + MediaScannerConnection
+    try {
+      const prep =
+        typeof LanSync.prepareExportDir === 'function'
+          ? await LanSync.prepareExportDir({ext: opts.ext, fileName})
+          : null;
+      const srv = prep?.localUploadUrl ? null : await LanSync.ensureMediaServer();
+      const uploadBase =
+        prep?.localUploadUrl ||
+        `http://127.0.0.1:${srv?.port || 8080}/export/upload`;
+      const uploadUrl = `${uploadBase}?fileName=${encodeURIComponent(fileName)}&ext=${encodeURIComponent(opts.ext)}&mimeType=${encodeURIComponent(mimeType)}`;
+      const uploadRes = await fetch(uploadUrl, {
+        method: 'POST',
+        headers: {'Content-Type': mimeType},
+        body: opts.blob,
+      });
+      if (uploadRes.ok) {
+        const data = (await uploadRes.json()) as {
+          ok?: boolean;
+          fileName?: string;
+          relativePath?: string;
+          savedPath?: string;
+          contentUri?: string;
+          mimeType?: string;
+          fileSize?: number;
+        };
+        if (data.ok && data.savedPath) {
+          return {
+            ok: true,
+            fileName: data.fileName || fileName,
+            relativePath: data.relativePath || `export/${data.fileName || fileName}`,
+            savedPath: data.savedPath,
+            contentUri: data.contentUri || undefined,
+            mimeType: data.mimeType || mimeType,
+            fileSize: data.fileSize ?? opts.blob.size,
+            storageKind: 'native',
+          };
+        }
+      }
+    } catch {
+      // fall through to Capacitor base64 bridge fallback
+    }
+
+    // 2. Native Capacitor bridge fallback
+    if (typeof LanSync.saveExportedFile === 'function') {
+      const base64Data = await blobToBase64(opts.blob);
+      const saved = await LanSync.saveExportedFile({
+        base64Data,
+        fileName,
+        ext: opts.ext,
+        mimeType,
+      });
+      return {
+        ok: Boolean(saved.ok),
+        fileName: saved.fileName || fileName,
+        relativePath: saved.relativePath || `export/${saved.fileName || fileName}`,
+        savedPath: saved.savedPath,
+        contentUri: saved.contentUri || undefined,
+        mimeType: saved.mimeType || mimeType,
+        fileSize: saved.fileSize ?? opts.blob.size,
+        storageKind: 'native',
+      };
+    }
+  }
+
+  // 3. Node / Electron server root folder
+  const serverEndpoint = getApiUrl(
+    `/api/export/upload?fileName=${encodeURIComponent(fileName)}&ext=${encodeURIComponent(opts.ext)}`
+  );
+  if (serverEndpoint) {
+    try {
+      const res = await fetch(serverEndpoint, {
+        method: 'POST',
+        headers: {'Content-Type': mimeType},
+        body: opts.blob,
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          ok?: boolean;
+          fileName?: string;
+          relativePath?: string;
+          savedPath?: string;
+          fileSize?: number;
+        };
+        if (data.ok) {
+          void saveExportToLocalFolder(data.fileName || fileName, opts.blob).catch(
+            () => {}
+          );
+          return {
+            ok: true,
+            fileName: data.fileName || fileName,
+            relativePath: data.relativePath || `export/${data.fileName || fileName}`,
+            savedPath: data.savedPath || `export/${data.fileName || fileName}`,
+            mimeType,
+            fileSize: data.fileSize ?? opts.blob.size,
+            storageKind: 'server',
+          };
+        }
+      }
+    } catch {
+      // fall through to browser local folder / OPFS
+    }
+  }
+
+  // 4. Browser / PWA selected directory or OPFS app-root
+  const localSaved = await saveExportToLocalFolder(fileName, opts.blob);
+  return {
+    ok: localSaved.ok,
+    fileName: localSaved.fileName,
+    relativePath: localSaved.relativePath,
+    savedPath: localSaved.savedPath,
+    mimeType,
+    fileSize: opts.blob.size,
+    storageKind: 'local-folder',
+  };
+}
+
+export async function shareExportedMedia(opts: {
+  contentUri?: string;
+  savedPath?: string;
+  fileName: string;
+  mimeType: string;
+  blob?: Blob;
+}): Promise<boolean> {
+  if (hasNativeLanPlugin() && typeof LanSync.shareExportedFile === 'function') {
+    const res = await LanSync.shareExportedFile({
+      contentUri: opts.contentUri,
+      savedPath: opts.savedPath,
+      fileName: opts.fileName,
+      mimeType: opts.mimeType,
+    });
+    return Boolean(res.shared);
+  }
+  if (
+    typeof navigator !== 'undefined' &&
+    typeof navigator.share === 'function' &&
+    opts.blob
+  ) {
+    const file = new File([opts.blob], opts.fileName, {type: opts.mimeType});
+    if (!navigator.canShare || navigator.canShare({files: [file]})) {
+      await navigator.share({
+        files: [file],
+        title: opts.fileName,
+      });
+      return true;
+    }
+  }
+  return false;
+}
+
+export async function openExportFolderTarget(opts: {
+  contentUri?: string;
+  savedPath?: string;
+  fileName?: string;
+  mimeType?: string;
+}): Promise<{opened: boolean; exportDir?: string}> {
+  if (hasNativeLanPlugin() && typeof LanSync.openExportFolder === 'function') {
+    return await LanSync.openExportFolder({
+      contentUri: opts.contentUri,
+      savedPath: opts.savedPath,
+      fileName: opts.fileName,
+      mimeType: opts.mimeType,
+    });
+  }
+  return {opened: false, exportDir: opts.savedPath};
+}
+

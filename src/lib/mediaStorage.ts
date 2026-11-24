@@ -130,7 +130,7 @@ function sanitizeProjectId(rawId: string): string {
 
 async function getSubDirHandle(
   parent: FsDirHandleLike | null,
-  subName: 'media' | 'projects',
+  subName: 'media' | 'projects' | 'export',
   create: boolean
 ): Promise<FsDirHandleLike | null> {
   if (!parent) return null;
@@ -359,6 +359,72 @@ export async function saveMediaToLocalFolder(
     }
   }
   return false;
+}
+
+export async function ensureExportFolderInLocalStorage(): Promise<{
+  ok: boolean;
+  folderName: string;
+}> {
+  if (typeof window === 'undefined') {
+    return {ok: false, folderName: 'export'};
+  }
+  const resolved = await resolveActiveBrowserDir(false);
+  if (resolved.dir) {
+    const expDir = await getSubDirHandle(resolved.dir, 'export', true);
+    if (expDir) {
+      return {ok: true, folderName: resolved.folderName};
+    }
+  }
+  const opfs = await getOpfsMediaDir(true);
+  if (opfs) {
+    const opfsExport = await getSubDirHandle(opfs, 'export', true);
+    if (opfsExport) {
+      return {ok: true, folderName: 'Корень приложения'};
+    }
+  }
+  return {ok: false, folderName: resolved.folderName};
+}
+
+export async function saveExportToLocalFolder(
+  fileName: string,
+  blob: Blob
+): Promise<{ok: boolean; fileName: string; relativePath: string; savedPath: string}> {
+  const safeName = sanitizeSafeFileName(fileName);
+  const relativePath = `export/${safeName}`;
+  if (typeof window === 'undefined') {
+    return {ok: false, fileName: safeName, relativePath, savedPath: relativePath};
+  }
+  const resolved = await resolveActiveBrowserDir(false);
+  if (resolved.dir) {
+    const expDir = await getSubDirHandle(resolved.dir, 'export', true);
+    if (expDir) {
+      const res = await writeBlobToDir(expDir, safeName, blob, {overwrite: true});
+      if (res.ok) {
+        return {
+          ok: true,
+          fileName: safeName,
+          relativePath,
+          savedPath: `${resolved.folderName}/${relativePath}`,
+        };
+      }
+    }
+  }
+  const opfs = await getOpfsMediaDir(true);
+  if (opfs) {
+    const opfsExp = await getSubDirHandle(opfs, 'export', true);
+    if (opfsExp) {
+      const res = await writeBlobToDir(opfsExp, safeName, blob, {overwrite: true});
+      if (res.ok) {
+        return {
+          ok: true,
+          fileName: safeName,
+          relativePath,
+          savedPath: relativePath,
+        };
+      }
+    }
+  }
+  return {ok: false, fileName: safeName, relativePath, savedPath: relativePath};
 }
 
 export async function readMediaFromLocalFolder(

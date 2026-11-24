@@ -181,6 +181,12 @@ function getProjectsDirFor(baseDir = getActiveUploadsDir()): string {
   return dir;
 }
 
+function getExportDirFor(baseDir = getActiveUploadsDir()): string {
+  const dir = path.join(baseDir, 'export');
+  fs.mkdirSync(dir, {recursive: true});
+  return dir;
+}
+
 function sanitizeProjectId(rawId: string): string {
   const cleaned = (rawId || '')
     .trim()
@@ -905,6 +911,72 @@ app.post('/media/upload', (req, res, next) => {
         shareUrl: `http://${primaryIp}:${ACTIVE_PORT}/media/${dedupBase}`,
         fileSize: fp.size,
         fileHash,
+      });
+    } catch (err) {
+      try {
+        if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+      } catch {
+        // ignore
+      }
+      res.status(500).json({error: err instanceof Error ? err.message : String(err)});
+    }
+  });
+  ws.on('error', (err) => {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath);
+    } catch {
+      // ignore
+    }
+    res.status(500).json({error: err.message});
+  });
+});
+
+app.post('/api/export/prepare', (_req, res) => {
+  const exportDir = getExportDirFor();
+  res.json({
+    ok: true,
+    exportDir,
+    relativePath: 'export',
+  });
+});
+
+app.post('/api/export/upload', (req, res) => {
+  const rawName = req.query.fileName;
+  const rawExt = typeof req.query.ext === 'string' ? req.query.ext : 'mp4';
+  const cleanExt = rawExt.toLowerCase().replace(/[^a-z0-9]/g, '') || 'mp4';
+  const fallbackStamp = new Date()
+    .toISOString()
+    .replace(/[-:T]/g, '')
+    .slice(0, 15);
+  const safeName =
+    typeof rawName === 'string' && rawName.trim()
+      ? path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_')
+      : `Webcut_${fallbackStamp}.${cleanExt}`;
+  const exportDir = getExportDirFor();
+  const tempPath = path.resolve(
+    exportDir,
+    `.export-${Date.now()}-${crypto.randomBytes(6).toString('hex')}.part`
+  );
+  const destPath = path.resolve(exportDir, safeName);
+  if (
+    !tempPath.startsWith(path.resolve(exportDir) + path.sep) ||
+    !destPath.startsWith(path.resolve(exportDir) + path.sep)
+  ) {
+    res.status(400).json({error: 'Недопустимое имя файла экспорта'});
+    return;
+  }
+  const ws = fs.createWriteStream(tempPath);
+  req.pipe(ws);
+  ws.on('finish', () => {
+    try {
+      moveFileReplaceSync(tempPath, destPath);
+      const stat = fs.statSync(destPath);
+      res.json({
+        ok: true,
+        fileName: safeName,
+        relativePath: `export/${safeName}`,
+        savedPath: destPath,
+        fileSize: stat.size,
       });
     } catch (err) {
       try {

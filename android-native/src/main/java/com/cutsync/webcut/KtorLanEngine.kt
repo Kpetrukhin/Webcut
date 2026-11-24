@@ -6,6 +6,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Environment
@@ -79,6 +80,9 @@ import java.net.InetAddress
 import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 
 data class NetIfaceInfo(
@@ -125,6 +129,10 @@ class KtorLanEngine(private val context: Context) {
 
     private fun projectsSubDir(baseDir: File = mediaDir): File {
         return File(baseDir, "projects").apply { mkdirs() }
+    }
+
+    private fun exportSubDir(baseDir: File = mediaDir): File {
+        return File(baseDir, "export").apply { mkdirs() }
     }
 
     private fun sanitizeExtension(rawName: String?): String {
@@ -264,6 +272,7 @@ class KtorLanEngine(private val context: Context) {
         var count = 0
         count += copyFlatFiles(File(fromDir, "media"), File(toDir, "media"), registerAsMedia = true)
         count += copyFlatFiles(File(fromDir, "projects"), File(toDir, "projects"), registerAsMedia = false)
+        count += copyFlatFiles(File(fromDir, "export"), File(toDir, "export"), registerAsMedia = false)
         // Legacy flat files inside root -> migrate to media/ (or projects/ if json)
         fromDir.listFiles()?.forEach { f ->
             if (f.isFile && !f.name.endsWith(".part")) {
@@ -968,6 +977,39 @@ class KtorLanEngine(private val context: Context) {
                         if (sha.isNotEmpty()) put("fileHash", sha)
                         put("localUrl", "http://127.0.0.1:$serverPort/media/$baseName")
                         put("shareUrl", "http://$bestIp:$serverPort/media/$baseName")
+                    }
+                    call.respondText(resp.toString(), ContentType.Application.Json)
+                }
+
+                get("/export/{fileName}") {
+                    applyCors(call)
+                    val rawName = call.parameters["fileName"] ?: ""
+                    val safeName = normalizeBaseMediaName(rawName)
+                    val file = withContext(Dispatchers.IO) {
+                        File(exportSubDir(), safeName).takeIf { it.exists() && it.isFile }
+                    }
+                    if (file == null) {
+                        call.respond(HttpStatusCode.NotFound, "Export file not found")
+                        return@get
+                    }
+                    call.response.header(HttpHeaders.AcceptRanges, "bytes")
+                    call.response.header(HttpHeaders.ContentType, contentTypeForFile(file).toString())
+                    call.respondFile(file)
+                }
+
+                post("/export/upload") {
+                    applyCors(call)
+                    val rawName = call.request.queryParameters["fileName"]
+                    val extParam = call.request.queryParameters["ext"] ?: "mp4"
+                    val mimeParam = call.request.queryParameters["mimeType"]
+                    val channel: ByteReadChannel = call.receiveChannel()
+                    val resp = withContext(Dispatchers.IO) {
+                        saveExportChannelToExportDir(
+                            channel = channel,
+                            rawName = rawName,
+                            fallbackExt = extParam,
+                            explicitMimeType = mimeParam
+                        )
                     }
                     call.respondText(resp.toString(), ContentType.Application.Json)
                 }
@@ -2492,6 +2534,283 @@ class KtorLanEngine(private val context: Context) {
             }
         }
     }
+
+    private fun mimeTypeForExportExt(ext: String): String {
+        return when (ext.lowercase().trimStart('.')) {
+            "mp4", "m4v" -> "video/mp4"
+            "webm" -> "video/webm"
+            "mov" -> "video/quicktime"
+            "webp" -> "image/webp"
+            "gif" -> "image/gif"
+            "png" -> "image/png"
+            "jpg", "jpeg" -> "image/jpeg"
+            else -> "application/octet-stream"
+        }
+    }
+
+    private fun buildExportFileName(rawName: String?, fallbackExt: String = "mp4"): String {
+        val cleanExt = sanitizeExtension(rawName?.takeIf { it.contains('.') } ?: ".$fallbackExt")
+            .let { if (it == "bin") sanitizeExtension(".$fallbackExt") else it }
+            .let { if (it == "bin") "mp4" else it }
+        if (!rawName.isNullOrBlank()) {
+            val baseOnly = File(rawName.trim().replace('\\', '/').substringBefore('?')).name
+            val sanitized = baseOnly.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+            if (sanitized.isNotBlank() && !sanitized.startsWith(".")) {
+                return if (sanitized.contains('.')) sanitized else "$sanitized.$cleanExt"
+            }
+        }
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        return "Webcut_$stamp.$cleanExt"
+    }
+
+    private fun resolveSafSubPathRealFile(
+        treeUri: Uri,
+        subFolder: String,
+        fileName: String? = null
+    ): File? {
+        return try {
+            val docId = DocumentsContract.getTreeDocumentId(treeUri)
+            if (!docId.startsWith("primary:", ignoreCase = true)) return null
+            val relRoot = docId.substringAfter(':').trim('/')
+            val baseDir = if (relRoot.isEmpty()) {
+                Environment.getExternalStorageDirectory()
+            } else {
+                File(Environment.getExternalStorageDirectory(), relRoot)
+            }
+            val subDir = File(baseDir, subFolder)
+            if (fileName.isNullOrBlank()) subDir else File(subDir, fileName)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun scanExportedMedia(filePath: String?, mimeType: String) {
+        if (filePath.isNullOrBlank()) return
+        try {
+            MediaScannerConnection.scanFile(
+                context,
+                arrayOf(filePath),
+                arrayOf(mimeType),
+                null
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
+    fun prepareExportDir(ext: String = "mp4", rawName: String? = null): JSONObject {
+        val localExportDir = exportSubDir()
+        val uriStr = safTreeUriString
+        val isSaf = !uriStr.isNullOrBlank()
+        var displayExportDir = localExportDir.absolutePath
+        if (isSaf) {
+            try {
+                val treeUri = Uri.parse(uriStr)
+                getOrCreateSafSubdir(treeUri, "export", createIfMissing = true)
+                displayExportDir = resolveSafSubPathRealFile(treeUri, "export")?.absolutePath
+                    ?: "${safDisplayName ?: "Выбранная папка"}/export"
+            } catch (_: Throwable) {
+                displayExportDir = "${safDisplayName ?: "Выбранная папка"}/export"
+            }
+        }
+        val fileName = buildExportFileName(rawName, ext)
+        ensureMediaServerStarted()
+        val mode = when {
+            isSaf -> "saf"
+            mediaDir.absolutePath == defaultMediaDir.absolutePath -> "internal"
+            else -> "custom"
+        }
+        return JSONObject().apply {
+            put("ok", true)
+            put("exportDir", displayExportDir)
+            put("relativePath", "export/$fileName")
+            put("fileName", fileName)
+            put("localUploadUrl", "http://127.0.0.1:$serverPort/export/upload")
+            put("mode", mode)
+        }
+    }
+
+    private suspend fun saveExportChannelToExportDir(
+        channel: ByteReadChannel,
+        rawName: String?,
+        fallbackExt: String = "mp4",
+        explicitMimeType: String? = null
+    ): JSONObject {
+        val safeName = buildExportFileName(rawName, fallbackExt)
+        val mime = explicitMimeType?.takeIf { it.isNotBlank() }
+            ?: mimeTypeForExportExt(sanitizeExtension(safeName))
+        val uriStr = safTreeUriString
+
+        if (!uriStr.isNullOrBlank()) {
+            try {
+                val treeUri = Uri.parse(uriStr)
+                val exportDirUri = getOrCreateSafSubdir(treeUri, "export", createIfMissing = true)
+                if (exportDirUri != null) {
+                    val parentDocId = DocumentsContract.getDocumentId(exportDirUri)
+                    querySafChildren(treeUri, parentDocId)
+                        .firstOrNull { it.name == safeName }
+                        ?.let { existing ->
+                            try {
+                                DocumentsContract.deleteDocument(context.contentResolver, existing.uri)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    val createdUri = DocumentsContract.createDocument(
+                        context.contentResolver,
+                        exportDirUri,
+                        mime,
+                        safeName
+                    )
+                    if (createdUri != null) {
+                        var bytesWritten = 0L
+                        context.contentResolver.openOutputStream(createdUri, "wt")?.use { out ->
+                            bytesWritten = channel.copyTo(out)
+                        } ?: throw IllegalStateException("Не удалось открыть поток записи SAF")
+
+                        val realFile = resolveSafSubPathRealFile(treeUri, "export", safeName)
+                        if (realFile != null && realFile.exists()) {
+                            scanExportedMedia(realFile.absolutePath, mime)
+                        }
+                        val savedPath = realFile?.absolutePath
+                            ?: "${safDisplayName ?: "Выбранная папка"}/export/$safeName"
+                        return JSONObject().apply {
+                            put("ok", true)
+                            put("fileName", safeName)
+                            put("relativePath", "export/$safeName")
+                            put("savedPath", savedPath)
+                            put("contentUri", createdUri.toString())
+                            put("mimeType", mime)
+                            put("fileSize", bytesWritten)
+                            put("localUrl", "http://127.0.0.1:$serverPort/export/$safeName")
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                // Fall back to local exportSubDir() only if SAF creation failed before consuming channel
+            }
+        }
+
+        val dir = exportSubDir()
+        val partFile = File(dir, ".$safeName.${System.nanoTime()}.part")
+        val destFile = File(dir, safeName)
+        try {
+            FileOutputStream(partFile).use { fos ->
+                channel.copyTo(fos)
+            }
+            if (destFile.exists()) destFile.delete()
+            if (!partFile.renameTo(destFile)) {
+                partFile.copyTo(destFile, overwrite = true)
+                partFile.delete()
+            }
+        } catch (err: Throwable) {
+            if (partFile.exists()) partFile.delete()
+            throw err
+        }
+
+        scanExportedMedia(destFile.absolutePath, mime)
+        return JSONObject().apply {
+            put("ok", true)
+            put("fileName", safeName)
+            put("relativePath", "export/$safeName")
+            put("savedPath", destFile.absolutePath)
+            put("contentUri", "")
+            put("mimeType", mime)
+            put("fileSize", destFile.length())
+            put("localUrl", "http://127.0.0.1:$serverPort/export/$safeName")
+        }
+    }
+
+    fun saveExportBytesToExportDir(
+        bytes: ByteArray,
+        rawName: String?,
+        fallbackExt: String = "mp4",
+        explicitMimeType: String? = null
+    ): JSONObject {
+        val safeName = buildExportFileName(rawName, fallbackExt)
+        val mime = explicitMimeType?.takeIf { it.isNotBlank() }
+            ?: mimeTypeForExportExt(sanitizeExtension(safeName))
+        val uriStr = safTreeUriString
+
+        if (!uriStr.isNullOrBlank()) {
+            try {
+                val treeUri = Uri.parse(uriStr)
+                val exportDirUri = getOrCreateSafSubdir(treeUri, "export", createIfMissing = true)
+                if (exportDirUri != null) {
+                    val parentDocId = DocumentsContract.getDocumentId(exportDirUri)
+                    querySafChildren(treeUri, parentDocId)
+                        .firstOrNull { it.name == safeName }
+                        ?.let { existing ->
+                            try {
+                                DocumentsContract.deleteDocument(context.contentResolver, existing.uri)
+                            } catch (_: Throwable) {
+                            }
+                        }
+                    val createdUri = DocumentsContract.createDocument(
+                        context.contentResolver,
+                        exportDirUri,
+                        mime,
+                        safeName
+                    )
+                    if (createdUri != null) {
+                        context.contentResolver.openOutputStream(createdUri, "wt")?.use { out ->
+                            out.write(bytes)
+                        } ?: throw IllegalStateException("Не удалось открыть поток записи SAF")
+
+                        val realFile = resolveSafSubPathRealFile(treeUri, "export", safeName)
+                        if (realFile != null && realFile.exists()) {
+                            scanExportedMedia(realFile.absolutePath, mime)
+                        }
+                        val savedPath = realFile?.absolutePath
+                            ?: "${safDisplayName ?: "Выбранная папка"}/export/$safeName"
+                        return JSONObject().apply {
+                            put("ok", true)
+                            put("fileName", safeName)
+                            put("relativePath", "export/$safeName")
+                            put("savedPath", savedPath)
+                            put("contentUri", createdUri.toString())
+                            put("mimeType", mime)
+                            put("fileSize", bytes.size.toLong())
+                            put("localUrl", "http://127.0.0.1:$serverPort/export/$safeName")
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+            }
+        }
+
+        val dir = exportSubDir()
+        val partFile = File(dir, ".$safeName.${System.nanoTime()}.part")
+        val destFile = File(dir, safeName)
+        FileOutputStream(partFile).use { fos ->
+            fos.write(bytes)
+        }
+        if (destFile.exists()) destFile.delete()
+        if (!partFile.renameTo(destFile)) {
+            partFile.copyTo(destFile, overwrite = true)
+            partFile.delete()
+        }
+        scanExportedMedia(destFile.absolutePath, mime)
+        return JSONObject().apply {
+            put("ok", true)
+            put("fileName", safeName)
+            put("relativePath", "export/$safeName")
+            put("savedPath", destFile.absolutePath)
+            put("contentUri", "")
+            put("mimeType", mime)
+            put("fileSize", destFile.length())
+            put("localUrl", "http://127.0.0.1:$serverPort/export/$safeName")
+        }
+    }
+
+    fun getSafExportDirUri(): Uri? {
+        val uriStr = safTreeUriString ?: return null
+        return try {
+            getOrCreateSafSubdir(Uri.parse(uriStr), "export", createIfMissing = true)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun getLocalExportDir(): File = exportSubDir()
 
     fun stopHostServer() {
         isHostingRoom = false

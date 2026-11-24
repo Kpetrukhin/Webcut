@@ -9,6 +9,7 @@ import {
   Download,
   Droplet,
   FlipHorizontal2,
+  FolderOpen,
   Gauge,
   Grid3X3,
   Home,
@@ -32,6 +33,7 @@ import {
   Scissors,
   Settings,
   Shapes,
+  Share2,
   Sliders,
   Sparkles,
   Spline,
@@ -65,13 +67,18 @@ import {
   upsertKeyframeAtTime,
 } from './lib/keyframeEngine.ts';
 import {
+  buildWebcutExportFileName,
   deleteProjectFromRootStorage,
   fetchServerStorageConfig,
   getNativeStorageConfig,
   listProjectsFromRootStorage,
   loadProjectFromRootStorage,
+  openExportFolderTarget,
+  prepareExportTarget,
   resolvePortableMediaUrl,
+  saveExportedMediaToRoot,
   saveProjectToRootStorage,
+  shareExportedMedia,
   uploadFileForP2P,
 } from './lib/lanSyncBridge.ts';
 import type {CompressedMediaResult} from './lib/lanSyncBridge.ts';
@@ -607,10 +614,15 @@ export default function App() {
   const [exportedUrl, setExportedUrl] = useState<{
     url: string;
     filename: string;
+    relativePath: string;
+    savedPath: string;
+    contentUri?: string;
+    mimeType: string;
     ext: ExportFormat;
     width: number;
     height: number;
     fps: number;
+    blob: Blob;
   } | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
@@ -2411,6 +2423,12 @@ export default function App() {
     exportAbortRef.current = controller;
 
     try {
+      const targetName = buildWebcutExportFileName(exportFormat);
+      const prepared = await prepareExportTarget(exportFormat, targetName).catch(
+        () => null
+      );
+      const preparedBaseName = prepared?.fileName || targetName;
+
       const result = await exportProjectToVideo({
         clips: project.clips,
         tracks: project.tracks,
@@ -2427,30 +2445,41 @@ export default function App() {
         quality: exportQuality,
         pool: mediaPoolRef.current!,
         audioEngine: audioEngineRef.current!,
-        onProgress: (pct) => setExportProgress(pct),
+        onProgress: (pct) => setExportProgress(Math.min(98, pct)),
         onStage: (stage) => setExportStage(stage),
         signal: controller.signal,
       });
 
+      setExportStage('Сохранение в папку export/...');
+      setExportProgress(99);
+
+      const finalFileName =
+        result.ext === exportFormat
+          ? preparedBaseName
+          : preparedBaseName.replace(/\.[^.]+$/, '') + `.${result.ext}`;
+
+      const saved = await saveExportedMediaToRoot({
+        blob: result.blob,
+        ext: result.ext,
+        fileName: finalFileName,
+      });
+
       const url = URL.createObjectURL(result.blob);
-      const safeTitle =
-        project.title.replace(/[^a-zA-Zа-яА-Я0-9_-]/g, '_') || 'CutSync';
-      const filename = `${safeTitle}_${result.width}x${result.height}.${result.ext}`;
       setExportedUrl({
         url,
-        filename,
+        filename: saved.fileName,
+        relativePath: saved.relativePath,
+        savedPath: saved.savedPath,
+        contentUri: saved.contentUri,
+        mimeType: saved.mimeType,
         ext: result.ext,
         width: result.width,
         height: result.height,
         fps: result.fps,
+        blob: result.blob,
       });
-
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      setExportStage('Готово! Видео сохранено в папку export/');
+      setExportProgress(100);
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         setExportProgress(null);
@@ -6037,14 +6066,75 @@ export default function App() {
                     className="max-h-56 w-full rounded-xl border border-white/10 bg-black"
                   />
                 )}
-                <a
-                  href={exportedUrl.url}
-                  download={exportedUrl.filename}
-                  className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-cyan-500 text-sm font-semibold text-zinc-950 hover:bg-cyan-400"
+                <div className="rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-3 text-xs">
+                  <div className="flex items-center gap-2 font-semibold text-emerald-300">
+                    <Check className="h-4 w-4 shrink-0" />
+                    <span>Готово! Видео сохранено в папку export/</span>
+                  </div>
+                  <p className="mt-1.5 font-mono text-[11px] font-medium text-white break-all">
+                    {exportedUrl.filename}
+                  </p>
+                  <p className="mt-0.5 text-[11px] text-zinc-400 break-all">
+                    {exportedUrl.savedPath || exportedUrl.relativePath}
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void openExportFolderTarget({
+                        contentUri: exportedUrl.contentUri,
+                        savedPath: exportedUrl.savedPath,
+                        fileName: exportedUrl.filename,
+                        mimeType: exportedUrl.mimeType,
+                      }).then((res) => {
+                        if (!res.opened) {
+                          showTransientNotice(
+                            `Папка: ${res.exportDir || exportedUrl.savedPath || exportedUrl.relativePath}`
+                          );
+                        }
+                      });
+                    }}
+                    className="flex h-10 items-center justify-center gap-1.5 rounded-xl border border-white/15 bg-zinc-800/90 px-3 text-xs font-medium text-zinc-100 hover:bg-zinc-700"
+                  >
+                    <FolderOpen className="h-3.5 w-3.5 text-cyan-400" />
+                    Открыть папку
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void shareExportedMedia({
+                        contentUri: exportedUrl.contentUri,
+                        savedPath: exportedUrl.savedPath,
+                        fileName: exportedUrl.filename,
+                        mimeType: exportedUrl.mimeType,
+                        blob: exportedUrl.blob,
+                      }).catch((err) => {
+                        showTransientNotice(
+                          err instanceof Error ? err.message : 'Не удалось поделиться'
+                        );
+                      });
+                    }}
+                    className="flex h-10 items-center justify-center gap-1.5 rounded-xl border border-cyan-400/40 bg-cyan-500/15 px-3 text-xs font-medium text-cyan-200 hover:bg-cyan-500/25"
+                  >
+                    <Share2 className="h-3.5 w-3.5" />
+                    Поделиться
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (exportedUrl?.url) {
+                      URL.revokeObjectURL(exportedUrl.url);
+                    }
+                    setExportedUrl(null);
+                    setExportProgress(null);
+                    setExportError(null);
+                  }}
+                  className="flex h-10 w-full items-center justify-center rounded-xl bg-zinc-800 text-xs font-semibold text-white hover:bg-zinc-700"
                 >
-                  <Download className="h-4 w-4" />
-                  Скачать {exportedUrl.filename}
-                </a>
+                  Закрыть
+                </button>
               </div>
             )}
           </div>

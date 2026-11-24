@@ -3,7 +3,11 @@ package com.cutsync.webcut
 import android.Manifest
 import android.app.Activity
 import android.content.Intent
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.util.Base64
 import androidx.activity.result.ActivityResult
+import androidx.core.content.FileProvider
 import com.getcapacitor.JSArray
 import com.getcapacitor.JSObject
 import com.getcapacitor.PermissionState
@@ -548,5 +552,150 @@ class LanSyncPlugin : Plugin() {
                 call.reject(err.message ?: "Не удалось открыть выбранную папку")
             }
         }
+    }
+
+    private fun resolveShareableUri(contentUriStr: String?, savedPath: String?, fileName: String?): Uri? {
+        if (!contentUriStr.isNullOrBlank() && contentUriStr.startsWith("content://")) {
+            return Uri.parse(contentUriStr)
+        }
+        val candidateFile = when {
+            !savedPath.isNullOrBlank() -> java.io.File(savedPath)
+            !fileName.isNullOrBlank() -> java.io.File(engine.getLocalExportDir(), fileName)
+            else -> null
+        } ?: return null
+        if (!candidateFile.exists() || !candidateFile.isFile) return null
+        val authority = "${context.packageName}.fileprovider"
+        return try {
+            FileProvider.getUriForFile(context, authority, candidateFile)
+        } catch (_: Throwable) {
+            try {
+                val cacheCopy = java.io.File(context.cacheDir, candidateFile.name)
+                candidateFile.copyTo(cacheCopy, overwrite = true)
+                FileProvider.getUriForFile(context, authority, cacheCopy)
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
+    @PluginMethod
+    fun prepareExportDir(call: PluginCall) {
+        val ext = call.getString("ext") ?: "mp4"
+        val fileName = call.getString("fileName")
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val resJson = engine.prepareExportDir(ext = ext, rawName = fileName)
+                call.resolve(JSObject(resJson.toString()))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось подготовить папку export/")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun saveExportedFile(call: PluginCall) {
+        val base64Data = call.getString("base64Data") ?: run {
+            call.reject("Missing base64Data")
+            return
+        }
+        val fileName = call.getString("fileName")
+        val ext = call.getString("ext") ?: "mp4"
+        val mimeType = call.getString("mimeType")
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val cleanBase64 = if (base64Data.contains(",")) {
+                    base64Data.substringAfter(",")
+                } else {
+                    base64Data
+                }
+                val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+                val resJson = engine.saveExportBytesToExportDir(
+                    bytes = bytes,
+                    rawName = fileName,
+                    fallbackExt = ext,
+                    explicitMimeType = mimeType
+                )
+                call.resolve(JSObject(resJson.toString()))
+            } catch (err: Throwable) {
+                call.reject(err.message ?: "Не удалось сохранить файл в export/")
+            }
+        }
+    }
+
+    @PluginMethod
+    fun shareExportedFile(call: PluginCall) {
+        val contentUriStr = call.getString("contentUri")
+        val savedPath = call.getString("savedPath")
+        val fileName = call.getString("fileName") ?: "Webcut.mp4"
+        val mimeType = call.getString("mimeType") ?: "video/mp4"
+        val shareUri = resolveShareableUri(contentUriStr, savedPath, fileName)
+        if (shareUri == null) {
+            call.reject("Не найден экспортированный файл для отправки")
+            return
+        }
+        try {
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = mimeType
+                putExtra(Intent.EXTRA_STREAM, shareUri)
+                putExtra(Intent.EXTRA_SUBJECT, fileName)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(sendIntent, "Поделиться видео").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            (activity ?: context).startActivity(chooser)
+            call.resolve(JSObject().apply { put("shared", true) })
+        } catch (err: Throwable) {
+            call.reject(err.message ?: "Не удалось открыть меню «Поделиться»")
+        }
+    }
+
+    @PluginMethod
+    fun openExportFolder(call: PluginCall) {
+        val contentUriStr = call.getString("contentUri")
+        val savedPath = call.getString("savedPath")
+        val fileName = call.getString("fileName")
+        val mimeType = call.getString("mimeType") ?: "video/mp4"
+
+        val safExportUri = engine.getSafExportDirUri()
+        if (safExportUri != null) {
+            try {
+                val folderIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(safExportUri, DocumentsContract.Document.MIME_TYPE_DIR)
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_ACTIVITY_NEW_TASK
+                    )
+                }
+                (activity ?: context).startActivity(folderIntent)
+                call.resolve(JSObject().apply { put("opened", true) })
+                return
+            } catch (_: Throwable) {
+            }
+        }
+
+        val viewUri = resolveShareableUri(contentUriStr, savedPath, fileName)
+        if (viewUri != null) {
+            try {
+                val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(viewUri, mimeType)
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_ACTIVITY_NEW_TASK
+                    )
+                }
+                (activity ?: context).startActivity(viewIntent)
+                call.resolve(JSObject().apply { put("opened", true) })
+                return
+            } catch (_: Throwable) {
+            }
+        }
+
+        call.resolve(
+            JSObject().apply {
+                put("opened", false)
+                put("exportDir", engine.getLocalExportDir().absolutePath)
+            }
+        )
     }
 }
