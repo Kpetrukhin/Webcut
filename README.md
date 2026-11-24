@@ -1,4 +1,5 @@
 > **Latest Release (Android APK & Windows .exe):** [CutSync v0.2.0](https://github.com/Kpetrukhin/Webcut/releases/tag/v0.2.0)
+
 > **Offline AI Models Pack (Whisper, VitTrack, MobileSAM):** [AI Models Pack v1](https://github.com/Kpetrukhin/Webcut/releases/tag/ai-models-v1)
 
 
